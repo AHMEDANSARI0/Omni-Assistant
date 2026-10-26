@@ -1,0 +1,28 @@
+# Secrets / local config
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local runtime data (created by the app)
+data/
+workspace/*
+!workspace/.gitkeep
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Patcher backups
+.patcher-backups/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
