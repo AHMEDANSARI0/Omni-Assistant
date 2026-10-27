@@ -128,7 +128,7 @@ class DoctorSummary:
         )
         return "\n".join(
             [
-                f"Self-Healing PC Agent {self.version} (PHASE 8 File Operations)",
+                f"Self-Healing PC Agent {self.version} (PHASE 10 Workflow Reuse)",
                 f"Python: {self.python_version}",
                 f"Environment: {self.environment}",
                 f"Root: {self.root}",
@@ -576,6 +576,36 @@ class GuiController:
         finally:
             self._active_task_id = None
 
+    def list_workflows(self) -> tuple[Any, ...]:
+        return self._orchestrator.workflow_records()
+
+    def run_workflow(
+        self, workflow_key: str, options: TaskRunOptions | None = None
+    ) -> ExecutionReport:
+        run_options = options or TaskRunOptions()
+        self._require_license(FEATURE_CORE_TASKS)
+        record = self._orchestrator.resolve_workflow(workflow_key)
+        instruction = record.content.get("instruction")
+        task = self._tasks.create(
+            Task(
+                instruction=instruction
+                if isinstance(instruction, str) and instruction
+                else f"Reuse verified workflow {record.key}"
+            )
+        )
+        self._active_task_id = task.id
+        self._cancel_event.clear()
+        try:
+            return self._orchestrator.run_workflow(
+                task.id,
+                record.key,
+                approval_callback=self._approval_callback,
+                max_recovery_attempts=run_options.max_recovery_attempts,
+                cancellation_requested=self._cancel_event.is_set,
+            )
+        finally:
+            self._active_task_id = None
+
     def request_task_cancellation(self, task_id: str) -> str:
         """Cancel immediately when safe, else flag the running worker + DB."""
 
@@ -764,6 +794,77 @@ class GuiController:
                 "search_content": search_content,
                 "max_results": max_results,
             },
+        )
+
+    def pdf_extract_pages(
+        self, path: str, pages: str, output_path: str
+    ) -> ToolResult:
+        return self._invoke_builtin(
+            "pdf.extract_pages",
+            {
+                "path": _require(path, "PDF file"),
+                "pages": _require(pages, "page selection"),
+                "output_path": _require(output_path, "output PDF"),
+            },
+        )
+
+    def pdf_split(self, path: str, output_folder: str) -> ToolResult:
+        return self._invoke_builtin(
+            "pdf.split",
+            {
+                "path": _require(path, "PDF file"),
+                "output_folder": _require(output_folder, "output folder"),
+            },
+        )
+
+    def office_docx_replace(
+        self, input_path: str, output_path: str, find: str, replace: str
+    ) -> ToolResult:
+        return self._invoke_builtin(
+            "office.docx_replace_text",
+            {
+                "input_path": _require(input_path, "input DOCX"),
+                "output_path": _require(output_path, "output DOCX"),
+                "find": _require(find, "find text"),
+                "replace": replace,
+            },
+        )
+
+    def office_docx_append(
+        self, input_path: str, output_path: str, paragraphs: Sequence[str]
+    ) -> ToolResult:
+        cleaned = [paragraph for paragraph in paragraphs if paragraph.strip()]
+        if not cleaned:
+            raise PcAgentError("Add at least one paragraph to append.")
+        return self._invoke_builtin(
+            "office.docx_append_paragraphs",
+            {
+                "input_path": _require(input_path, "input DOCX"),
+                "output_path": _require(output_path, "output DOCX"),
+                "paragraphs": cleaned,
+            },
+        )
+
+    def office_xlsx_set_cell(
+        self, input_path: str, output_path: str, reference: str, value: str
+    ) -> ToolResult:
+        return self._invoke_builtin(
+            "office.xlsx_set_cells",
+            {
+                "input_path": _require(input_path, "input XLSX"),
+                "output_path": _require(output_path, "output XLSX"),
+                "cells": [
+                    {
+                        "reference": _require(reference, "cell reference"),
+                        "value": value,
+                    }
+                ],
+            },
+        )
+
+    def office_xlsx_verify_formulas(self, path: str) -> ToolResult:
+        return self._invoke_builtin(
+            "office.xlsx_verify_formulas", {"path": _require(path, "XLSX file")}
         )
 
     def fetch_web(
@@ -1005,6 +1106,17 @@ def format_execution_report(report: ExecutionReport) -> str:
         lines.extend(["", "Tool result:", format_tool_result(report.tool_result)])
     if report.resumed_from_checkpoint:
         lines.append("Resumed from checkpoint: the completed tool step was not re-run.")
+    if report.workflow_key:
+        if report.workflow_reused:
+            lines.append(
+                f"Verified workflow reused: {report.workflow_key} "
+                "(stored plan revalidated live before running)."
+            )
+        else:
+            lines.append(
+                f"Verified workflow recorded: {report.workflow_key} "
+                f"(success #{report.workflow_success_count})."
+            )
     if report.verification_message:
         lines.append(
             f"Verification: {report.verification_valid} - "

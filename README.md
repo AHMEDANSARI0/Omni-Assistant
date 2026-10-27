@@ -5,7 +5,7 @@ secure, lightweight, extensible agent that plans and executes user tasks with
 explicit permissions, verifies results deterministically, and reports honestly
 what it did.
 
-## Current status: PHASE 8 - General file operations (this build)
+## Current status: PHASE 10 - Verified workflow reuse (this build)
 
 | Status | Capability |
 |---|---|
@@ -20,7 +20,9 @@ what it did.
 | Implemented + tested (Phase 6) | Offline Ed25519-signed licensing: trial/standard/pro/enterprise plans mapped to feature gates, expiring or perpetual terms, optional machine binding, built-in configurable trial, vendor `pc-agent-license-admin` issuing tool, customer `pc-agent license` CLI + GUI Dashboard activation; enforcement opt-in (`off` default) |
 | Implemented + tested (Phase 7) | Generalized acceptance-criteria verification persisted per attempt (artifact existence, independent SHA-256, PDF pages, CSV/JSON row recounts); durable step checkpoints with safe in-place `task resume`; cooperative CLI/GUI cancellation at stage boundaries; inspectable memory (preferences, notes, automatic verified-workflow records) with secret guards and explicit task-history deletion; schema v6 |
 | Implemented + tested (Phase 8) | General workspace file operations — `files.copy/move/rename/organize/search` (23 built-ins) with a dedicated `MOVE_FILE` policy action, no-overwrite semantics, hash-verified transfers, conflict-skipping folder organization, bounded name/content search that never reads credential-like contents, deterministic planner intents, direct `pc-agent files` CLI, and a GUI Documents > Files panel; copy collisions heal to a fresh `-recovered` output |
-| Planned next phases | Deeper Office tools (DOCX edit, XLSX formulas, PDF split/extract), approved subprocess/Git workflows, browser automation, Windows app/UI automation, images, multi-step planning, verified workflow reuse |
+| Implemented + tested (Phase 9) | Deeper Office — `pdf.extract_pages`/`pdf.split`, run-safe `office.docx_replace_text`, `office.docx_append_paragraphs`, `office.xlsx_set_cells` with deterministic formula calculation (arithmetic + SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT/ABS/ROUND) and `office.xlsx_verify_formulas` (29 built-ins); deterministic planner intents with `--pages/--find/--replace/--cell/--value`, direct `pdf extract|split` + `office docx-*/xlsx-*` CLI, and GUI Documents panel controls |
+| Implemented + tested (Phase 10) | Verified workflow reuse — workflow records now store the exact validated arguments; `pc-agent workflow list|show|run|delete` re-runs a verified plan as a new task after live revalidation (approvals never inherited), the planner falls back to a verified workflow when it cannot plan an instruction, legacy Phase 7 records resolve through their last task's stored plan, and the GUI Tasks tab can run a workflow |
+| Planned next phases | Multi-step planning, approved subprocess/Git workflows, browser automation, Windows app/UI automation, images, secure OS credential storage |
 | Later | Full core self-repair with isolated staging/rollback, secure OS credential storage, production hardening, macOS/Linux |
 
 This build **does not** claim arbitrary computer control, arbitrary generated
@@ -38,12 +40,13 @@ server, or cloud account yet.
 ## Setup / upgrade (Windows PowerShell)
 
 New installs apply the patchers in order: 1A, 1B, 1C, Phase 2, Phase 3,
-Phase 4, the Phase 4.1 hotfix, Phase 5, Phase 6, Phase 7, then Phase 8. An
-existing Phase 7 (0.9.0) install only needs the Phase 8 patcher:
+Phase 4, the Phase 4.1 hotfix, Phase 5, Phase 6, Phase 7, Phase 8, Phase 9,
+then Phase 10. An existing Phase 9 (0.11.0) install only needs the Phase 10
+patcher:
 
 ```powershell
 cd D:\omni-assistant   # your project folder
-node PHASE_8_FILES.mjs
+node PHASE_10_WORKFLOW_REUSE.mjs
 
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -51,16 +54,19 @@ python -m pytest -q
 python -m ruff check
 pc-agent --version
 pc-agent doctor
-pc-agent files search report --content
+pc-agent demo pdf
+pc-agent run "Merge PDFs from Folder A and Folder B"
+pc-agent run "Extract pages 1-2 from merged.pdf"
+pc-agent workflow list
+pc-agent workflow run latest
 pc-agent gui --check
 ```
 
-Phase 8 adds no runtime dependency and no database migration (schema stays
-**v6**). Reinstalling refreshes the editable package metadata to 0.10.0.
-License enforcement still defaults to `off`. See `docs/phase8.md` for the
-new copy/move/rename/organize/search behavior and `docs/phase7.md` for the
-acceptance-criteria, checkpoint/resume, cancellation and memory behavior it
-builds on.
+Phase 10 adds no runtime dependency and no database migration (schema
+stays **v6**). Reinstalling refreshes the editable package metadata to
+0.12.0.
+License enforcement still defaults to `off`. See `docs/phase10.md` for
+verified workflow reuse and `docs/phase9.md` for the deeper-Office tools.
 
 ## Desktop GUI (Phase 5)
 
@@ -303,6 +309,40 @@ pc-agent run "Search files containing \"budget\""
 
 See `docs/phase8.md`.
 
+## Deeper Office (Phase 9)
+
+PDF split/extract, DOCX text editing and XLSX cell writing with real,
+deterministic formula calculation — still workspace-confined and
+no-overwrite:
+
+```powershell
+pc-agent pdf extract book.pdf --pages "1-3,5" --output part.pdf
+pc-agent pdf split book.pdf --output-folder pages
+pc-agent office docx-replace doc.docx --output edited.docx --find "draft" --replace "final"
+pc-agent office xlsx-set data.xlsx --output edited.xlsx --cell B4==SUM(B2:B3)
+pc-agent office xlsx-formulas edited.xlsx
+pc-agent run "Extract pages 1-2 from merged.pdf"
+pc-agent run "Set the cell" --target data.xlsx --cell A3 --value "=SUM(A1:A2)"
+```
+
+See `docs/phase9.md`.
+
+## Verified workflow reuse (Phase 10)
+
+Every verified success is recorded as a reusable workflow. Re-run one as a
+fresh task (live-revalidated; approvals are never inherited), or let the
+planner fall back to it automatically when an instruction cannot be planned
+fresh:
+
+```powershell
+pc-agent workflow list
+pc-agent workflow show latest
+pc-agent workflow run latest
+pc-agent workflow delete latest --yes
+```
+
+See `docs/phase10.md`.
+
 ## Natural-language PDF task (safe demo)
 
 ```powershell
@@ -369,7 +409,7 @@ Copy `.env.example` to `.env` locally when needed. The patcher updates
 `data\` and artifacts in `workspace\`; both are git-ignored.
 
 See `docs/phase4.md`, `docs/phase5.md`, `docs/phase6.md`, `docs/phase7.md`,
-`docs/phase8.md`,
+`docs/phase8.md`, `docs/phase9.md`, `docs/phase10.md`,
 `docs/providers.md`, `docs/tools.md`, `docs/tool_builder.md`,
 `docs/recovery.md`, `docs/architecture.md`, and `CHANGELOG.md` for detailed
 contracts and honest limitations.

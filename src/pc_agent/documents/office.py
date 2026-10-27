@@ -943,3 +943,773 @@ def _docx_paragraph(body: Any, text: str, *, title: bool) -> None:
         if line[:1].isspace() or line[-1:].isspace():
             text_element.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         text_element.text = line
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: DOCX editing, XLSX cell editing and formula evaluation
+# ---------------------------------------------------------------------------
+
+_MAX_FORMULA_RANGE_CELLS = 10_000
+_MAX_CELL_EDITS = 100
+
+
+def _read_package_parts(path: Path, expected_suffix: str) -> dict[str, bytes]:
+    suffix = _require_supported_input(path)
+    if suffix != expected_suffix:
+        raise ToolError(f"Expected a {expected_suffix} file: {path.name}")
+    with _open_ooxml(path) as package:
+        return {
+            info.filename: package.read(info.filename)
+            for info in package.infolist()
+            if not info.is_dir()
+        }
+
+
+def _register_namespaces_from(data: bytes) -> None:
+    for prefix, uri in _NS.items():
+        ET.register_namespace(prefix, uri)
+    try:
+        for _event, namespace in ET.iterparse(io.BytesIO(data), events=("start-ns",)):
+            prefix, uri = namespace
+            if prefix and prefix != "xml":
+                try:
+                    ET.register_namespace(prefix, uri)
+                except ValueError:
+                    pass
+    except ET.ParseError:
+        pass
+
+
+def _parse_xml_bytes(data: bytes, part: str) -> Any:
+    if b"<!doctype" in data.lower():
+        raise ToolError("Office XML containing a DOCTYPE is rejected for safety.")
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise ToolError(f"Office XML could not be parsed: {part}") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class DocxReplaceResult:
+    data: bytes
+    replacements: int
+    paragraphs_changed: int
+
+
+@dataclass(frozen=True, slots=True)
+class DocxAppendResult:
+    data: bytes
+    paragraphs_added: int
+    total_paragraphs: int
+
+
+def replace_docx_text(path: Path, find: str, replace: str) -> DocxReplaceResult:
+    """Replace exact text inside DOCX body paragraphs (run-boundary safe)."""
+
+    if not find:
+        raise ToolError("The text to find must not be empty.")
+    if len(find) > 1000 or len(replace) > 10_000:
+        raise ToolError("Find/replace text exceeds its safety limit.")
+    parts = _read_package_parts(path, ".docx")
+    document_bytes = parts.get("word/document.xml")
+    if document_bytes is None:
+        raise ToolError("DOCX package is missing word/document.xml.")
+    _register_namespaces_from(document_bytes)
+    root = _parse_xml_bytes(document_bytes, "word/document.xml")
+
+    replacements = 0
+    changed = 0
+    for paragraph in _iter_local(root, "p"):
+        text_nodes = [node for node in paragraph.iter() if _local(node.tag) == "t"]
+        if not text_nodes:
+            continue
+        joined = "".join(node.text or "" for node in text_nodes)
+        occurrences = joined.count(find)
+        if not occurrences:
+            continue
+        new_text = joined.replace(find, replace)
+        first = text_nodes[0]
+        if new_text[:1].isspace() or new_text[-1:].isspace():
+            first.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        first.text = new_text
+        for extra in text_nodes[1:]:
+            extra.text = ""
+        replacements += occurrences
+        changed += 1
+
+    parts["word/document.xml"] = _xml_bytes(root)
+    return DocxReplaceResult(
+        data=_zip_package(parts),
+        replacements=replacements,
+        paragraphs_changed=changed,
+    )
+
+
+def append_docx_paragraphs(path: Path, paragraphs: list[str]) -> DocxAppendResult:
+    clean = [_xml_safe(str(item)) for item in paragraphs]
+    if not clean or len(clean) > 100:
+        raise ToolError("Append between 1 and 100 paragraphs at a time.")
+    if any(len(item) > 10_000 for item in clean):
+        raise ToolError("Each appended paragraph is limited to 10000 characters.")
+
+    parts = _read_package_parts(path, ".docx")
+    document_bytes = parts.get("word/document.xml")
+    if document_bytes is None:
+        raise ToolError("DOCX package is missing word/document.xml.")
+    _register_namespaces_from(document_bytes)
+    root = _parse_xml_bytes(document_bytes, "word/document.xml")
+    body = next((child for child in root if _local(child.tag) == "body"), None)
+    if body is None:
+        raise ToolError("DOCX document has no body element.")
+    section = next((child for child in body if _local(child.tag) == "sectPr"), None)
+    for paragraph in clean:
+        _docx_paragraph(body, paragraph, title=False)
+    if section is not None:
+        body.remove(section)
+        body.append(section)  # section properties must stay last
+    total = sum(1 for _ in _iter_local(root, "p"))
+    parts["word/document.xml"] = _xml_bytes(root)
+    return DocxAppendResult(
+        data=_zip_package(parts),
+        paragraphs_added=len(clean),
+        total_paragraphs=total,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class XlsxCell:
+    reference: str
+    value: str
+    formula: str | None
+    kind: str  # "number" | "string" | "boolean" | "empty"
+
+
+@dataclass(frozen=True, slots=True)
+class XlsxSheetCells:
+    name: str
+    cells: dict[str, XlsxCell]
+
+
+@dataclass(frozen=True, slots=True)
+class XlsxWorkbookCells:
+    sheets: tuple[XlsxSheetCells, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaEvaluation:
+    sheet: str
+    reference: str
+    formula: str
+    value: float | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class XlsxEditResult:
+    data: bytes
+    sheet: str
+    cells_set: tuple[str, ...]
+    evaluations: tuple[FormulaEvaluation, ...]
+
+
+def _reference_parts(reference: str) -> tuple[int, int]:
+    match = _CELL_RE.fullmatch(reference.strip().replace("$", ""))
+    if not match:
+        raise ToolError(f"Invalid cell reference: {reference!r}")
+    column = 0
+    for character in match.group(1).upper():
+        column = column * 26 + (ord(character) - ord("A") + 1)
+    return column, int(match.group(2))
+
+
+def _normalize_reference(reference: str) -> str:
+    column, row = _reference_parts(reference)
+    if column > MAX_XLSX_COLUMNS or row < 1 or row > MAX_XLSX_ROWS:
+        raise ToolError(f"Cell reference is outside the safety limits: {reference!r}")
+    return f"{_column_letters(column)}{row}"
+
+
+def read_xlsx_cells(path: Path) -> XlsxWorkbookCells:
+    """Read every populated cell (value + formula text) keyed by reference."""
+
+    suffix = _require_supported_input(path)
+    if suffix != ".xlsx":
+        raise ToolError(f"Expected a .xlsx file: {path.name}")
+    with _open_ooxml(path) as package:
+        workbook = _xml_root(package, "xl/workbook.xml")
+        rels = _relationships(package, "xl/_rels/workbook.xml.rels")
+        shared: list[str] = []
+        shared_root = _xml_root(package, "xl/sharedStrings.xml", required=False)
+        if shared_root is not None:
+            for item in _iter_local(shared_root, "si"):
+                shared.append(
+                    "".join(
+                        str(node.text or "")
+                        for node in item.iter()
+                        if _local(node.tag) == "t"
+                    )
+                )
+
+        sheets: list[XlsxSheetCells] = []
+        total_cells = 0
+        for sheet_element in _iter_local(workbook, "sheet"):
+            name = str(sheet_element.attrib.get("name") or f"Sheet{len(sheets) + 1}")
+            rel_id = sheet_element.attrib.get(f"{{{_NS['r']}}}id")
+            target = rels.get(str(rel_id)) if rel_id else None
+            part = (
+                _worksheet_part(target)
+                if target
+                else f"xl/worksheets/sheet{len(sheets) + 1}.xml"
+            )
+            sheet_root = _xml_root(package, part)
+            cells: dict[str, XlsxCell] = {}
+            for row_element in _iter_local(sheet_root, "row"):
+                try:
+                    row_number = int(row_element.attrib.get("r", "0"))
+                except ValueError:
+                    row_number = 0
+                fallback_column = 1
+                for cell in row_element:
+                    if _local(cell.tag) != "c":
+                        continue
+                    total_cells += 1
+                    if total_cells > MAX_XLSX_CELLS:
+                        raise ToolError("XLSX workbook exceeds the 250000-cell safety limit.")
+                    raw_reference = str(cell.attrib.get("r") or "")
+                    try:
+                        reference = _normalize_reference(raw_reference)
+                        column, _row = _reference_parts(reference)
+                    except ToolError:
+                        if row_number < 1:
+                            continue
+                        column = fallback_column
+                        reference = f"{_column_letters(column)}{row_number}"
+                    fallback_column = column + 1
+                    formula_text: str | None = None
+                    for child in cell:
+                        if _local(child.tag) == "f":
+                            formula_text = "".join(child.itertext()).strip() or None
+                            break
+                    cell_type = str(cell.attrib.get("t") or "")
+                    raw_value = _first_text(cell, "v")
+                    if cell_type == "s" and raw_value is not None:
+                        try:
+                            value = shared[int(float(raw_value))]
+                        except (ValueError, IndexError):
+                            value = raw_value
+                        kind = "string"
+                    elif cell_type == "inlineStr":
+                        value = "".join(
+                            str(node.text or "")
+                            for node in cell.iter()
+                            if _local(node.tag) == "t"
+                        )
+                        kind = "string"
+                    elif cell_type == "b":
+                        value = "TRUE" if raw_value == "1" else "FALSE"
+                        kind = "boolean"
+                    elif cell_type == "str":
+                        value = raw_value or ""
+                        kind = "string"
+                    else:
+                        value = raw_value or ""
+                        kind = (
+                            "number"
+                            if value and _NUMBER_RE.fullmatch(value.strip())
+                            else "empty"
+                            if not value
+                            else "string"
+                        )
+                    cells[reference] = XlsxCell(
+                        reference=reference, value=value, formula=formula_text, kind=kind
+                    )
+            sheets.append(XlsxSheetCells(name=name, cells=cells))
+    return XlsxWorkbookCells(sheets=tuple(sheets))
+
+
+class _FormulaError(Exception):
+    """Internal: a formula cell cannot be computed deterministically."""
+
+
+_TOKEN_RE = re.compile(
+    r"\s*(?:(?P<number>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+    r"|(?P<ref>\$?[A-Za-z]{1,3}\$?[0-9]+)"
+    r"|(?P<name>[A-Za-z_][A-Za-z0-9_.]*)"
+    r"|(?P<op>[+\-*/(),:]))"
+)
+
+
+def _tokenize_formula(formula: str) -> list[tuple[str, str]]:
+    tokens: list[tuple[str, str]] = []
+    position = 0
+    while position < len(formula):
+        if formula[position].isspace():
+            position += 1
+            continue
+        match = _TOKEN_RE.match(formula, position)
+        if not match:
+            raise _FormulaError(f"unsupported formula syntax near {formula[position:position + 10]!r}")
+        position = match.end()
+        kind = match.lastgroup or ""
+        tokens.append((kind, match.group(kind)))
+    return tokens
+
+
+_AGGREGATE_FUNCTIONS = frozenset({"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "PRODUCT"})
+
+
+class _FormulaEvaluator:
+    """Deterministic evaluator for the common arithmetic/aggregate subset."""
+
+    def __init__(self, cells: dict[str, XlsxCell]) -> None:
+        self._cells = cells
+        self._cache: dict[str, float] = {}
+        self._visiting: set[str] = set()
+
+    def evaluate_cell(self, reference: str) -> float:
+        if reference in self._cache:
+            return self._cache[reference]
+        cell = self._cells.get(reference)
+        if cell is None or cell.formula is None:
+            value = self._plain_number(reference, aggregate=False)
+            return 0.0 if value is None else value
+        if reference in self._visiting:
+            raise _FormulaError("circular reference")
+        self._visiting.add(reference)
+        try:
+            tokens = _tokenize_formula(cell.formula)
+            parser = _FormulaParser(tokens, self)
+            value = parser.parse()
+        finally:
+            self._visiting.discard(reference)
+        self._cache[reference] = value
+        return value
+
+    def _plain_number(self, reference: str, *, aggregate: bool) -> float | None:
+        cell = self._cells.get(reference)
+        if cell is None:
+            return None
+        if cell.formula is not None:
+            return self.evaluate_cell(reference)
+        if cell.kind == "number":
+            try:
+                return float(cell.value)
+            except ValueError as exc:
+                raise _FormulaError("#VALUE!") from exc
+        if cell.value.strip() == "":
+            return None
+        if aggregate:
+            return None  # aggregate functions ignore text like Excel does
+        raise _FormulaError("#VALUE!")
+
+    def scalar(self, reference: str) -> float:
+        value = self._plain_number(reference, aggregate=False)
+        return 0.0 if value is None else value
+
+    def range_values(self, start: str, end: str) -> list[float]:
+        start_col, start_row = _reference_parts(start)
+        end_col, end_row = _reference_parts(end)
+        low_col, high_col = min(start_col, end_col), max(start_col, end_col)
+        low_row, high_row = min(start_row, end_row), max(start_row, end_row)
+        if (high_col - low_col + 1) * (high_row - low_row + 1) > _MAX_FORMULA_RANGE_CELLS:
+            raise _FormulaError("formula range exceeds the safety limit")
+        values: list[float] = []
+        for row in range(low_row, high_row + 1):
+            for column in range(low_col, high_col + 1):
+                number = self._plain_number(
+                    f"{_column_letters(column)}{row}", aggregate=True
+                )
+                if number is not None:
+                    values.append(number)
+        return values
+
+    def call(self, name: str, arguments: list[list[float]]) -> float:
+        function = name.upper()
+        flat = [value for group in arguments for value in group]
+        if function == "ABS":
+            if len(flat) != 1:
+                raise _FormulaError("ABS needs exactly one value")
+            return abs(flat[0])
+        if function == "ROUND":
+            if len(flat) not in {1, 2}:
+                raise _FormulaError("ROUND needs one or two values")
+            digits = int(flat[1]) if len(flat) == 2 else 0
+            return round(flat[0], digits)
+        if function not in _AGGREGATE_FUNCTIONS:
+            raise _FormulaError(f"unsupported function {function}")
+        if function == "SUM":
+            return math.fsum(flat)
+        if function == "PRODUCT":
+            result = 1.0
+            for value in flat:
+                result *= value
+            return result if flat else 0.0
+        if function == "COUNT":
+            return float(len(flat))
+        if function == "AVERAGE":
+            if not flat:
+                raise _FormulaError("#DIV/0!")
+            return math.fsum(flat) / len(flat)
+        if function == "MIN":
+            return min(flat) if flat else 0.0
+        return max(flat) if flat else 0.0
+
+
+class _FormulaParser:
+    def __init__(
+        self, tokens: list[tuple[str, str]], evaluator: _FormulaEvaluator
+    ) -> None:
+        self._tokens = tokens
+        self._evaluator = evaluator
+        self._position = 0
+
+    def parse(self) -> float:
+        value = self._expression()
+        if self._position != len(self._tokens):
+            raise _FormulaError("unexpected extra formula content")
+        return value
+
+    def _peek(self) -> tuple[str, str] | None:
+        return self._tokens[self._position] if self._position < len(self._tokens) else None
+
+    def _take(self) -> tuple[str, str]:
+        token = self._peek()
+        if token is None:
+            raise _FormulaError("formula ended unexpectedly")
+        self._position += 1
+        return token
+
+    def _expression(self) -> float:
+        value = self._term()
+        while True:
+            token = self._peek()
+            if token == ("op", "+"):
+                self._take()
+                value += self._term()
+            elif token == ("op", "-"):
+                self._take()
+                value -= self._term()
+            else:
+                return value
+
+    def _term(self) -> float:
+        value = self._factor()
+        while True:
+            token = self._peek()
+            if token == ("op", "*"):
+                self._take()
+                value *= self._factor()
+            elif token == ("op", "/"):
+                self._take()
+                divisor = self._factor()
+                if divisor == 0:
+                    raise _FormulaError("#DIV/0!")
+                value /= divisor
+            else:
+                return value
+
+    def _factor(self) -> float:
+        kind, text = self._take()
+        if kind == "op" and text == "-":
+            return -self._factor()
+        if kind == "op" and text == "(":
+            value = self._expression()
+            if self._take() != ("op", ")"):
+                raise _FormulaError("missing closing parenthesis")
+            return value
+        if kind == "number":
+            return float(text)
+        if kind == "ref":
+            reference = _normalize_reference(text)
+            if self._peek() == ("op", ":"):
+                raise _FormulaError("a range is only allowed inside a function")
+            return self._evaluator.scalar(reference)
+        if kind == "name":
+            if self._take() != ("op", "("):
+                raise _FormulaError(f"unsupported name {text!r}")
+            arguments: list[list[float]] = []
+            if self._peek() != ("op", ")"):
+                while True:
+                    arguments.append(self._argument())
+                    if self._peek() == ("op", ","):
+                        self._take()
+                        continue
+                    break
+            if self._take() != ("op", ")"):
+                raise _FormulaError("missing closing parenthesis")
+            return self._evaluator.call(text, arguments)
+        raise _FormulaError(f"unsupported formula token {text!r}")
+
+    def _argument(self) -> list[float]:
+        token = self._peek()
+        following = (
+            self._tokens[self._position + 1]
+            if self._position + 1 < len(self._tokens)
+            else None
+        )
+        if token is not None and token[0] == "ref" and following == ("op", ":"):
+            start = _normalize_reference(self._take()[1])
+            self._take()  # consume ":"
+            end_kind, end_text = self._take()
+            if end_kind != "ref":
+                raise _FormulaError("a range must end with a cell reference")
+            return self._evaluator.range_values(start, _normalize_reference(end_text))
+        if token is not None and token[0] == "ref":
+            reference = _normalize_reference(token[1])
+            value = self._evaluator._plain_number(reference, aggregate=True)
+            self._take()
+            return [] if value is None else [value]
+        return [self._expression()]
+
+
+def evaluate_workbook_formulas(
+    workbook: XlsxWorkbookCells,
+) -> tuple[FormulaEvaluation, ...]:
+    results: list[FormulaEvaluation] = []
+    for sheet in workbook.sheets:
+        evaluator = _FormulaEvaluator(sheet.cells)
+        for reference in sorted(sheet.cells, key=lambda ref: _reference_parts(ref)[::-1]):
+            cell = sheet.cells[reference]
+            if cell.formula is None:
+                continue
+            try:
+                value: float | None = evaluator.evaluate_cell(reference)
+                error = None
+            except (_FormulaError, ToolError) as exc:
+                value = None
+                error = str(exc)
+            results.append(
+                FormulaEvaluation(
+                    sheet=sheet.name,
+                    reference=reference,
+                    formula=cell.formula,
+                    value=value,
+                    error=error,
+                )
+            )
+    return tuple(results)
+
+
+def _format_number(value: float) -> str:
+    if value == int(value) and abs(value) < 1e15:
+        return str(int(value))
+    return format(value, ".10g")
+
+
+def set_xlsx_cells(
+    path: Path,
+    edits: dict[str, str],
+    *,
+    sheet_name: str | None = None,
+) -> XlsxEditResult:
+    """Set cells (values or ``=formulas``) in one sheet of an existing XLSX.
+
+    Only the target worksheet XML is rewritten; every other package part is
+    preserved byte-for-byte. Formula cells get a freshly computed cached
+    value when the deterministic evaluator supports the formula.
+    """
+
+    if not edits or len(edits) > _MAX_CELL_EDITS:
+        raise ToolError(f"Set between 1 and {_MAX_CELL_EDITS} cells at a time.")
+    normalized_edits: dict[str, str] = {}
+    for reference, raw_value in edits.items():
+        normalized = _normalize_reference(str(reference))
+        value = str(raw_value)
+        if len(value) > 5000:
+            raise ToolError("A cell value exceeds the 5000-character safety limit.")
+        normalized_edits[normalized] = _xml_safe(value)
+
+    parts = _read_package_parts(path, ".xlsx")
+    workbook_bytes = parts.get("xl/workbook.xml")
+    if workbook_bytes is None:
+        raise ToolError("XLSX package is missing xl/workbook.xml.")
+    _register_namespaces_from(workbook_bytes)
+    workbook_root = _parse_xml_bytes(workbook_bytes, "xl/workbook.xml")
+    rels: dict[str, str] = {}
+    rels_bytes = parts.get("xl/_rels/workbook.xml.rels")
+    if rels_bytes is not None:
+        rels_root = _parse_xml_bytes(rels_bytes, "xl/_rels/workbook.xml.rels")
+        for item in _iter_local(rels_root, "Relationship"):
+            if item.attrib.get("Id") and item.attrib.get("Target"):
+                rels[item.attrib["Id"]] = item.attrib["Target"]
+
+    sheet_targets: list[tuple[str, str]] = []
+    for sheet_element in _iter_local(workbook_root, "sheet"):
+        name = str(sheet_element.attrib.get("name") or f"Sheet{len(sheet_targets) + 1}")
+        rel_id = sheet_element.attrib.get(f"{{{_NS['r']}}}id")
+        target = rels.get(str(rel_id)) if rel_id else None
+        part = (
+            _worksheet_part(target)
+            if target
+            else f"xl/worksheets/sheet{len(sheet_targets) + 1}.xml"
+        )
+        sheet_targets.append((name, part))
+    if not sheet_targets:
+        raise ToolError("XLSX workbook contains no worksheets.")
+    if sheet_name is None:
+        chosen_name, chosen_part = sheet_targets[0]
+    else:
+        matches = [item for item in sheet_targets if item[0] == sheet_name]
+        if not matches:
+            available = ", ".join(name for name, _part in sheet_targets)
+            raise ToolError(f"Sheet {sheet_name!r} not found. Available: {available}.")
+        chosen_name, chosen_part = matches[0]
+    if chosen_part not in parts:
+        raise ToolError(f"XLSX package is missing the worksheet part: {chosen_part}")
+
+    # Model first so cached formula values and the report agree exactly.
+    model = read_xlsx_cells(path)
+    model_sheet = next(
+        (sheet for sheet in model.sheets if sheet.name == chosen_name), None
+    )
+    cells: dict[str, XlsxCell] = dict(model_sheet.cells) if model_sheet else {}
+    for reference, value in normalized_edits.items():
+        if value.startswith("="):
+            cells[reference] = XlsxCell(reference, "", value[1:].strip(), "number")
+        elif _NUMBER_RE.fullmatch(value.strip()):
+            cells[reference] = XlsxCell(reference, value.strip(), None, "number")
+        elif value.strip().upper() in {"TRUE", "FALSE"}:
+            cells[reference] = XlsxCell(reference, value.strip().upper(), None, "boolean")
+        elif value == "":
+            cells[reference] = XlsxCell(reference, "", None, "empty")
+        else:
+            cells[reference] = XlsxCell(reference, value, None, "string")
+    evaluations = evaluate_workbook_formulas(
+        XlsxWorkbookCells(
+            sheets=tuple(
+                XlsxSheetCells(sheet.name, cells if sheet.name == chosen_name else sheet.cells)
+                for sheet in model.sheets
+            )
+        )
+    )
+    computed = {
+        item.reference: item for item in evaluations if item.sheet == chosen_name
+    }
+
+    sheet_bytes = parts[chosen_part]
+    _register_namespaces_from(sheet_bytes)
+    sheet_root = _parse_xml_bytes(sheet_bytes, chosen_part)
+    main = _NS["main"]
+    sheet_data = next(
+        (child for child in sheet_root if _local(child.tag) == "sheetData"), None
+    )
+    if sheet_data is None:
+        sheet_data = ET.SubElement(sheet_root, f"{{{main}}}sheetData")
+
+    def find_row(row_number: int) -> Any:
+        rows = [child for child in sheet_data if _local(child.tag) == "row"]
+        for row in rows:
+            try:
+                if int(row.attrib.get("r", "0")) == row_number:
+                    return row
+            except ValueError:
+                continue
+        row = ET.Element(f"{{{main}}}row")
+        row.set("r", str(row_number))
+        index = len(rows)
+        for position, existing in enumerate(rows):
+            try:
+                if int(existing.attrib.get("r", "0")) > row_number:
+                    index = position
+                    break
+            except ValueError:
+                continue
+        sheet_data.insert(index, row)
+        return row
+
+    for reference, value in sorted(
+        normalized_edits.items(), key=lambda item: _reference_parts(item[0])[::-1]
+    ):
+        column, row_number = _reference_parts(reference)
+        row = find_row(row_number)
+        cell = next(
+            (
+                child
+                for child in row
+                if _local(child.tag) == "c" and child.attrib.get("r") == reference
+            ),
+            None,
+        )
+        if cell is None:
+            cell = ET.Element(f"{{{main}}}c")
+            cell.set("r", reference)
+            position = len(list(row))
+            for index, existing in enumerate(row):
+                if _local(existing.tag) != "c":
+                    continue
+                try:
+                    existing_column, _ = _reference_parts(existing.attrib.get("r", ""))
+                except ToolError:
+                    continue
+                if existing_column > column:
+                    position = index
+                    break
+            row.insert(position, cell)
+        for child in list(cell):
+            cell.remove(child)
+        cell.attrib.pop("t", None)
+        if value.startswith("="):
+            formula_element = ET.SubElement(cell, f"{{{main}}}f")
+            formula_element.text = value[1:].strip()
+            evaluation = computed.get(reference)
+            if evaluation is not None and evaluation.value is not None:
+                value_element = ET.SubElement(cell, f"{{{main}}}v")
+                value_element.text = _format_number(evaluation.value)
+        elif value == "":
+            pass  # cleared cell
+        elif _NUMBER_RE.fullmatch(value.strip()):
+            value_element = ET.SubElement(cell, f"{{{main}}}v")
+            value_element.text = value.strip()
+        elif value.strip().upper() in {"TRUE", "FALSE"}:
+            cell.set("t", "b")
+            value_element = ET.SubElement(cell, f"{{{main}}}v")
+            value_element.text = "1" if value.strip().upper() == "TRUE" else "0"
+        else:
+            cell.set("t", "inlineStr")
+            inline = ET.SubElement(cell, f"{{{main}}}is")
+            text_element = ET.SubElement(inline, f"{{{main}}}t")
+            if value[:1].isspace() or value[-1:].isspace():
+                text_element.set(
+                    "{http://www.w3.org/XML/1998/namespace}space", "preserve"
+                )
+            text_element.text = value
+
+    dimension = next(
+        (child for child in sheet_root if _local(child.tag) == "dimension"), None
+    )
+    if dimension is not None:
+        max_column = 1
+        max_row = 1
+        for cell_element in _iter_local(sheet_data, "c"):
+            try:
+                col, row_idx = _reference_parts(cell_element.attrib.get("r", ""))
+            except ToolError:
+                continue
+            max_column = max(max_column, col)
+            max_row = max(max_row, row_idx)
+        dimension.set("ref", f"A1:{_column_letters(max_column)}{max_row}")
+
+    parts[chosen_part] = _xml_bytes(sheet_root)
+    if "xl/calcChain.xml" in parts:
+        del parts["xl/calcChain.xml"]
+        content_types = parts.get("[Content_Types].xml")
+        if content_types is not None:
+            _register_namespaces_from(content_types)
+            types_root = _parse_xml_bytes(content_types, "[Content_Types].xml")
+            for override in list(types_root):
+                if override.attrib.get("PartName") == "/xl/calcChain.xml":
+                    types_root.remove(override)
+            parts["[Content_Types].xml"] = _xml_bytes(types_root)
+    calc_properties = next(
+        (child for child in workbook_root if _local(child.tag) == "calcPr"), None
+    )
+    if calc_properties is not None:
+        calc_properties.set("fullCalcOnLoad", "1")
+        parts["xl/workbook.xml"] = _xml_bytes(workbook_root)
+
+    return XlsxEditResult(
+        data=_zip_package(parts),
+        sheet=chosen_name,
+        cells_set=tuple(sorted(normalized_edits)),
+        evaluations=evaluations,
+    )

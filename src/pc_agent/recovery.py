@@ -97,6 +97,12 @@ _OUTPUT_TOOLS = frozenset(
         # Only the copy: its source survives a failed attempt, so retrying to
         # a fresh output is safe. A move/rename source may already be gone.
         "files.copy",
+        # Phase 9 editors also write a brand-new output from a surviving
+        # source, so fresh-output retries are equally safe for them.
+        "pdf.extract_pages",
+        "office.docx_replace_text",
+        "office.docx_append_paragraphs",
+        "office.xlsx_set_cells",
     }
 )
 _TRANSIENT_MARKERS = (

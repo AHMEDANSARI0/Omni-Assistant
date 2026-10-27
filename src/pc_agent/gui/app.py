@@ -48,7 +48,7 @@ from .controller import (
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
 except ImportError as exc:  # pragma: no cover - depends on the Python build
     tk = None  # type: ignore[assignment]
     filedialog = None  # type: ignore[assignment]
@@ -420,6 +420,9 @@ class PcAgentGuiApp:
         ttk.Button(buttons, text="Cancel", command=self._cancel_selected_task).grid(
             row=2, column=1, sticky="ew", padx=(4, 0), pady=2
         )
+        ttk.Button(
+            buttons, text="Run Verified Workflow...", command=self._run_workflow
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=2)
         buttons.columnconfigure(0, weight=1)
         buttons.columnconfigure(1, weight=1)
 
@@ -496,6 +499,11 @@ class PcAgentGuiApp:
         self.doc_title_var = tk.StringVar(value="GUI Document")
         self.pdf_expected_pages_var = tk.StringVar()
         self.pdf_recursive_var = tk.BooleanVar(value=False)
+        self.pdf_pages_var = tk.StringVar(value="1-2")
+        self.doc_find_var = tk.StringVar()
+        self.doc_replace_var = tk.StringVar()
+        self.doc_cell_ref_var = tk.StringVar(value="B2")
+        self.doc_cell_value_var = tk.StringVar(value="=SUM(A1:A3)")
         self.files_new_name_var = tk.StringVar(value="renamed.txt")
         self.files_folder_var = tk.StringVar(value=".")
         self.files_by_var = tk.StringVar(value="category")
@@ -568,6 +576,25 @@ class PcAgentGuiApp:
         ttk.Button(
             office_buttons, text="CSV to XLSX", command=self._doc_csv_to_xlsx
         ).grid(row=2, column=1, sticky="ew", padx=(3, 0), pady=2)
+        self._labeled_entry(office_panel, "DOCX find text", self.doc_find_var, 4)
+        self._labeled_entry(office_panel, "DOCX replace with", self.doc_replace_var, 6)
+        ttk.Button(
+            office_panel, text="DOCX Replace Text", command=self._doc_docx_replace
+        ).grid(row=8, column=0, sticky="ew", pady=2)
+        self._labeled_entry(office_panel, "XLSX cell (e.g. B2)", self.doc_cell_ref_var, 9)
+        self._labeled_entry(
+            office_panel, "XLSX value/formula", self.doc_cell_value_var, 11
+        )
+        xlsx_buttons = ttk.Frame(office_panel)
+        xlsx_buttons.grid(row=13, column=0, sticky="ew")
+        xlsx_buttons.columnconfigure(0, weight=1)
+        xlsx_buttons.columnconfigure(1, weight=1)
+        ttk.Button(xlsx_buttons, text="Set XLSX Cell", command=self._doc_xlsx_set_cell).grid(
+            row=0, column=0, sticky="ew", padx=(0, 3), pady=2
+        )
+        ttk.Button(
+            xlsx_buttons, text="Verify Formulas", command=self._doc_xlsx_verify_formulas
+        ).grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
 
         self._labeled_entry(create_panel, "New DOCX title", self.doc_title_var, 0)
         ttk.Label(create_panel, text="Paragraphs (one per line)").grid(
@@ -584,6 +611,11 @@ class PcAgentGuiApp:
         ttk.Button(
             create_panel, text="Create DOCX", command=self._doc_create_docx
         ).grid(row=4, column=0, sticky="ew", pady=2)
+        ttk.Button(
+            create_panel,
+            text="Append Paragraphs to Input DOCX",
+            command=self._doc_docx_append,
+        ).grid(row=5, column=0, sticky="ew", pady=2)
 
         ttk.Label(pdf_panel, text="PDF folders (one per line)").grid(
             row=0, column=0, sticky="w"
@@ -610,6 +642,22 @@ class PcAgentGuiApp:
         ttk.Button(
             pdf_buttons, text="Merge PDF Folders", command=self._pdf_merge_folders
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
+        self._labeled_entry(pdf_panel, "Pages to extract (e.g. 1-3,5)", self.pdf_pages_var, 6)
+        pdf_edit_buttons = ttk.Frame(pdf_panel)
+        pdf_edit_buttons.grid(row=8, column=0, sticky="ew")
+        pdf_edit_buttons.columnconfigure(0, weight=1)
+        pdf_edit_buttons.columnconfigure(1, weight=1)
+        ttk.Button(
+            pdf_edit_buttons, text="Extract Pages", command=self._pdf_extract_pages
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Split PDF", command=self._pdf_split
+        ).grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Label(
+            pdf_panel,
+            text="Extract writes the Output file; Split treats Output as a folder name.",
+            wraplength=380,
+        ).grid(row=9, column=0, sticky="w")
 
         ttk.Label(
             files_panel,
@@ -1397,6 +1445,58 @@ class PcAgentGuiApp:
         if not self._busy:
             self._populate_tasks(self.controller.list_tasks(limit=100))
 
+    def _run_workflow(self) -> None:
+        if self._busy:
+            return
+        try:
+            records = self.controller.list_workflows()
+        except PcAgentError as exc:
+            messagebox.showerror("Run verified workflow", str(exc), parent=self.root)
+            return
+        if not records:
+            messagebox.showinfo(
+                "Run verified workflow",
+                "No verified workflows are recorded yet.\n"
+                "Run a task to completion first; its verified plan is then "
+                "recorded automatically.",
+                parent=self.root,
+            )
+            return
+        known = "\n".join(
+            f"{record.key}  {record.title}" for record in records[:10]
+        )
+        key = simpledialog.askstring(
+            "Run verified workflow",
+            "Workflow key (or 'latest'):\n\n" + known,
+            initialvalue="latest",
+            parent=self.root,
+        )
+        if not key:
+            return
+        try:
+            options = self._task_options_from_form()
+        except PcAgentError as exc:
+            messagebox.showerror("Invalid task options", str(exc), parent=self.root)
+            return
+        if not messagebox.askokcancel(
+            "Run verified workflow",
+            f"Run verified workflow {key} as a new task?\n\n"
+            "The stored plan is revalidated against live policy and "
+            "verified again; memory itself grants no permission.",
+            parent=self.root,
+        ):
+            return
+
+        def done(report: Any) -> None:
+            self._set_text(self.task_details_text, format_execution_report(report))
+            self._populate_tasks(self.controller.list_tasks(limit=100))
+
+        self._run_async(
+            "Run verified workflow",
+            lambda: self.controller.run_workflow(key, options),
+            done,
+        )
+
     def _recover_selected_task(self) -> None:
         task_id = self._require_selected_task()
         if task_id is None:
@@ -1547,6 +1647,64 @@ class PcAgentGuiApp:
             lambda: self.controller.pdf_merge_folders(
                 folders, output_path, recursive=recursive
             ),
+        )
+
+    def _pdf_extract_pages(self) -> None:
+        path = self.doc_input_var.get()
+        pages = self.pdf_pages_var.get()
+        output_path = self.doc_output_var.get()
+        self._doc_tool(
+            "Extract PDF pages",
+            lambda: self.controller.pdf_extract_pages(path, pages, output_path),
+        )
+
+    def _pdf_split(self) -> None:
+        path = self.doc_input_var.get()
+        output_folder = self.doc_output_var.get()
+        self._doc_tool(
+            "Split PDF", lambda: self.controller.pdf_split(path, output_folder)
+        )
+
+    def _doc_docx_replace(self) -> None:
+        input_path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        find = self.doc_find_var.get()
+        replace = self.doc_replace_var.get()
+        self._doc_tool(
+            "DOCX replace text",
+            lambda: self.controller.office_docx_replace(
+                input_path, output_path, find, replace
+            ),
+        )
+
+    def _doc_docx_append(self) -> None:
+        input_path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        paragraphs = parse_line_list(self._get_text(self.doc_paragraphs_text))
+        self._doc_tool(
+            "DOCX append paragraphs",
+            lambda: self.controller.office_docx_append(
+                input_path, output_path, paragraphs
+            ),
+        )
+
+    def _doc_xlsx_set_cell(self) -> None:
+        input_path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        reference = self.doc_cell_ref_var.get()
+        value = self.doc_cell_value_var.get()
+        self._doc_tool(
+            "Set XLSX cell",
+            lambda: self.controller.office_xlsx_set_cell(
+                input_path, output_path, reference, value
+            ),
+        )
+
+    def _doc_xlsx_verify_formulas(self) -> None:
+        path = self.doc_input_var.get()
+        self._doc_tool(
+            "Verify XLSX formulas",
+            lambda: self.controller.office_xlsx_verify_formulas(path),
         )
 
     def _files_copy(self) -> None:

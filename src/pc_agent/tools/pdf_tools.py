@@ -5,7 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..documents.pdf import inspect_pdf, merge_pdf_files, verify_pdf
+from ..documents.pdf import (
+    extract_pdf_pages,
+    inspect_pdf,
+    merge_pdf_files,
+    parse_page_selection,
+    split_pdf,
+    verify_pdf,
+)
 from ..errors import ToolError
 from ..policies.policy import Action
 from .registry import ToolContext, ToolHandler, ToolRegistry, ToolSpec
@@ -133,6 +140,44 @@ def _discover_pdfs(context: ToolContext, folders: list[Path], recursive: bool) -
             seen.add(resolved)
             discovered.append(resolved)
     return discovered
+
+
+def _extract_pages(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    source = _resolve_allowed(context, str(arguments["path"]), Action.READ_FILE)
+    output = _resolve_allowed(context, str(arguments["output_path"]), Action.WRITE_FILE)
+    info = inspect_pdf(source)
+    if info.encrypted or info.pages is None:
+        raise ToolError("Encrypted PDFs are not supported without a password.")
+    pages = parse_page_selection(str(arguments["pages"]), info.pages)
+    result = extract_pdf_pages(source, pages, output)
+    return {
+        "path": relative_posix(context, source),
+        "output_path": relative_posix(context, output),
+        "source_pages": result.source_pages,
+        "extracted_pages": list(result.extracted_pages),
+        "page_count": result.page_count,
+        "size_bytes": result.size_bytes,
+        "sha256": result.sha256,
+        "verified": True,
+    }
+
+
+def _split(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    source = _resolve_allowed(context, str(arguments["path"]), Action.READ_FILE)
+    output_dir = _resolve_allowed(
+        context, str(arguments["output_folder"]), Action.WRITE_FILE
+    )
+    if output_dir.is_file():
+        raise ToolError("The split output must be a folder, not a file.")
+    prefix = arguments.get("prefix")
+    parts = split_pdf(source, output_dir, prefix=str(prefix) if prefix else None)
+    return {
+        "path": relative_posix(context, source),
+        "output_folder": relative_posix(context, output_dir),
+        "outputs": [relative_posix(context, part.path) for part in parts],
+        "page_count": len(parts),
+        "verified": True,
+    }
 
 
 _MERGE_OUTPUT_SCHEMA = {
@@ -290,6 +335,79 @@ def _specs() -> list[tuple[ToolSpec, ToolHandler]]:
                 timeout_seconds=180.0,
             ),
             _merge_folders,
+        ),
+        (
+            ToolSpec(
+                id="pdf.extract_pages",
+                name="Extract PDF pages",
+                version="1.0.0",
+                description="Extract selected pages (for example \"1-3,5\") into a new verified PDF. Never overwrites.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": string_path,
+                        "pages": string_path,
+                        "output_path": string_path,
+                    },
+                    "required": ["path", "pages", "output_path"],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "output_path": {"type": "string"},
+                        "source_pages": {"type": "integer"},
+                        "extracted_pages": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
+                        "page_count": {"type": "integer"},
+                        "size_bytes": {"type": "integer"},
+                        "sha256": {"type": "string"},
+                        "verified": {"type": "boolean"},
+                    },
+                    "required": [
+                        "path", "output_path", "source_pages", "extracted_pages",
+                        "page_count", "size_bytes", "sha256", "verified",
+                    ],
+                },
+                permissions=(Action.READ_FILE, Action.WRITE_FILE),
+                timeout_seconds=120.0,
+            ),
+            _extract_pages,
+        ),
+        (
+            ToolSpec(
+                id="pdf.split",
+                name="Split PDF into single pages",
+                version="1.0.0",
+                description="Split a PDF into one verified single-page PDF per page inside a workspace folder (max 200 pages). Never overwrites.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": string_path,
+                        "output_folder": string_path,
+                        "prefix": {"type": "string"},
+                    },
+                    "required": ["path", "output_folder"],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "output_folder": {"type": "string"},
+                        "outputs": {"type": "array", "items": {"type": "string"}},
+                        "page_count": {"type": "integer"},
+                        "verified": {"type": "boolean"},
+                    },
+                    "required": [
+                        "path", "output_folder", "outputs", "page_count", "verified",
+                    ],
+                },
+                permissions=(Action.READ_FILE, Action.WRITE_FILE),
+                timeout_seconds=180.0,
+            ),
+            _split,
         ),
     ]
 

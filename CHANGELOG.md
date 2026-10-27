@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.12.0 - PHASE 10 Verified Workflow Reuse
+
+- Workflow memory now stores the exact reusable plan material (normalized
+  instruction, validated arguments, external roots, expected pages) under a
+  precise per-instruction key; repeats to fresh outputs grow the same
+  workflow's verified count. Phase 7 legacy records stay usable through
+  their last task's stored plan.
+- New `pc-agent workflow list|show|run|delete` (exact key, unique prefix or
+  `latest`). `workflow run` creates a new task and re-runs the stored plan
+  only after live registry/allow-list revalidation, with fresh approvals
+  (never inherited), acceptance criteria, checkpoints and bounded recovery.
+- Planner fallback: when deterministic/AI planning cannot plan an
+  instruction, a still-valid verified workflow for the same normalized
+  instruction is reused instead of `needs_input`. Execution reports show
+  `Verified workflow recorded/reused: wf-...` in CLI (text + JSON) and GUI.
+- GUI Tasks tab gains **Run Verified Workflow...**. No new dependency or
+  database migration (schema stays v6); 10 new tests including a forged
+  workflow rejection and external-root approval re-check.
+
+Still not included: fuzzy/semantic workflow matching or argument
+re-binding, multi-step plans, secure OS credential storage, subprocess/Git
+adapters, browser or Windows UI automation, or image tools.
+
+## 0.11.0 - PHASE 9 Deeper Office
+
+- PDF: `pdf.extract_pages` (validated `1-3,5` selections, order preserved)
+  and `pdf.split` (one verified single-page PDF per page, max 200 pages,
+  partial outputs cleaned on failure).
+- DOCX: `office.docx_replace_text` (exact paragraph replacement that also
+  works when Word split a word across runs) and
+  `office.docx_append_paragraphs`, both writing new verified documents.
+- XLSX: `office.xlsx_set_cells` writes values or `=formulas` into one sheet
+  of an existing workbook (other package parts preserved, stale calcChain
+  dropped) and `office.xlsx_verify_formulas` recomputes every formula with
+  a bounded deterministic evaluator (arithmetic, ranges,
+  SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT/ABS/ROUND; circular/unsupported
+  formulas reported explicitly). Computed cached values are written back
+  so other readers see results immediately.
+- Independent verification for all six tools, Phase 7 acceptance criteria
+  for the writers (including PDF page-count expectations), checkpoints, and
+  fresh-output collision recovery for the editors.
+- Deterministic planner intents (`Extract pages...`, `Split...`,
+  `Replace...`, `Append...`, `Set cell...`, `Verify formulas`) with new
+  `--pages/--find/--replace/--cell/--value` run options; direct
+  `pdf extract|split` and `office docx-replace|docx-append|xlsx-set|
+  xlsx-formulas` CLI; new GUI Documents controls. 29 built-ins total, no
+  new dependency, no database migration (schema stays v6). 11 new tests.
+
+Still not included: cross-paragraph/header DOCX matches, XLSX styles/
+charts/pivots creation, lookup/date/conditional formula functions, PDF
+rotation or PDF text extraction, subprocess/Git adapters, browser or
+Windows UI automation, image tools, or multi-step planning.
+
 ## 0.10.0 - PHASE 8 File Operations
 
 - Five new workspace-confined tools (23 built-ins total): `files.copy`

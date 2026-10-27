@@ -51,6 +51,12 @@ _INTENT_TO_TOOL = {
     "files.rename": "files.rename",
     "files.organize": "files.organize",
     "files.search": "files.search",
+    "pdf.extract_pages": "pdf.extract_pages",
+    "pdf.split": "pdf.split",
+    "office.docx_replace_text": "office.docx_replace_text",
+    "office.docx_append_paragraphs": "office.docx_append_paragraphs",
+    "office.xlsx_set_cells": "office.xlsx_set_cells",
+    "office.xlsx_verify_formulas": "office.xlsx_verify_formulas",
 }
 
 
@@ -62,6 +68,13 @@ class PlannerOptions:
     target_path: str | None = None
     recursive: bool = False
     expected_pages: int | None = None
+    # Phase 9 deeper-office options (all optional; quoted instruction text
+    # is used as a fallback where that is unambiguous).
+    page_selection: str | None = None
+    find_text: str | None = None
+    replace_text: str | None = None
+    cell_reference: str | None = None
+    cell_value: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +168,9 @@ class DeterministicPlanner:
                     planner="deterministic",
                 )
             )
+        deeper_outcome = self._plan_deeper_office(instruction, options)
+        if deeper_outcome is not None:
+            return deeper_outcome
         office_outcome = self._plan_office(instruction, options)
         if office_outcome is not None:
             return office_outcome
@@ -525,6 +541,242 @@ class DeterministicPlanner:
                 ),
             )
         )
+
+    def _plan_deeper_office(
+        self, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome | None:
+        lowered = instruction.lower()
+        verb = _deeper_office_verb(lowered)
+        if verb is None:
+            return None
+
+        if verb in {"pdf.split", "pdf.extract_pages"}:
+            target = self._extract_target_pdf(instruction, options)
+            if isinstance(target, PlanningOutcome):
+                return target
+            if verb == "pdf.split":
+                raw_folder = options.output_path or f"{Path(target.argument).stem} split"
+                folder = self._workspace_folder(raw_folder)
+                if isinstance(folder, PlanningOutcome):
+                    return folder
+                return PlanningOutcome(
+                    plan=TaskPlan(
+                        intent="pdf.split",
+                        tool_id="pdf.split",
+                        arguments={
+                            "path": target.argument,
+                            "output_folder": folder,
+                        },
+                        summary=f"Split {target.argument} into single-page PDFs in {folder}.",
+                        planner="deterministic",
+                    )
+                )
+            selection = options.page_selection or _extract_page_selection(instruction)
+            if not selection:
+                return PlanningOutcome(
+                    missing_information=(
+                        'Which pages? Pass --pages "1-3,5" or say "pages 1-3".',
+                    )
+                )
+            count = _selection_page_count(selection)
+            if count is None:
+                return PlanningOutcome(
+                    missing_information=(
+                        f"Page selection {selection!r} is invalid; use forms like 1-3,5.",
+                    )
+                )
+            output = self._workspace_output(
+                options.output_path,
+                default_name=f"{Path(target.argument).stem}-extracted.pdf",
+                expected_suffix=".pdf",
+                format_label="PDF",
+            )
+            if isinstance(output, PlanningOutcome):
+                return output
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="pdf.extract_pages",
+                    tool_id="pdf.extract_pages",
+                    arguments={
+                        "path": target.argument,
+                        "pages": selection.replace(" ", ""),
+                        "output_path": output,
+                    },
+                    summary=f"Extract pages {selection} from {target.argument} into {output}.",
+                    planner="deterministic",
+                    expected_pages=count,
+                )
+            )
+
+        if verb in {"office.docx_replace_text", "office.docx_append_paragraphs"}:
+            target = self._workspace_office_target(instruction, options, suffix=".docx")
+            if isinstance(target, PlanningOutcome):
+                return target
+            output = self._workspace_output(
+                options.output_path,
+                default_name=f"{Path(target.argument).stem}-edited.docx",
+                expected_suffix=".docx",
+                format_label="DOCX",
+            )
+            if isinstance(output, PlanningOutcome):
+                return output
+            if verb == "office.docx_replace_text":
+                quoted = _extract_quoted(instruction)
+                find = options.find_text or (quoted[0] if quoted else None)
+                replace = options.replace_text or (
+                    quoted[1] if len(quoted) > 1 else None
+                )
+                if not find:
+                    return PlanningOutcome(
+                        missing_information=(
+                            "What text should be replaced? Quote it or pass --find.",
+                        )
+                    )
+                if replace is None:
+                    return PlanningOutcome(
+                        missing_information=(
+                            "Replace it with what? Quote the new text or pass --replace.",
+                        )
+                    )
+                return PlanningOutcome(
+                    plan=TaskPlan(
+                        intent="office.docx_replace_text",
+                        tool_id="office.docx_replace_text",
+                        arguments={
+                            "input_path": target.argument,
+                            "output_path": output,
+                            "find": find,
+                            "replace": replace,
+                        },
+                        summary=f"Replace text in {target.argument} into {output}.",
+                        planner="deterministic",
+                    )
+                )
+            paragraphs = _extract_quoted(instruction)
+            if not paragraphs:
+                return PlanningOutcome(
+                    missing_information=(
+                        "What paragraph should be appended? Quote the text.",
+                    )
+                )
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="office.docx_append_paragraphs",
+                    tool_id="office.docx_append_paragraphs",
+                    arguments={
+                        "input_path": target.argument,
+                        "output_path": output,
+                        "paragraphs": paragraphs,
+                    },
+                    summary=f"Append {len(paragraphs)} paragraph(s) to {target.argument} into {output}.",
+                    planner="deterministic",
+                )
+            )
+
+        # XLSX verbs
+        target = self._workspace_office_target(instruction, options, suffix=".xlsx")
+        if isinstance(target, PlanningOutcome):
+            return target
+        if verb == "office.xlsx_verify_formulas":
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="office.xlsx_verify_formulas",
+                    tool_id="office.xlsx_verify_formulas",
+                    arguments={"path": target.argument},
+                    summary=f"Verify formulas in {target.argument}.",
+                    planner="deterministic",
+                )
+            )
+        reference = options.cell_reference or _extract_cell_reference(instruction)
+        quoted = _extract_quoted(instruction)
+        value = options.cell_value or (quoted[0] if quoted else None)
+        if not reference:
+            return PlanningOutcome(
+                missing_information=("Which cell? Say \"cell B2\" or pass --cell B2.",)
+            )
+        if value is None:
+            return PlanningOutcome(
+                missing_information=(
+                    "What value or formula? Quote it, e.g. \"=SUM(A1:A3)\", or pass --value.",
+                )
+            )
+        output = self._workspace_output(
+            options.output_path,
+            default_name=f"{Path(target.argument).stem}-edited.xlsx",
+            expected_suffix=".xlsx",
+            format_label="XLSX",
+        )
+        if isinstance(output, PlanningOutcome):
+            return output
+        return PlanningOutcome(
+            plan=TaskPlan(
+                intent="office.xlsx_set_cells",
+                tool_id="office.xlsx_set_cells",
+                arguments={
+                    "input_path": target.argument,
+                    "output_path": output,
+                    "cells": [{"reference": reference.upper(), "value": value}],
+                },
+                summary=f"Set cell {reference.upper()} in {target.argument} into {output}.",
+                planner="deterministic",
+            )
+        )
+
+    def _workspace_office_target(
+        self, instruction: str, options: PlannerOptions, *, suffix: str
+    ) -> _ResolvedInput | PlanningOutcome:
+        raw_target = (
+            options.target_path
+            or (options.input_files[0] if options.input_files else None)
+            or next(
+                (
+                    token
+                    for token in _extract_office_tokens(instruction)
+                    if token.lower().endswith(suffix)
+                ),
+                None,
+            )
+        )
+        if not raw_target:
+            return PlanningOutcome(
+                missing_information=(
+                    f"Which {suffix} file should be used? Pass --target <path>.",
+                )
+            )
+        resolved = self._resolve_input(str(raw_target))
+        if resolved is None or not resolved.resolved.is_file():
+            return PlanningOutcome(
+                missing_information=(f"File was not found: {raw_target}",)
+            )
+        if resolved.external_root is not None:
+            return PlanningOutcome(
+                missing_information=(
+                    (
+                        "Deeper-office edits are workspace-only in this phase. "
+                        "Choose a file inside the workspace."
+                    ),
+                )
+            )
+        if resolved.resolved.suffix.lower() != suffix:
+            return PlanningOutcome(
+                missing_information=(f"The target file must end with {suffix}.",)
+            )
+        return resolved
+
+    def _workspace_folder(self, raw_folder: str) -> str | PlanningOutcome:
+        candidate = Path(raw_folder).expanduser()
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (self._workspace / candidate).resolve()
+        )
+        if resolved == self._workspace or not resolved.is_relative_to(self._workspace):
+            return PlanningOutcome(
+                missing_information=(
+                    "The split output folder must be inside the workspace.",
+                )
+            )
+        return resolved.relative_to(self._workspace).as_posix()
 
     def _plan_files(
         self, instruction: str, options: PlannerOptions
@@ -1149,6 +1401,63 @@ def _office_conversion(
     ):
         return "office.csv_to_xlsx", ".csv", ".xlsx", "to XLSX"
     return None
+
+
+def _deeper_office_verb(lowered: str) -> str | None:
+    """Detect a Phase 9 deeper-office verb, most specific first."""
+
+    if re.search(r"\bextract\b", lowered) and "page" in lowered:
+        return "pdf.extract_pages"
+    if re.search(r"\bsplit\b", lowered) and "pdf" in lowered:
+        return "pdf.split"
+    if re.search(r"\b(replace|change)\b", lowered) and any(
+        word in lowered for word in ("docx", "document", "word")
+    ):
+        return "office.docx_replace_text"
+    if re.search(r"\bappend\b", lowered) and any(
+        word in lowered for word in ("docx", "document", "word")
+    ):
+        return "office.docx_append_paragraphs"
+    if "formula" in lowered and any(
+        word in lowered for word in ("verify", "check", "calculate", "compute")
+    ):
+        return "office.xlsx_verify_formulas"
+    if re.search(r"\b(set|put|write)\b", lowered) and "cell" in lowered:
+        return "office.xlsx_set_cells"
+    return None
+
+
+def _extract_page_selection(instruction: str) -> str | None:
+    match = re.search(r"pages?\s+([0-9][0-9,\s\-]*[0-9]|[0-9])", instruction.lower())
+    return match.group(1).strip() if match else None
+
+
+def _selection_page_count(selection: str) -> int | None:
+    compact = selection.replace(" ", "")
+    if not re.fullmatch(r"\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*", compact):
+        return None
+    total = 0
+    seen: set[int] = set()
+    for token in compact.split(","):
+        if "-" in token:
+            start, _, end = token.partition("-")
+            first, last = int(start), int(end)
+            if first > last or last - first > 100_000:
+                return None
+            values = range(first, last + 1)
+        else:
+            values = range(int(token), int(token) + 1)
+        for value in values:
+            if value in seen or value < 1:
+                return None
+            seen.add(value)
+            total += 1
+    return total or None
+
+
+def _extract_cell_reference(instruction: str) -> str | None:
+    match = re.search(r"\bcell\s+([A-Za-z]{1,3}[0-9]+)\b", instruction)
+    return match.group(1) if match else None
 
 
 def _file_operation_verb(lowered: str) -> str | None:

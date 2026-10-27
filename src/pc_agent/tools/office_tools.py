@@ -13,12 +13,17 @@ from typing import Any
 
 from ..documents.office import (
     MAX_CSV_FILE_BYTES,
+    append_docx_paragraphs,
     build_docx,
     build_xlsx,
+    evaluate_workbook_formulas,
     extract_office_text,
     inspect_csv,
     inspect_office,
     read_csv,
+    read_xlsx_cells,
+    replace_docx_text,
+    set_xlsx_cells,
 )
 from ..errors import ToolError
 from ..policies.policy import Action
@@ -228,6 +233,126 @@ def _csv_to_xlsx(arguments: dict[str, Any], context: ToolContext) -> dict[str, A
     }
 
 
+def _docx_replace(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    source = _resolve_allowed(context, str(arguments["input_path"]), Action.READ_FILE)
+    output = _resolve_allowed(context, str(arguments["output_path"]), Action.WRITE_FILE)
+    _require_different(source, output)
+    if source.suffix.lower() != ".docx" or output.suffix.lower() != ".docx":
+        raise ToolError("DOCX replace needs a .docx input and a .docx output.")
+    result = replace_docx_text(
+        source, str(arguments["find"]), str(arguments.get("replace", ""))
+    )
+    size, digest, _info = _write_verified_package(
+        output, result.data, expected_format="docx"
+    )
+    return {
+        "input_path": relative_posix(context, source),
+        "output_path": relative_posix(context, output),
+        "format": "docx",
+        "find": str(arguments["find"]),
+        "replace": str(arguments.get("replace", "")),
+        "replacements": result.replacements,
+        "paragraphs_changed": result.paragraphs_changed,
+        "size_bytes": size,
+        "sha256": digest,
+        "verified": True,
+    }
+
+
+def _docx_append(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    source = _resolve_allowed(context, str(arguments["input_path"]), Action.READ_FILE)
+    output = _resolve_allowed(context, str(arguments["output_path"]), Action.WRITE_FILE)
+    _require_different(source, output)
+    if source.suffix.lower() != ".docx" or output.suffix.lower() != ".docx":
+        raise ToolError("DOCX append needs a .docx input and a .docx output.")
+    paragraphs = [str(item) for item in arguments.get("paragraphs", [])]
+    result = append_docx_paragraphs(source, paragraphs)
+    size, digest, _info = _write_verified_package(
+        output, result.data, expected_format="docx"
+    )
+    return {
+        "input_path": relative_posix(context, source),
+        "output_path": relative_posix(context, output),
+        "format": "docx",
+        "paragraphs_added": result.paragraphs_added,
+        "total_paragraphs": result.total_paragraphs,
+        "size_bytes": size,
+        "sha256": digest,
+        "verified": True,
+    }
+
+
+def _formula_items(evaluations: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "sheet": item.sheet,
+            "reference": item.reference,
+            "formula": item.formula,
+            "computed": item.value,
+            "error": item.error,
+        }
+        for item in evaluations
+    ]
+
+
+def _xlsx_set_cells(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    source = _resolve_allowed(context, str(arguments["input_path"]), Action.READ_FILE)
+    output = _resolve_allowed(context, str(arguments["output_path"]), Action.WRITE_FILE)
+    _require_different(source, output)
+    if source.suffix.lower() != ".xlsx" or output.suffix.lower() != ".xlsx":
+        raise ToolError("XLSX set-cells needs a .xlsx input and a .xlsx output.")
+    raw_cells = arguments.get("cells")
+    if not isinstance(raw_cells, list) or not raw_cells:
+        raise ToolError(
+            "cells must be a non-empty list like "
+            "[{\"reference\": \"B2\", \"value\": \"=SUM(A1:A3)\"}]."
+        )
+    edits: dict[str, str] = {}
+    for item in raw_cells:
+        if not isinstance(item, dict):
+            raise ToolError("Each cells entry must be {\"reference\": ..., \"value\": ...}.")
+        reference = str(item.get("reference") or "").strip()
+        if not reference or "value" not in item:
+            raise ToolError("Each cells entry needs a reference and a value.")
+        edits[reference] = str(item["value"])
+    sheet_name = arguments.get("sheet_name")
+    result = set_xlsx_cells(
+        source, edits, sheet_name=str(sheet_name) if sheet_name else None
+    )
+    size, digest, _info = _write_verified_package(
+        output, result.data, expected_format="xlsx"
+    )
+    return {
+        "input_path": relative_posix(context, source),
+        "output_path": relative_posix(context, output),
+        "format": "xlsx",
+        "sheet": result.sheet,
+        "cells_set": list(result.cells_set),
+        "formulas": _formula_items(result.evaluations),
+        "size_bytes": size,
+        "sha256": digest,
+        "verified": True,
+    }
+
+
+def _xlsx_verify_formulas(
+    arguments: dict[str, Any], context: ToolContext
+) -> dict[str, Any]:
+    source = _resolve_allowed(context, str(arguments["path"]), Action.READ_FILE)
+    if source.suffix.lower() != ".xlsx":
+        raise ToolError("Formula verification needs a .xlsx file.")
+    workbook = read_xlsx_cells(source)
+    evaluations = evaluate_workbook_formulas(workbook)
+    computed_count = sum(1 for item in evaluations if item.value is not None)
+    return {
+        "path": relative_posix(context, source),
+        "formulas": _formula_items(evaluations),
+        "formula_count": len(evaluations),
+        "computed_count": computed_count,
+        "unsupported_count": len(evaluations) - computed_count,
+    }
+
+
 def _csv_scalar(value: Any) -> str:
     if value is None:
         return ""
@@ -290,6 +415,80 @@ def _write_verified_package(
         temporary.unlink(missing_ok=True)
         raise
     return len(data), hashlib.sha256(data).hexdigest(), info
+
+
+def _formula_items_schema() -> dict[str, Any]:
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "sheet": {"type": "string"},
+                "reference": {"type": "string"},
+                "formula": {"type": "string"},
+                "computed": {"type": ["number", "null"]},
+                "error": {"type": ["string", "null"]},
+            },
+            "required": ["sheet", "reference", "formula", "computed", "error"],
+        },
+    }
+
+
+def _docx_edit_schema(*, extra_replacements: bool) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "input_path": {"type": "string"},
+        "output_path": {"type": "string"},
+        "format": {"type": "string"},
+        "size_bytes": {"type": "integer"},
+        "sha256": {"type": "string"},
+        "verified": {"type": "boolean"},
+    }
+    if extra_replacements:
+        properties.update(
+            {
+                "find": {"type": "string"},
+                "replace": {"type": "string"},
+                "replacements": {"type": "integer"},
+                "paragraphs_changed": {"type": "integer"},
+            }
+        )
+        required = [
+            "input_path", "output_path", "format", "find", "replace",
+            "replacements", "paragraphs_changed", "size_bytes", "sha256", "verified",
+        ]
+    else:
+        properties.update(
+            {
+                "paragraphs_added": {"type": "integer"},
+                "total_paragraphs": {"type": "integer"},
+            }
+        )
+        required = [
+            "input_path", "output_path", "format", "paragraphs_added",
+            "total_paragraphs", "size_bytes", "sha256", "verified",
+        ]
+    return {"type": "object", "properties": properties, "required": required}
+
+
+def _xlsx_set_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "input_path": {"type": "string"},
+            "output_path": {"type": "string"},
+            "format": {"type": "string"},
+            "sheet": {"type": "string"},
+            "cells_set": {"type": "array", "items": {"type": "string"}},
+            "formulas": _formula_items_schema(),
+            "size_bytes": {"type": "integer"},
+            "sha256": {"type": "string"},
+            "verified": {"type": "boolean"},
+        },
+        "required": [
+            "input_path", "output_path", "format", "sheet", "cells_set",
+            "formulas", "size_bytes", "sha256", "verified",
+        ],
+    }
 
 
 def _conversion_output_schema(format_type: str) -> dict[str, Any]:
@@ -609,6 +808,120 @@ def _specs() -> list[tuple[ToolSpec, ToolHandler]]:
                 timeout_seconds=60.0,
             ),
             _csv_to_xlsx,
+        ),
+        (
+            ToolSpec(
+                id="office.docx_replace_text",
+                name="Replace text in DOCX",
+                version="1.0.0",
+                description="Replace exact paragraph text in a DOCX and write a new verified document. Never overwrites.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "input_path": string_path,
+                        "output_path": string_path,
+                        "find": {"type": "string", "minLength": 1},
+                        "replace": {"type": "string"},
+                    },
+                    "required": ["input_path", "output_path", "find"],
+                },
+                output_schema=_docx_edit_schema(extra_replacements=True),
+                permissions=(Action.READ_FILE, Action.WRITE_FILE),
+                timeout_seconds=60.0,
+            ),
+            _docx_replace,
+        ),
+        (
+            ToolSpec(
+                id="office.docx_append_paragraphs",
+                name="Append paragraphs to DOCX",
+                version="1.0.0",
+                description="Append paragraphs to a DOCX body and write a new verified document. Never overwrites.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "input_path": string_path,
+                        "output_path": string_path,
+                        "paragraphs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 100,
+                        },
+                    },
+                    "required": ["input_path", "output_path", "paragraphs"],
+                },
+                output_schema=_docx_edit_schema(extra_replacements=False),
+                permissions=(Action.READ_FILE, Action.WRITE_FILE),
+                timeout_seconds=60.0,
+            ),
+            _docx_append,
+        ),
+        (
+            ToolSpec(
+                id="office.xlsx_set_cells",
+                name="Set XLSX cells (values/formulas)",
+                version="1.0.0",
+                description="Set cell values or =formulas in one sheet of an existing XLSX, writing a new workbook with freshly computed cached formula values. Never overwrites.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "input_path": string_path,
+                        "output_path": string_path,
+                        "sheet_name": {"type": "string"},
+                        "cells": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "reference": {"type": "string", "minLength": 2},
+                                    "value": {"type": "string"},
+                                },
+                                "required": ["reference", "value"],
+                            },
+                            "minItems": 1,
+                            "maxItems": 100,
+                        },
+                    },
+                    "required": ["input_path", "output_path", "cells"],
+                },
+                output_schema=_xlsx_set_schema(),
+                permissions=(Action.READ_FILE, Action.WRITE_FILE),
+                timeout_seconds=60.0,
+            ),
+            _xlsx_set_cells,
+        ),
+        (
+            ToolSpec(
+                id="office.xlsx_verify_formulas",
+                name="Verify XLSX formulas",
+                version="1.0.0",
+                description="Recompute every spreadsheet formula deterministically (arithmetic + SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT/ABS/ROUND) and report each value or the exact unsupported reason.",
+                input_schema={
+                    "type": "object",
+                    "properties": {"path": string_path},
+                    "required": ["path"],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "formulas": _formula_items_schema(),
+                        "formula_count": {"type": "integer"},
+                        "computed_count": {"type": "integer"},
+                        "unsupported_count": {"type": "integer"},
+                    },
+                    "required": [
+                        "path",
+                        "formulas",
+                        "formula_count",
+                        "computed_count",
+                        "unsupported_count",
+                    ],
+                },
+                permissions=(Action.READ_FILE,),
+            ),
+            _xlsx_verify_formulas,
         ),
     ]
 

@@ -42,9 +42,15 @@ _WRITER_TOOLS = frozenset(
         "files.copy",
         "files.move",
         "files.rename",
+        "pdf.extract_pages",
+        "office.docx_replace_text",
+        "office.docx_append_paragraphs",
+        "office.xlsx_set_cells",
     }
 )
-_PDF_PAGE_TOOLS = frozenset({"pdf.merge", "pdf.merge_folders", "pdf.verify", "pdf.inspect"})
+_PDF_PAGE_TOOLS = frozenset(
+    {"pdf.merge", "pdf.merge_folders", "pdf.verify", "pdf.inspect", "pdf.extract_pages"}
+)
 _ROW_COUNT_TOOLS = frozenset({"office.csv_inspect", "office.csv_to_json", "office.json_to_csv"})
 
 

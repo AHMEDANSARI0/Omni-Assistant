@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-healing-pc-agent"
-version = "0.10.0"
-description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file operations)"
+version = "0.12.0"
+description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file/Office operations + verified workflow reuse)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }

@@ -18,6 +18,12 @@ arguments before execution and validates the returned object afterwards.
 | `files.rename` | 1.0.0 | Rename one workspace file in place (plain new name only) | move_file, write_file |
 | `files.organize` | 1.0.0 | Move a folder's top-level files into category/extension subfolders; conflicts skipped + reported | list_files, move_file, write_file |
 | `files.search` | 1.0.0 | Search file names and optionally bounded UTF-8 content; credential-like contents never searched | list_files, read_file |
+| `pdf.extract_pages` | 1.0.0 | Extract selected pages (`1-3,5`) into a new verified PDF | read_file, write_file |
+| `pdf.split` | 1.0.0 | Split into verified single-page PDFs (max 200 pages) | read_file, write_file |
+| `office.docx_replace_text` | 1.0.0 | Replace exact paragraph text (run-boundary safe) into a new DOCX | read_file, write_file |
+| `office.docx_append_paragraphs` | 1.0.0 | Append paragraphs to a DOCX body into a new file | read_file, write_file |
+| `office.xlsx_set_cells` | 1.0.0 | Set cell values/`=`formulas in one sheet with computed cached values | read_file, write_file |
+| `office.xlsx_verify_formulas` | 1.0.0 | Deterministically recompute every formula; unsupported ones reported exactly | read_file |
 | `pdf.inspect` | 1.0.0 | Open a PDF and report page count/size | read_file |
 | `pdf.verify` | 1.0.0 | Re-open a PDF and optionally compare page count | read_file |
 | `pdf.merge` | 1.0.0 | Merge an explicit ordered list into a new verified workspace PDF | read_file, write_file |
@@ -116,7 +122,10 @@ Natural-language execution may use the five Phase 1C PDF/list tools plus
 `office.csv_to_json`, `office.json_to_csv`, `office.csv_to_xlsx`, and
 `desktop.system_info`. Phase 8 adds deterministic-only `files.copy`,
 `files.move`, `files.rename`, `files.organize` and `files.search` (AI
-plans for them are rejected). AI planning has a smaller Office subset
+plans for them are rejected). Phase 9 adds deterministic-only
+`pdf.extract_pages`, `pdf.split`, `office.docx_replace_text`,
+`office.docx_append_paragraphs`, `office.xlsx_set_cells` and
+`office.xlsx_verify_formulas`. AI planning has a smaller Office subset
 (inspection and conversions, not extraction or DOCX creation). `web.fetch`,
 `desktop.open_path`, `desktop.open_url`, `workspace.read_text` and
 `workspace.write_text` are never orchestrated generic-task choices.

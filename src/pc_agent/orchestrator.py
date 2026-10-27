@@ -27,7 +27,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
-from .documents.office import inspect_csv, inspect_office, read_csv
+from .documents.office import (
+    evaluate_workbook_formulas,
+    extract_office_text,
+    inspect_csv,
+    inspect_office,
+    read_csv,
+    read_xlsx_cells,
+)
 from .domain.task import Task, TaskStatus
 from .errors import (
     ApprovalUnavailableError,
@@ -52,6 +59,7 @@ from .recovery import (
 )
 from .storage.repositories import (
     ExecutionRepository,
+    MemoryItemRecord,
     MemoryRepository,
     RecoveryAttemptRecord,
     RecoveryRepository,
@@ -65,12 +73,39 @@ logger = logging.getLogger(__name__)
 CancellationCallback = Callable[[], bool]
 
 
+def _normalize_instruction(instruction: str) -> str:
+    return " ".join(instruction.lower().split()).strip(" .!")
+
+
+def _workflow_key(plan: TaskPlan, normalized_instruction: str) -> str:
+    # output_path is excluded: repeating the same verified work to a fresh
+    # output is still the same workflow; the full last arguments are kept
+    # inside the record for reuse.
+    basis = {
+        key: value
+        for key, value in dict(plan.arguments).items()
+        if key != "output_path"
+    }
+    canonical = json.dumps(basis, sort_keys=True, default=str)
+    digest = hashlib.sha256(
+        f"{plan.intent}|{plan.tool_id}|{normalized_instruction}|{canonical}".encode()
+    ).hexdigest()
+    return f"wf-{digest[:16]}"
+
+
 def _stream_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(64 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _numbers_close(left: str, right: str) -> bool:
+    try:
+        return abs(float(left) - float(right)) <= 1e-9
+    except ValueError:
+        return False
 
 _ALLOWED_ORCHESTRATED_TOOLS = frozenset(
     {
@@ -91,6 +126,12 @@ _ALLOWED_ORCHESTRATED_TOOLS = frozenset(
         "files.rename",
         "files.organize",
         "files.search",
+        "pdf.extract_pages",
+        "pdf.split",
+        "office.docx_replace_text",
+        "office.docx_append_paragraphs",
+        "office.xlsx_set_cells",
+        "office.xlsx_verify_formulas",
     }
 )
 
@@ -125,6 +166,9 @@ class ExecutionReport:
     error: str | None = None
     verification_report: VerificationReport | None = None
     resumed_from_checkpoint: bool = False
+    workflow_key: str | None = None
+    workflow_success_count: int = 0
+    workflow_reused: bool = False
 
     @property
     def success(self) -> bool:
@@ -286,6 +330,42 @@ class TaskOrchestrator:
                     )
 
         if outcome.plan is None:
+            reused = self.find_workflow_plan(task.instruction)
+            if reused is not None:
+                workflow_key, plan, prior_successes = reused
+                if self._is_cancellation_requested(task.id, cancellation_requested):
+                    return self._cancelled_report(
+                        task,
+                        plan=plan,
+                        provider_attempts=outcome.provider_attempts,
+                        source_task_id=source_task_id,
+                    )
+                self._execution.save_plan(task.id, plan.to_dict(), plan.planner)
+                self._tasks.record_event(
+                    task.id,
+                    "workflow_reuse",
+                    f"Planner missed; reusing verified workflow {workflow_key} "
+                    f"({prior_successes} prior verified success(es)) after "
+                    "live revalidation.",
+                )
+                report = self._approve_and_run(
+                    task,
+                    plan,
+                    approval_callback,
+                    outcome.provider_attempts,
+                    max_recovery_attempts=recovery_limit,
+                    source_task_id=source_task_id,
+                    initial_action=RecoveryAction.EXECUTE_PLAN,
+                    cancellation_requested=cancellation_requested,
+                )
+                return replace(
+                    report,
+                    workflow_key=report.workflow_key or workflow_key,
+                    workflow_success_count=(
+                        report.workflow_success_count or prior_successes
+                    ),
+                    workflow_reused=True,
+                )
             message = " ".join(outcome.missing_information) or "More information is required."
             needs_input = self._tasks.update_status(
                 task.id,
@@ -563,13 +643,11 @@ class TaskOrchestrator:
 
     def _record_workflow_memory(
         self, task: Task, plan: TaskPlan, result: ToolResult
-    ) -> None:
+    ) -> tuple[str, int] | None:
         if self._memory is None:
-            return
+            return None
         try:
-            key = "wf-" + hashlib.sha256(
-                f"{plan.intent}|{plan.tool_id}".encode()
-            ).hexdigest()[:16]
+            key = _workflow_key(plan, _normalize_instruction(task.instruction))
             existing = self._memory.get("workflow", key)
             success_count = 1
             if existing is not None:
@@ -583,19 +661,213 @@ class TaskOrchestrator:
                 title=plan.summary,
                 content={
                     "instruction": task.instruction,
+                    "normalized_instruction": _normalize_instruction(task.instruction),
                     "intent": plan.intent,
                     "tool_id": plan.tool_id,
                     "planner": plan.planner,
+                    "arguments": dict(plan.arguments),
+                    "external_read_roots": [
+                        str(root) for root in plan.external_read_roots
+                    ],
+                    "expected_pages": plan.expected_pages,
                     "output_path": output.get("output_path"),
                     "success_count": success_count,
                     "last_task_id": task.id,
                 },
                 source_task_id=task.id,
             )
+            return key, success_count
         except PcAgentError as exc:
             # Memory is supporting evidence, never a reason to fail a task
             # that already executed and verified successfully.
             logger.warning("Workflow memory could not be recorded: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Phase 10: verified workflow reuse. Memory supplies a candidate plan
+    # only; the live registry, policy, approvals, verification, criteria
+    # and bounded recovery decide everything else, exactly as for a fresh
+    # plan. A workflow record can never grant authority by itself.
+    # ------------------------------------------------------------------
+    def resolve_workflow(self, key: str) -> MemoryItemRecord:
+        if self._memory is None:
+            raise PcAgentError("Workflow memory is not available.")
+        records = self._memory.list(kind="workflow", limit=500)
+        if not records:
+            raise PcAgentError(
+                "No verified workflows are recorded yet. Run a task to "
+                "completion first; it will be recorded automatically."
+            )
+        cleaned = key.strip()
+        if cleaned == "latest":
+            return records[0]
+        exact = [record for record in records if record.key == cleaned]
+        if exact:
+            return exact[0]
+        prefix = [record for record in records if record.key.startswith(cleaned)]
+        if len(prefix) == 1:
+            return prefix[0]
+        if len(prefix) > 1:
+            raise PcAgentError(
+                f"Workflow key {cleaned!r} is ambiguous; use the full key."
+            )
+        raise PcAgentError(f"Workflow not found: {cleaned}")
+
+    def workflow_records(self) -> tuple[MemoryItemRecord, ...]:
+        if self._memory is None:
+            return ()
+        return tuple(self._memory.list(kind="workflow", limit=500))
+
+    def delete_workflow(self, key: str) -> MemoryItemRecord:
+        record = self.resolve_workflow(key)
+        assert self._memory is not None  # resolve_workflow guarantees this
+        self._memory.delete("workflow", record.key)
+        return record
+
+    def find_workflow_plan(
+        self, instruction: str
+    ) -> tuple[str, TaskPlan, int] | None:
+        """Best still-valid verified plan for this exact instruction, if any."""
+
+        if self._memory is None:
+            return None
+        normalized = _normalize_instruction(instruction)
+        if not normalized:
+            return None
+        candidates: list[MemoryItemRecord] = []
+        for record in self._memory.list(kind="workflow", limit=500):
+            recorded = record.content.get("normalized_instruction")
+            if not isinstance(recorded, str):
+                original = record.content.get("instruction")
+                recorded = (
+                    _normalize_instruction(original)
+                    if isinstance(original, str)
+                    else ""
+                )
+            if recorded == normalized:
+                candidates.append(record)
+        candidates.sort(
+            key=lambda record: (
+                -(record.content.get("success_count")
+                  if isinstance(record.content.get("success_count"), int) else 0),
+                -record.updated_at.timestamp(),
+            )
+        )
+        for record in candidates:
+            plan = self._plan_from_workflow(record)
+            if plan is not None:
+                count = record.content.get("success_count")
+                return record.key, plan, count if isinstance(count, int) else 0
+        return None
+
+    def _plan_from_workflow(self, record: MemoryItemRecord) -> TaskPlan | None:
+        content = record.content
+        arguments = content.get("arguments")
+        plan: TaskPlan | None = None
+        if isinstance(arguments, Mapping):
+            intent = content.get("intent")
+            tool_id = content.get("tool_id")
+            roots = content.get("external_read_roots")
+            expected = content.get("expected_pages")
+            if isinstance(intent, str) and isinstance(tool_id, str):
+                plan = TaskPlan(
+                    intent=intent,
+                    tool_id=tool_id,
+                    arguments=dict(arguments),
+                    summary=record.title or f"Reuse verified workflow {record.key}.",
+                    planner="workflow-reuse",
+                    external_read_roots=tuple(
+                        Path(str(root)) for root in roots
+                    ) if isinstance(roots, list) else (),
+                    expected_pages=expected if isinstance(expected, int) else None,
+                )
+        if plan is None:
+            # Legacy records (Phase 7) carry no arguments; fall back to the
+            # stored plan of the last verified task.
+            last_task_id = content.get("last_task_id")
+            if isinstance(last_task_id, str):
+                try:
+                    stored = self._execution.get_plan(last_task_id)
+                    if stored is not None:
+                        plan = TaskPlan.from_dict(stored)
+                except (PcAgentError, PlanningError, TypeError, ValueError) as exc:
+                    logger.warning(
+                        "Workflow %s stored plan is unusable: %s", record.key, exc
+                    )
+                    return None
+        if plan is None or plan.tool_id not in _ALLOWED_ORCHESTRATED_TOOLS:
+            return None
+        registered = self._tools.get(plan.tool_id)
+        if registered is None:
+            return None
+        return replace(plan, planner="workflow-reuse")
+
+    def run_workflow(
+        self,
+        task_id: str,
+        workflow_key: str,
+        *,
+        approval_callback: ApprovalCallback | None = None,
+        max_recovery_attempts: int | None = None,
+        cancellation_requested: CancellationCallback | None = None,
+    ) -> ExecutionReport:
+        recovery_limit = self._validate_recovery_limit(
+            self._max_recovery_attempts
+            if max_recovery_attempts is None
+            else max_recovery_attempts
+        )
+        task = self._require_task(task_id)
+        if task.is_terminal:
+            raise PcAgentError(
+                f"Task {task.id} is already {task.status.value}; create a new task."
+            )
+        if task.status not in {TaskStatus.QUEUED, TaskStatus.NEEDS_INPUT}:
+            raise PcAgentError(
+                f"Task {task.id} cannot run a workflow from status {task.status.value}."
+            )
+        if self._is_cancellation_requested(task.id, cancellation_requested):
+            return self._cancelled_report(task)
+        record = self.resolve_workflow(workflow_key)
+        task = self._tasks.update_status(
+            task.id, TaskStatus.PLANNING, message="Reusing verified workflow"
+        )
+        plan = self._plan_from_workflow(record)
+        if plan is None:
+            message = (
+                f"Workflow {record.key} no longer maps to a valid allowed plan; "
+                "it was not executed. Re-run the task normally to record a "
+                "fresh verified workflow."
+            )
+            failed = self._tasks.update_status(
+                task.id, TaskStatus.FAILED, message="Workflow invalid", error=message
+            )
+            return ExecutionReport(task=failed, error=message)
+        self._execution.save_plan(task.id, plan.to_dict(), plan.planner)
+        self._tasks.record_event(
+            task.id,
+            "workflow_reuse",
+            f"Reusing verified workflow {record.key} after live revalidation.",
+        )
+        report = self._approve_and_run(
+            task,
+            plan,
+            approval_callback,
+            (),
+            max_recovery_attempts=recovery_limit,
+            source_task_id=None,
+            initial_action=RecoveryAction.EXECUTE_PLAN,
+            cancellation_requested=cancellation_requested,
+        )
+        count = record.content.get("success_count")
+        return replace(
+            report,
+            workflow_key=report.workflow_key or record.key,
+            workflow_success_count=(
+                report.workflow_success_count
+                or (count if isinstance(count, int) else 0)
+            ),
+            workflow_reused=True,
+        )
 
     def _stored_plan(
         self, task: Task, *, source_task_id: str | None = None
@@ -867,7 +1139,7 @@ class TaskOrchestrator:
                             "recovered",
                             f"Recovered after {recovery_used} bounded recovery attempt(s).",
                         )
-                    self._record_workflow_memory(succeeded, plan, result)
+                    recorded = self._record_workflow_memory(succeeded, plan, result)
                     return ExecutionReport(
                         task=succeeded,
                         plan=plan,
@@ -881,6 +1153,8 @@ class TaskOrchestrator:
                         source_task_id=source_task_id,
                         verification_report=verification_report,
                         resumed_from_checkpoint=resumed_used,
+                        workflow_key=recorded[0] if recorded else None,
+                        workflow_success_count=recorded[1] if recorded else 0,
                     )
                 failure_stage = "verification"
                 failure_message = verification_message
@@ -1215,7 +1489,194 @@ class TaskOrchestrator:
         if plan.tool_id == "files.search":
             return self._verify_search(output)
 
+        if plan.tool_id == "pdf.extract_pages":
+            arguments: dict[str, Any] = {
+                "path": output.get("output_path"),
+                "expected_pages": output.get("page_count"),
+            }
+            verification = self._tools.invoke("pdf.verify", arguments, context)
+            self._execution.record_tool_invocation(task_id, arguments, verification)
+            if not verification.success or verification.output is None:
+                return verification, False, verification.error or "PDF verification tool failed."
+            valid = bool(verification.output.get("valid")) and (
+                verification.output.get("sha256") == output.get("sha256")
+            )
+            return (
+                verification,
+                valid,
+                "Extracted PDF was re-opened; page count and SHA-256 matched."
+                if valid
+                else "Extracted PDF did not pass re-open verification.",
+            )
+
+        if plan.tool_id == "pdf.split":
+            return self._verify_pdf_split(task_id, output, context)
+
+        if plan.tool_id == "office.docx_replace_text":
+            return self._verify_docx_replace(plan, output)
+
+        if plan.tool_id == "office.docx_append_paragraphs":
+            return self._verify_docx_append(plan, output)
+
+        if plan.tool_id == "office.xlsx_set_cells":
+            return self._verify_xlsx_set_cells(plan, output)
+
+        if plan.tool_id == "office.xlsx_verify_formulas":
+            return self._verify_xlsx_formulas(output)
+
         return None, False, f"No deterministic verifier is registered for {plan.tool_id}."
+
+    def _verify_pdf_split(
+        self, task_id: str, output: Mapping[str, Any], context: ToolContext
+    ) -> tuple[ToolResult | None, bool, str]:
+        outputs = output.get("outputs")
+        if not isinstance(outputs, list) or output.get("page_count") != len(outputs):
+            return None, False, "Split page count did not match the output list."
+        last: ToolResult | None = None
+        for item in outputs:
+            arguments: dict[str, Any] = {"path": item, "expected_pages": 1}
+            verification = self._tools.invoke("pdf.verify", arguments, context)
+            self._execution.record_tool_invocation(task_id, arguments, verification)
+            last = verification
+            if (
+                not verification.success
+                or verification.output is None
+                or not verification.output.get("valid")
+            ):
+                return verification, False, f"Split page failed verification: {item}"
+        source = self._tools.invoke(
+            "pdf.inspect", {"path": output.get("path")}, context
+        )
+        self._execution.record_tool_invocation(
+            task_id, {"path": output.get("path")}, source
+        )
+        if (
+            not source.success
+            or source.output is None
+            or source.output.get("pages") != len(outputs)
+        ):
+            return last, False, "Split output count did not match the source pages."
+        return last, True, "Every split page PDF was re-opened and verified."
+
+    def _verify_docx_replace(
+        self, plan: TaskPlan, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        source = self._workspace_file(output.get("input_path"))
+        target = self._workspace_file(output.get("output_path"))
+        if source is None or target is None:
+            return None, False, "DOCX input/output is missing or outside the workspace."
+        find = str(plan.arguments.get("find") or "")
+        replace = str(plan.arguments.get("replace") or "")
+        try:
+            source_text = extract_office_text(source).text
+            output_text = extract_office_text(target).text
+        except PcAgentError as exc:
+            return None, False, f"Could not re-read DOCX text: {exc}"
+        reported = output.get("replacements")
+        if source_text.count(find) != reported:
+            return None, False, "Reported replacements do not match the source text."
+        if replace and output_text.count(replace) < int(reported or 0):
+            return None, False, "Replacement text is missing from the output document."
+        if find and find not in replace and find in output_text:
+            return None, False, "The old text still appears in the output document."
+        return None, True, "DOCX text replacement was re-read and counted independently."
+
+    def _verify_docx_append(
+        self, plan: TaskPlan, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        target = self._workspace_file(output.get("output_path"))
+        if target is None:
+            return None, False, "Appended DOCX is missing or outside the workspace."
+        paragraphs = plan.arguments.get("paragraphs")
+        if not isinstance(paragraphs, list) or not paragraphs:
+            return None, False, "The append plan contains no paragraphs to verify."
+        try:
+            output_text = extract_office_text(target).text
+        except PcAgentError as exc:
+            return None, False, f"Could not re-read DOCX text: {exc}"
+        for paragraph in paragraphs:
+            needle = str(paragraph).strip()
+            if needle and needle not in output_text:
+                return None, False, "An appended paragraph is missing from the output."
+        return None, True, "Every appended paragraph was found in the re-read document."
+
+    def _verify_xlsx_set_cells(
+        self, plan: TaskPlan, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        target = self._workspace_file(output.get("output_path"))
+        if target is None:
+            return None, False, "Edited XLSX is missing or outside the workspace."
+        try:
+            workbook = read_xlsx_cells(target)
+        except PcAgentError as exc:
+            return None, False, f"Could not re-read XLSX cells: {exc}"
+        sheet = next(
+            (item for item in workbook.sheets if item.name == output.get("sheet")),
+            workbook.sheets[0] if workbook.sheets else None,
+        )
+        if sheet is None:
+            return None, False, "Edited XLSX contains no readable sheet."
+        planned = plan.arguments.get("cells")
+        if not isinstance(planned, list):
+            return None, False, "The set-cells plan is malformed."
+        for item in planned:
+            if not isinstance(item, dict):
+                return None, False, "The set-cells plan is malformed."
+            reference = str(item.get("reference") or "").upper()
+            expected = str(item.get("value") or "")
+            cell = sheet.cells.get(reference)
+            if cell is None:
+                return None, False, f"Cell {reference} was not written."
+            if expected.startswith("="):
+                if (cell.formula or "").replace(" ", "") != expected[1:].replace(" ", ""):
+                    return None, False, f"Cell {reference} formula does not match the plan."
+            elif expected and cell.value != expected and not (
+                cell.kind == "number"
+                and _numbers_close(cell.value, expected)
+            ):
+                return None, False, f"Cell {reference} value does not match the plan."
+        return self._compare_formula_output(workbook, output)
+
+    def _verify_xlsx_formulas(
+        self, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        target = self._workspace_file(output.get("path"))
+        if target is None:
+            return None, False, "XLSX file is missing or outside the workspace."
+        try:
+            workbook = read_xlsx_cells(target)
+        except PcAgentError as exc:
+            return None, False, f"Could not re-read XLSX cells: {exc}"
+        return self._compare_formula_output(workbook, output)
+
+    def _compare_formula_output(
+        self, workbook: Any, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        reported = output.get("formulas")
+        if not isinstance(reported, list):
+            return None, False, "The tool did not report formula evaluations."
+        evaluations = evaluate_workbook_formulas(workbook)
+        expected = {
+            (item.sheet, item.reference): item for item in evaluations
+        }
+        if len(reported) != len(expected):
+            return None, False, "Formula count does not match an independent re-read."
+        for item in reported:
+            if not isinstance(item, dict):
+                return None, False, "Malformed formula report entry."
+            key = (str(item.get("sheet")), str(item.get("reference")))
+            evaluation = expected.get(key)
+            if evaluation is None:
+                return None, False, f"Unknown formula reported at {key[1]}."
+            computed = item.get("computed")
+            if evaluation.value is None:
+                if computed is not None:
+                    return None, False, f"Formula {key[1]} should not have computed."
+            elif not isinstance(computed, (int, float)) or abs(
+                float(computed) - evaluation.value
+            ) > 1e-9:
+                return None, False, f"Formula {key[1]} computed value mismatch."
+        return None, True, "Formulas were recomputed independently and all matched."
 
     def _verify_file_transfer(
         self, output: Mapping[str, Any], *, source_must_exist: bool

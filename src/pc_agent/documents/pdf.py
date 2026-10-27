@@ -1,8 +1,8 @@
-"""PDF inspection, merging and deterministic verification using pypdf.
+"""PDF inspection, merging, splitting/extracting and deterministic verification.
 
-A merge is only reported as successful after the produced file has been
-re-opened and its page count matches the sum of the validated inputs. Source
-files are opened read-only and are never modified.
+Every produced PDF is only reported as successful after it has been
+re-opened and its page count verified. Source files are opened read-only
+and are never modified.
 """
 
 from __future__ import annotations
@@ -10,12 +10,16 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..errors import ToolError
+
+MAX_SPLIT_PAGES = 200
 
 
 def _load_pypdf() -> tuple[Any, Any]:
@@ -186,6 +190,205 @@ def merge_pdf_files(input_paths: list[Path], output_path: Path) -> PdfMergeResul
         size_bytes=final.size_bytes,
         sha256=final.sha256,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PdfExtractResult:
+    output_path: Path
+    source_pages: int
+    extracted_pages: tuple[int, ...]
+    page_count: int
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class PdfSplitPart:
+    page: int
+    path: Path
+    sha256: str
+    size_bytes: int
+
+
+def parse_page_selection(selection: str, total_pages: int) -> list[int]:
+    """Parse a 1-based page selection like ``"1-3,5"`` into page numbers."""
+
+    if total_pages < 1:
+        raise ToolError("The PDF has no pages to select from.")
+    if not selection or not selection.strip():
+        raise ToolError('A page selection is required, for example "1-3,5".')
+    pages: list[int] = []
+    for raw_token in selection.split(","):
+        token = raw_token.strip()
+        if not token:
+            raise ToolError(f"Invalid page selection: {selection!r}.")
+        if "-" in token:
+            start_text, _, end_text = token.partition("-")
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError as exc:
+                raise ToolError(f"Invalid page range: {token!r}.") from exc
+            if start > end:
+                raise ToolError(f"Page range {token!r} is reversed.")
+            pages.extend(range(start, end + 1))
+        else:
+            try:
+                pages.append(int(token))
+            except ValueError as exc:
+                raise ToolError(f"Invalid page number: {token!r}.") from exc
+    if not pages:
+        raise ToolError('A page selection is required, for example "1-3,5".')
+    if len(set(pages)) != len(pages):
+        raise ToolError("The page selection contains duplicate pages.")
+    for page in pages:
+        if page < 1 or page > total_pages:
+            raise ToolError(
+                f"Page {page} is outside this PDF (1 to {total_pages} pages)."
+            )
+    return pages
+
+
+def _write_pages_atomically(
+    page_objects: list[Any], output_path: Path, *, expected_pages: int
+) -> PdfVerification:
+    _, PdfWriter = _load_pypdf()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.stem}.tmp-{uuid.uuid4().hex}.pdf")
+    try:
+        writer = PdfWriter()
+        try:
+            for page in page_objects:
+                writer.add_page(page)
+            with temporary.open("wb") as handle:
+                writer.write(handle)
+        except Exception as exc:
+            raise ToolError(
+                f"PDF write failed while producing the output: {type(exc).__name__}"
+            ) from exc
+        finally:
+            writer.close()
+        verification = verify_pdf(temporary, expected_pages=expected_pages)
+        if not verification.valid:
+            raise ToolError(f"Produced PDF failed verification: {verification.error}")
+        if output_path.exists():
+            raise ToolError(
+                "Output file already exists. PDF tools never overwrite; "
+                "choose a new output path."
+            )
+        os.replace(temporary, output_path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    final = verify_pdf(output_path, expected_pages=expected_pages)
+    if not final.valid or final.sha256 is None or final.size_bytes is None:
+        raise ToolError(f"Produced PDF could not be re-verified: {final.error}")
+    return final
+
+
+def extract_pdf_pages(
+    input_path: Path, pages: Sequence[int], output_path: Path
+) -> PdfExtractResult:
+    """Extract the given 1-based pages (in the given order) into a new PDF."""
+
+    if output_path.suffix.lower() != ".pdf":
+        raise ToolError("The extract output must be a .pdf file.")
+    if output_path.exists():
+        raise ToolError(
+            "Output file already exists. PDF tools never overwrite; "
+            "choose a new output path."
+        )
+    if input_path.expanduser().resolve() == output_path.expanduser().resolve():
+        raise ToolError("The output path must not be the input PDF.")
+    info = inspect_pdf(input_path)
+    if info.encrypted or info.pages is None:
+        raise ToolError("Encrypted PDFs are not supported without a password.")
+    selected = list(pages)
+    if not selected:
+        raise ToolError("At least one page must be selected.")
+    if len(set(selected)) != len(selected):
+        raise ToolError("The page selection contains duplicate pages.")
+    for page in selected:
+        if page < 1 or page > info.pages:
+            raise ToolError(f"Page {page} is outside this PDF (1 to {info.pages}).")
+
+    PdfReader, _ = _load_pypdf()
+    try:
+        reader = PdfReader(str(input_path))
+        page_objects = [reader.pages[page - 1] for page in selected]
+    except Exception as exc:
+        raise ToolError(f"Could not read PDF pages: {type(exc).__name__}") from exc
+    final = _write_pages_atomically(
+        page_objects, output_path, expected_pages=len(selected)
+    )
+    assert final.sha256 is not None and final.size_bytes is not None  # verified above
+    return PdfExtractResult(
+        output_path=output_path,
+        source_pages=info.pages,
+        extracted_pages=tuple(selected),
+        page_count=len(selected),
+        size_bytes=final.size_bytes,
+        sha256=final.sha256,
+    )
+
+
+def split_pdf(
+    input_path: Path, output_dir: Path, *, prefix: str | None = None
+) -> list[PdfSplitPart]:
+    """Split a PDF into one single-page PDF per page inside ``output_dir``."""
+
+    info = inspect_pdf(input_path)
+    if info.encrypted or info.pages is None:
+        raise ToolError("Encrypted PDFs are not supported without a password.")
+    if info.pages > MAX_SPLIT_PAGES:
+        raise ToolError(
+            f"Splitting is limited to {MAX_SPLIT_PAGES} pages; "
+            f"this PDF has {info.pages}. Use extract-pages for a range instead."
+        )
+    clean_prefix = (prefix or input_path.stem).strip()
+    if not clean_prefix or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.\-]*", clean_prefix):
+        raise ToolError("The split prefix must be a simple file-name prefix.")
+    targets = [
+        output_dir / f"{clean_prefix}-page-{page:03d}.pdf"
+        for page in range(1, info.pages + 1)
+    ]
+    for target in targets:
+        if target.exists():
+            raise ToolError(
+                "Output file already exists. PDF tools never overwrite: "
+                f"{target.name}. Choose a new output folder or prefix."
+            )
+
+    PdfReader, _ = _load_pypdf()
+    try:
+        reader = PdfReader(str(input_path))
+        all_pages = list(reader.pages)
+    except Exception as exc:
+        raise ToolError(f"Could not read PDF pages: {type(exc).__name__}") from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written: list[PdfSplitPart] = []
+    try:
+        for page_number, (page_object, target) in enumerate(
+            zip(all_pages, targets, strict=True), start=1
+        ):
+            final = _write_pages_atomically(
+                [page_object], target, expected_pages=1
+            )
+            assert final.sha256 is not None and final.size_bytes is not None
+            written.append(
+                PdfSplitPart(
+                    page=page_number,
+                    path=target,
+                    sha256=final.sha256,
+                    size_bytes=final.size_bytes,
+                )
+            )
+    except Exception:
+        # Remove only the partial outputs this call created.
+        for part in written:
+            part.path.unlink(missing_ok=True)
+        raise
+    return written
 
 
 def write_blank_pdf(path: Path, pages: int) -> None:

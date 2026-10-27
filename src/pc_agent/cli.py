@@ -78,6 +78,15 @@ def _add_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", default=None, help="Output path inside the workspace")
     parser.add_argument("--target", default=None, help="Exact target file/folder for the task")
     parser.add_argument("--expected-pages", type=int, default=None)
+    parser.add_argument(
+        "--pages", default=None, help='PDF page selection for extract tasks, e.g. "1-3,5"'
+    )
+    parser.add_argument("--find", default=None, help="Exact DOCX text to replace")
+    parser.add_argument("--replace", default=None, help="Replacement DOCX text")
+    parser.add_argument("--cell", default=None, help="Spreadsheet cell reference, e.g. B2")
+    parser.add_argument(
+        "--value", default=None, help='Spreadsheet cell value/formula, e.g. "=SUM(A1:A3)"'
+    )
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument(
         "--use-ai",
@@ -109,7 +118,7 @@ def _add_execution_options(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent",
-        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 8)",
+        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 10)",
     )
     parser.add_argument("--version", action="version", version=f"pc-agent {__version__}")
     parser.add_argument(
@@ -191,6 +200,37 @@ def build_parser() -> argparse.ArgumentParser:
         "clear", help="Delete all preferences, notes and workflow memory (tasks are kept)"
     )
     memory_clear_parser.add_argument("--yes", action="store_true")
+
+    workflow_parser = subparsers.add_parser(
+        "workflow", help="Inspect and re-run verified workflows (Phase 10)"
+    )
+    workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command")
+    workflow_subparsers.add_parser(
+        "list", help="List verified workflows that can be re-run"
+    )
+    workflow_show_parser = workflow_subparsers.add_parser(
+        "show", help="Show one verified workflow (key, unique prefix, or latest)"
+    )
+    workflow_show_parser.add_argument("key")
+    workflow_run_parser = workflow_subparsers.add_parser(
+        "run",
+        help="Re-run a verified workflow as a new task after live revalidation",
+    )
+    workflow_run_parser.add_argument("key", help="Workflow key, unique prefix, or latest")
+    workflow_run_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Approve the exact read-only external folders in the stored plan",
+    )
+    workflow_run_parser.add_argument(
+        "--max-recovery-attempts", type=int, choices=[0, 1, 2, 3], default=None
+    )
+    workflow_run_parser.add_argument("--json", action="store_true")
+    workflow_delete_parser = workflow_subparsers.add_parser(
+        "delete", help="Delete a verified workflow record (tasks are kept)"
+    )
+    workflow_delete_parser.add_argument("key")
+    workflow_delete_parser.add_argument("--yes", action="store_true")
 
     task_parser = subparsers.add_parser("task", help="Manage and execute local task records")
     task_subparsers = task_parser.add_subparsers(dest="task_command")
@@ -470,6 +510,38 @@ def build_parser() -> argparse.ArgumentParser:
     create_docx_parser.add_argument(
         "--paragraph", action="append", default=[], help="Paragraph text (repeatable)"
     )
+    docx_replace_parser = office_subparsers.add_parser(
+        "docx-replace", help="Replace exact text in a DOCX into a new file"
+    )
+    docx_replace_parser.add_argument("input", help="DOCX path relative to workspace")
+    docx_replace_parser.add_argument("--output", required=True, help="New DOCX output")
+    docx_replace_parser.add_argument("--find", required=True, help="Exact text to find")
+    docx_replace_parser.add_argument("--replace", required=True, help="Replacement text")
+    docx_append_parser = office_subparsers.add_parser(
+        "docx-append", help="Append paragraphs to a DOCX into a new file"
+    )
+    docx_append_parser.add_argument("input", help="DOCX path relative to workspace")
+    docx_append_parser.add_argument("--output", required=True, help="New DOCX output")
+    docx_append_parser.add_argument(
+        "--paragraph", action="append", required=True, help="Paragraph text (repeatable)"
+    )
+    xlsx_set_parser = office_subparsers.add_parser(
+        "xlsx-set", help="Set XLSX cell values/formulas into a new workbook"
+    )
+    xlsx_set_parser.add_argument("input", help="XLSX path relative to workspace")
+    xlsx_set_parser.add_argument("--output", required=True, help="New XLSX output")
+    xlsx_set_parser.add_argument("--sheet", default=None, help="Sheet name (default first)")
+    xlsx_set_parser.add_argument(
+        "--cell",
+        action="append",
+        required=True,
+        dest="cells",
+        help='Cell assignment REF=VALUE, e.g. B2==SUM(A1:A3) (repeatable)',
+    )
+    xlsx_formulas_parser = office_subparsers.add_parser(
+        "xlsx-formulas", help="Recompute and list every formula in an XLSX"
+    )
+    xlsx_formulas_parser.add_argument("input", help="XLSX path relative to workspace")
 
     web_parser = subparsers.add_parser(
         "web", help="Fetch one user-requested web page as text (no script execution)"
@@ -530,6 +602,24 @@ def build_parser() -> argparse.ArgumentParser:
     folders_parser.add_argument("folders", nargs="+", help="Folders relative to the workspace")
     folders_parser.add_argument("--output", required=True, help="New output PDF in the workspace")
     folders_parser.add_argument("--recursive", action="store_true")
+    extract_pages_parser = pdf_subparsers.add_parser(
+        "extract", help="Extract selected pages into a new PDF"
+    )
+    extract_pages_parser.add_argument("path", help="PDF path relative to the workspace")
+    extract_pages_parser.add_argument(
+        "--pages", required=True, help='Page selection like "1-3,5" (1-based)'
+    )
+    extract_pages_parser.add_argument(
+        "--output", required=True, help="New output PDF in the workspace"
+    )
+    split_parser = pdf_subparsers.add_parser(
+        "split", help="Split a PDF into one single-page PDF per page"
+    )
+    split_parser.add_argument("path", help="PDF path relative to the workspace")
+    split_parser.add_argument(
+        "--output-folder", required=True, help="Workspace folder for the page PDFs"
+    )
+    split_parser.add_argument("--prefix", default=None, help="Output name prefix")
 
     files_parser = subparsers.add_parser(
         "files", help="Run deterministic workspace file operations"
@@ -587,6 +677,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_license_command(settings, args)
         if args.command == "memory":
             return _run_memory_command(settings, args)
+        if args.command == "workflow":
+            return _run_workflow_command(settings, args)
         if args.command == "task":
             return _run_task_command(settings, args)
         if args.command == "run":
@@ -889,7 +981,7 @@ def _run_doctor(settings: Settings) -> int:
         / "dynamic-tools"
         / "word_count_arguments.json"
     )
-    print(f"Self-Healing PC Agent {__version__} (PHASE 8 File Operations)")
+    print(f"Self-Healing PC Agent {__version__} (PHASE 10 Workflow Reuse)")
     print(f"Python: {platform.python_version()}")
     print(f"Environment: {summary['environment']}")
     print(f"Root: {summary['root']}")
@@ -1789,7 +1881,7 @@ def _report_tool_failure(result: ToolResult) -> int:
 
 def _run_pdf_command(settings: Settings, args: argparse.Namespace) -> int:
     if args.pdf_command is None:
-        print("Usage: pc-agent pdf inspect|verify|merge|merge-folders ...", file=sys.stderr)
+        print("Usage: pc-agent pdf inspect|verify|merge|merge-folders|extract|split ...", file=sys.stderr)
         return 2
     _require_license(settings, FEATURE_DOCUMENTS)
 
@@ -1819,6 +1911,38 @@ def _run_pdf_command(settings: Settings, args: argparse.Namespace) -> int:
         if result.output["error"]:
             print(f"Error: {result.output['error']}")
         return 0 if result.output["valid"] else 1
+
+    if args.pdf_command == "extract":
+        result = registry.invoke(
+            "pdf.extract_pages",
+            {"path": args.path, "pages": args.pages, "output_path": args.output},
+            context,
+        )
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"Extracted PDF: {result.output['output_path']}")
+        print(f"Pages: {result.output['page_count']} of {result.output['source_pages']}")
+        print(f"Extracted: {', '.join(str(p) for p in result.output['extracted_pages'])}")
+        print(f"SHA-256: {result.output['sha256']}")
+        return 0
+
+    if args.pdf_command == "split":
+        split_arguments: dict[str, object] = {
+            "path": args.path,
+            "output_folder": args.output_folder,
+        }
+        if args.prefix:
+            split_arguments["prefix"] = args.prefix
+        result = registry.invoke("pdf.split", split_arguments, context)
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(
+            f"Split {result.output['path']} into {result.output['page_count']} "
+            f"page PDF(s) in {result.output['output_folder']}:"
+        )
+        for output_path in result.output["outputs"]:
+            print(f"  {output_path}")
+        return 0
 
     if args.pdf_command == "merge":
         result = registry.invoke(
@@ -1856,6 +1980,88 @@ def _run_pdf_command(settings: Settings, args: argparse.Namespace) -> int:
         print("Skipped: none")
     print(f"SHA-256: {result.output['sha256']}")
     return 0
+
+
+def _run_workflow_command(settings: Settings, args: argparse.Namespace) -> int:
+    if args.workflow_command is None:
+        print("Usage: pc-agent workflow list|show|run|delete ...", file=sys.stderr)
+        return 2
+    settings.ensure_directories()
+    Database = _open_database(settings)
+    orchestrator = _build_orchestrator(settings, database=Database)
+
+    if args.workflow_command == "list":
+        records = orchestrator.workflow_records()
+        if not records:
+            print("Verified workflows: none (run a task to completion to record one).")
+            return 0
+        print(f"Verified workflows: {len(records)}")
+        for record in records:
+            content = record.content
+            successes = content.get("success_count")
+            successes = successes if isinstance(successes, int) else 0
+            print(
+                f"{record.key}  {record.title} tool={content.get('tool_id', '-')} "
+                f"successes={successes}  (updated {record.updated_at.isoformat()})"
+            )
+        return 0
+
+    if args.workflow_command == "show":
+        record = orchestrator.resolve_workflow(args.key)
+        content = record.content
+        print(f"Workflow: {record.key}")
+        print(f"Title: {record.title}")
+        print(f"Tool: {content.get('tool_id', '-')} (intent {content.get('intent', '-')})")
+        print(f"Instruction: {content.get('instruction', '-')}")
+        print(f"Verified successes: {content.get('success_count', 0)}")
+        print(f"Last task: {content.get('last_task_id', '-')}")
+        arguments = content.get("arguments")
+        if isinstance(arguments, dict):
+            print("Stored arguments:")
+            print(json.dumps(arguments, indent=2, sort_keys=True, default=str))
+        else:
+            print("Stored arguments: (legacy record; resolved from the last task plan)")
+        return 0
+
+    if args.workflow_command == "delete":
+        record = orchestrator.resolve_workflow(args.key)
+        if not args.yes:
+            print(
+                f"Refusing to delete workflow {record.key} without --yes.",
+                file=sys.stderr,
+            )
+            return 1
+        orchestrator.delete_workflow(record.key)
+        print(f"Deleted workflow record {record.key}. Task history was kept.")
+        return 0
+
+    # run
+    _require_license(settings, FEATURE_CORE_TASKS)
+    record = orchestrator.resolve_workflow(args.key)
+    instruction = record.content.get("instruction")
+    task = TaskRepository(Database).create(
+        Task(
+            instruction=instruction
+            if isinstance(instruction, str) and instruction
+            else f"Reuse verified workflow {record.key}"
+        )
+    )
+    print(f"Resolved workflow -> {record.key}", file=sys.stderr)
+    try:
+        report = orchestrator.run_workflow(
+            task.id,
+            record.key,
+            approval_callback=_approval_callback(preapproved=bool(args.yes)),
+            max_recovery_attempts=args.max_recovery_attempts,
+        )
+    except KeyboardInterrupt:
+        print(
+            "Interrupted. The task may be left mid-step; check it with "
+            f"'pc-agent task show {task.id}', then resume or cancel it.",
+            file=sys.stderr,
+        )
+        return 130
+    return _print_execution_report(report, as_json=bool(args.json))
 
 
 def _run_files_command(settings: Settings, args: argparse.Namespace) -> int:
@@ -1949,7 +2155,8 @@ def _run_office_command(settings: Settings, args: argparse.Namespace) -> int:
     if args.office_command is None:
         print(
             "Usage: pc-agent office inspect|extract|csv-inspect|csv-to-json|"
-            "json-to-csv|csv-to-xlsx|create-docx ...",
+            "json-to-csv|csv-to-xlsx|create-docx|docx-replace|docx-append|"
+            "xlsx-set|xlsx-formulas ...",
             file=sys.stderr,
         )
         return 2
@@ -1990,6 +2197,43 @@ def _run_office_command(settings: Settings, args: argparse.Namespace) -> int:
             "title": args.title,
             "paragraphs": list(args.paragraph or []),
         }
+    elif args.office_command == "docx-replace":
+        tool_id = "office.docx_replace_text"
+        arguments = {
+            "input_path": args.input,
+            "output_path": args.output,
+            "find": args.find,
+            "replace": args.replace,
+        }
+    elif args.office_command == "docx-append":
+        tool_id = "office.docx_append_paragraphs"
+        arguments = {
+            "input_path": args.input,
+            "output_path": args.output,
+            "paragraphs": list(args.paragraph or []),
+        }
+    elif args.office_command == "xlsx-set":
+        tool_id = "office.xlsx_set_cells"
+        cells: list[dict[str, str]] = []
+        for assignment in args.cells or []:
+            reference, separator, value = str(assignment).partition("=")
+            if not separator or not reference.strip():
+                print(
+                    "Each --cell must look like B2==SUM(A1:A3) or B2=42.",
+                    file=sys.stderr,
+                )
+                return 2
+            cells.append({"reference": reference.strip(), "value": value})
+        arguments = {
+            "input_path": args.input,
+            "output_path": args.output,
+            "cells": cells,
+        }
+        if args.sheet:
+            arguments["sheet_name"] = args.sheet
+    elif args.office_command == "xlsx-formulas":
+        tool_id = "office.xlsx_verify_formulas"
+        arguments = {"path": args.input}
     else:
         return 2
 
@@ -2117,6 +2361,11 @@ def _planner_options(args: argparse.Namespace) -> PlannerOptions:
         target_path=getattr(args, "target", None),
         recursive=bool(getattr(args, "recursive", False)),
         expected_pages=getattr(args, "expected_pages", None),
+        page_selection=getattr(args, "pages", None),
+        find_text=getattr(args, "find", None),
+        replace_text=getattr(args, "replace", None),
+        cell_reference=getattr(args, "cell", None),
+        cell_value=getattr(args, "value", None),
     )
 
 
@@ -2261,6 +2510,9 @@ def _report_to_dict(report: ExecutionReport) -> dict[str, Any]:
             report.verification_report.to_dict() if report.verification_report else None
         ),
         "resumed_from_checkpoint": report.resumed_from_checkpoint,
+        "workflow_key": report.workflow_key,
+        "workflow_success_count": report.workflow_success_count,
+        "workflow_reused": report.workflow_reused,
     }
 
 
@@ -2309,6 +2561,17 @@ def _print_execution_report(report: ExecutionReport, *, as_json: bool) -> int:
             _print_tool_output(report)
         if report.resumed_from_checkpoint:
             print("Resumed from checkpoint: the completed tool step was not re-run.")
+        if report.workflow_key:
+            if report.workflow_reused:
+                print(
+                    f"Verified workflow reused: {report.workflow_key} "
+                    "(stored plan revalidated live before running)."
+                )
+            else:
+                print(
+                    f"Verified workflow recorded: {report.workflow_key} "
+                    f"(success #{report.workflow_success_count})."
+                )
         if report.verification_message:
             print(f"Verification: {report.verification_valid} - {report.verification_message}")
         if report.verification_report is not None:

@@ -1,4 +1,4 @@
-# Architecture - through PHASE 8
+# Architecture - through PHASE 10
 
 ## Shape
 
@@ -94,6 +94,30 @@ front-ends. Enforcement defaults to `off`; `warn` reports and continues,
 surfaces (`doctor`, license commands, listing/showing records) are never
 gated. `admin.py` is vendor-side tooling only and is never imported by the
 client runtime. See `docs/phase6.md`.
+
+## Phase 10 verified workflow reuse
+
+Workflow records became execution-grade evidence: normalized instruction,
+exact validated arguments and approval roots under a precise key. The
+orchestrator can resolve a record (exact/prefix/latest), rebuild its plan
+(content first, legacy stored-plan fallback), revalidate it against the
+live registry + allow-list, and run it as a new task through the unchanged
+approval/verification/criteria/checkpoint/recovery pipeline. The same
+lookup is the planner's last-resort fallback before `needs_input`. Memory
+remains evidence only — approvals are always re-asked and nothing is
+force-succeeded from history.
+
+## Phase 9 deeper Office
+
+The PDF engine gained atomic page extraction/splitting on the same
+temp-file + re-verify pattern as merging. The Office engine gained a
+reference-addressed XLSX cell model, a bounded deterministic formula
+evaluator (tokenizer + recursive-descent parser, cycle detection), a
+surgical single-sheet XLSX cell writer (other zip parts preserved,
+calcChain dropped, computed cached values written), and zip-surgical DOCX
+paragraph replace/append operating on run-concatenated paragraph text.
+All six tools ride the existing registry, policy, criteria, checkpoint and
+fresh-output recovery rails.
 
 ## Phase 8 file operations
 

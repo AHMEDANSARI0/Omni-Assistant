@@ -63,6 +63,12 @@ def test_default_registry_contains_expected_tools() -> None:
         "files.rename",
         "files.organize",
         "files.search",
+        "pdf.extract_pages",
+        "pdf.split",
+        "office.docx_replace_text",
+        "office.docx_append_paragraphs",
+        "office.xlsx_set_cells",
+        "office.xlsx_verify_formulas",
     }
 
 

@@ -724,7 +724,7 @@ def test_cli_run_reports_recovery_and_doctor_health(
 
     assert main([*root, "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 8 File Operations" in doctor
+    assert "PHASE 10 Workflow Reuse" in doctor
     assert "recorded attempts=2" in doctor
     assert "Bundled dynamic-tool example arguments: missing" in doctor
 
