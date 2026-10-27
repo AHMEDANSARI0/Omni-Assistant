@@ -19,11 +19,13 @@ class Action(str, enum.Enum):
     LIST_FILES = "list_files"
     READ_FILE = "read_file"
     WRITE_FILE = "write_file"
+    MOVE_FILE = "move_file"
     OVERWRITE_FILE = "overwrite_file"
     DELETE_FILE = "delete_file"
     RUN_SHELL = "run_shell"
     INSTALL_SOFTWARE = "install_software"
     NETWORK_ACCESS = "network_access"
+    DESKTOP_OPEN = "desktop_open"
     EXTERNAL_SEND = "external_send"
     PRIVILEGED_CHANGE = "privileged_change"
     ACCESS_CREDENTIALS = "access_credentials"
@@ -47,6 +49,7 @@ class ActionRequest:
     action: Action
     target_path: Path | None = None
     description: str = ""
+    target_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +72,7 @@ _FILE_ACTIONS = frozenset(
         Action.LIST_FILES,
         Action.READ_FILE,
         Action.WRITE_FILE,
+        Action.MOVE_FILE,
         Action.OVERWRITE_FILE,
         Action.DELETE_FILE,
     }
@@ -81,6 +85,10 @@ class PolicyEngine:
         self,
         workspace_dir: Path,
         approved_read_roots: tuple[Path, ...] = (),
+        *,
+        network_access_allowed: bool = False,
+        allow_private_network: bool = False,
+        desktop_open_allowed: bool = False,
     ) -> None:
         self._workspace_dir = workspace_dir.expanduser().resolve()
         resolved_roots = {
@@ -88,6 +96,9 @@ class PolicyEngine:
         }
         resolved_roots.discard(self._workspace_dir)
         self._approved_read_roots = tuple(sorted(resolved_roots, key=str))
+        self._network_access_allowed = network_access_allowed
+        self._allow_private_network = allow_private_network
+        self._desktop_open_allowed = desktop_open_allowed
 
     @property
     def workspace_dir(self) -> Path:
@@ -96,6 +107,18 @@ class PolicyEngine:
     @property
     def approved_read_roots(self) -> tuple[Path, ...]:
         return self._approved_read_roots
+
+    @property
+    def network_access_allowed(self) -> bool:
+        return self._network_access_allowed
+
+    @property
+    def allow_private_network(self) -> bool:
+        return self._allow_private_network
+
+    @property
+    def desktop_open_allowed(self) -> bool:
+        return self._desktop_open_allowed
 
     def evaluate(self, request: ActionRequest) -> PolicyDecision:
         action = request.action
@@ -108,6 +131,41 @@ class PolicyEngine:
 
         if action in _FILE_ACTIONS:
             return self._evaluate_file_action(request)
+
+        if action is Action.NETWORK_ACCESS:
+            if not request.target_url:
+                return _deny(RiskLevel.HIGH, "A network action requires an exact target URL.")
+            if self._network_access_allowed:
+                return PolicyDecision(
+                    PolicyOutcome.ALLOW,
+                    RiskLevel.HIGH,
+                    "Network access was explicitly requested for this direct command.",
+                )
+            return _approval(
+                RiskLevel.HIGH,
+                "Use the dedicated web command so the exact URL can be approved and audited.",
+            )
+
+        if action is Action.DESKTOP_OPEN:
+            if request.target_path is not None and not is_within(
+                self._workspace_dir, request.target_path
+            ):
+                return _deny(
+                    RiskLevel.CRITICAL,
+                    "Desktop open is limited to files and folders inside the workspace.",
+                )
+            if request.target_path is None and not request.target_url:
+                return _deny(RiskLevel.HIGH, "Desktop open requires an exact path or URL.")
+            if self._desktop_open_allowed:
+                return PolicyDecision(
+                    PolicyOutcome.ALLOW,
+                    RiskLevel.HIGH,
+                    "Desktop open was explicitly requested for this direct command.",
+                )
+            return _approval(
+                RiskLevel.HIGH,
+                "Use the dedicated desktop command so the exact target can be approved.",
+            )
 
         if action in {Action.RUN_SHELL, Action.INSTALL_SOFTWARE}:
             return _approval(
@@ -136,7 +194,13 @@ class PolicyEngine:
             return _approval(RiskLevel.HIGH, "Deleting or overwriting a file needs approval.")
 
         if inside:
-            risk = RiskLevel.LOW if action is not Action.WRITE_FILE else RiskLevel.MEDIUM
+            # A move/rename inside the workspace preserves the file's bytes at
+            # the destination, so it is treated like a write, not a delete.
+            risk = (
+                RiskLevel.MEDIUM
+                if action in {Action.WRITE_FILE, Action.MOVE_FILE}
+                else RiskLevel.LOW
+            )
             return PolicyDecision(PolicyOutcome.ALLOW, risk, "Workspace-scoped file action.")
 
         if action in {Action.LIST_FILES, Action.READ_FILE} and any(

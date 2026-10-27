@@ -7,7 +7,10 @@ excluded from repr and from the public summary.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +20,7 @@ from .errors import ConfigError
 
 _ALLOWED_ENVIRONMENTS = frozenset({"development", "test", "production"})
 _ALLOWED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_ALLOWED_LICENSE_ENFORCEMENT = frozenset({"off", "warn", "enforce"})
 # Provider slots understood by the replaceable provider-abstraction layer.
 # `providers list` says which slots have a direct adapter in this build.
 _ALLOWED_PROVIDERS = frozenset(
@@ -87,6 +91,18 @@ class Settings:
     provider_order: tuple[str, ...] = ()
     provider_timeout_seconds: float = 30.0
     max_retries: int = 2
+    max_recovery_attempts: int = 2
+    recovery_backoff_seconds: float = 0.25
+    recovery_stale_after_minutes: int = 10
+    web_timeout_seconds: float = 15.0
+    web_max_bytes: int = 2_000_000
+    # Phase 6 licensing. Enforcement defaults to "off" so development and
+    # existing installs keep working; commercial builds opt in explicitly.
+    license_enforcement: str = "off"
+    license_file: Path = field(default_factory=lambda: Path("data") / "license.key")
+    license_public_key: str | None = field(default=None, repr=False)
+    license_key_id: str = "default"
+    trial_days: int = 14
     gemini_api_key: str | None = field(default=None, repr=False)
     openrouter_api_key: str | None = field(default=None, repr=False)
     openai_api_key: str | None = field(default=None, repr=False)
@@ -135,6 +151,14 @@ class Settings:
             "log_level": self.log_level,
             "provider_order": ", ".join(self.provider_order) or "mock (default)",
             "providers_with_credentials": configured,
+            "max_recovery_attempts": str(self.max_recovery_attempts),
+            "recovery_stale_after_minutes": str(self.recovery_stale_after_minutes),
+            "web_timeout_seconds": str(self.web_timeout_seconds),
+            "web_max_bytes": str(self.web_max_bytes),
+            "license_enforcement": self.license_enforcement,
+            "license_public_key_configured": "yes" if self.license_public_key else "no",
+            "license_file": str(self.license_file),
+            "trial_days": str(self.trial_days),
         }
 
     @classmethod
@@ -185,6 +209,36 @@ class Settings:
         provider_order = _parse_provider_order(get("PC_AGENT_PROVIDER_ORDER"))
         timeout = _parse_timeout(get("PC_AGENT_PROVIDER_TIMEOUT_SECONDS", "30"))
         max_retries = _parse_max_retries(get("PC_AGENT_MAX_RETRIES", "2"))
+        max_recovery_attempts = _parse_max_recovery_attempts(
+            get("PC_AGENT_MAX_RECOVERY_ATTEMPTS", "2")
+        )
+        recovery_backoff_seconds = _parse_recovery_backoff(
+            get("PC_AGENT_RECOVERY_BACKOFF_SECONDS", "0.25")
+        )
+        recovery_stale_after_minutes = _parse_stale_after_minutes(
+            get("PC_AGENT_RECOVERY_STALE_AFTER_MINUTES", "10")
+        )
+        web_timeout_seconds = _parse_web_timeout(
+            get("PC_AGENT_WEB_TIMEOUT_SECONDS", "15")
+        )
+        web_max_bytes = _parse_web_max_bytes(get("PC_AGENT_WEB_MAX_BYTES", "2000000"))
+
+        license_enforcement = get("PC_AGENT_LICENSE_ENFORCEMENT", "off").lower()
+        if license_enforcement not in _ALLOWED_LICENSE_ENFORCEMENT:
+            raise ConfigError(
+                "PC_AGENT_LICENSE_ENFORCEMENT must be one of: off, warn, enforce."
+            )
+        raw_license_file = get("PC_AGENT_LICENSE_FILE")
+        license_file = (
+            _resolve_from(root, raw_license_file)
+            if raw_license_file
+            else data_dir / "license.key"
+        )
+        license_public_key = _parse_license_public_key(get("PC_AGENT_LICENSE_PUBLIC_KEY"))
+        license_key_id = _parse_license_key_id(
+            get("PC_AGENT_LICENSE_KEY_ID", "default")
+        )
+        trial_days = _parse_trial_days(get("PC_AGENT_TRIAL_DAYS", "14"))
 
         gemini_model = _parse_model(
             "PC_AGENT_GEMINI_MODEL", get("PC_AGENT_GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
@@ -244,6 +298,16 @@ class Settings:
             provider_order=provider_order,
             provider_timeout_seconds=timeout,
             max_retries=max_retries,
+            max_recovery_attempts=max_recovery_attempts,
+            recovery_backoff_seconds=recovery_backoff_seconds,
+            recovery_stale_after_minutes=recovery_stale_after_minutes,
+            web_timeout_seconds=web_timeout_seconds,
+            web_max_bytes=web_max_bytes,
+            license_enforcement=license_enforcement,
+            license_file=license_file,
+            license_public_key=license_public_key,
+            license_key_id=license_key_id,
+            trial_days=trial_days,
             gemini_api_key=get("GEMINI_API_KEY") or None,
             openrouter_api_key=get("OPENROUTER_API_KEY") or None,
             openai_api_key=get("OPENAI_API_KEY") or None,
@@ -301,6 +365,92 @@ def _parse_max_retries(raw: str) -> int:
     if value < 0 or value > 5:
         # Bounded on purpose: an agent must never retry indefinitely.
         raise ConfigError("PC_AGENT_MAX_RETRIES must be between 0 and 5.")
+    return value
+
+
+def _parse_max_recovery_attempts(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_MAX_RECOVERY_ATTEMPTS must be an integer.") from exc
+    if value < 0 or value > 3:
+        # Healing is deliberately capped so a broken workflow cannot loop forever.
+        raise ConfigError("PC_AGENT_MAX_RECOVERY_ATTEMPTS must be between 0 and 3.")
+    return value
+
+
+def _parse_recovery_backoff(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_RECOVERY_BACKOFF_SECONDS must be a number.") from exc
+    if value < 0 or value > 5:
+        raise ConfigError("PC_AGENT_RECOVERY_BACKOFF_SECONDS must be between 0 and 5.")
+    return value
+
+
+def _parse_stale_after_minutes(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_RECOVERY_STALE_AFTER_MINUTES must be an integer.") from exc
+    if value < 1 or value > 10_080:
+        raise ConfigError(
+            "PC_AGENT_RECOVERY_STALE_AFTER_MINUTES must be between 1 and 10080."
+        )
+    return value
+
+
+def _parse_web_timeout(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_WEB_TIMEOUT_SECONDS must be a number.") from exc
+    if value <= 0 or value > 60:
+        raise ConfigError("PC_AGENT_WEB_TIMEOUT_SECONDS must be greater than 0 and at most 60.")
+    return value
+
+
+def _parse_web_max_bytes(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_WEB_MAX_BYTES must be an integer.") from exc
+    if value < 1024 or value > 10_000_000:
+        raise ConfigError("PC_AGENT_WEB_MAX_BYTES must be between 1024 and 10000000.")
+    return value
+
+
+def _parse_trial_days(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_TRIAL_DAYS must be an integer.") from exc
+    if value < 0 or value > 90:
+        raise ConfigError("PC_AGENT_TRIAL_DAYS must be between 0 and 90 (0 disables the trial).")
+    return value
+
+
+def _parse_license_key_id(raw: str) -> str:
+    value = raw.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
+        raise ConfigError(
+            "PC_AGENT_LICENSE_KEY_ID must be 1-64 letters, digits, '.', '_' or '-'."
+        )
+    return value
+
+
+def _parse_license_public_key(raw: str) -> str | None:
+    value = raw.strip()
+    if not value:
+        return None
+    padded = value + "=" * (-len(value) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (binascii.Error, ValueError, UnicodeEncodeError) as exc:
+        raise ConfigError("PC_AGENT_LICENSE_PUBLIC_KEY must be base64url data.") from exc
+    if len(decoded) != 32:
+        raise ConfigError("PC_AGENT_LICENSE_PUBLIC_KEY must decode to a 32-byte Ed25519 key.")
     return value
 
 

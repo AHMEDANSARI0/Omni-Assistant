@@ -27,6 +27,12 @@ _ALLOWED_AI_TOOLS = {
     "pdf.verify": "pdf.verify",
     "pdf.inspect": "pdf.inspect",
     "workspace.list_files": "workspace.list_files",
+    "office.inspect": "office.inspect",
+    "office.csv_inspect": "office.csv_inspect",
+    "office.csv_to_json": "office.csv_to_json",
+    "office.json_to_csv": "office.json_to_csv",
+    "office.csv_to_xlsx": "office.csv_to_xlsx",
+    "desktop.system_info": "desktop.system_info",
 }
 _INTENT_TO_TOOL = {
     "pdf.merge_folders": "pdf.merge_folders",
@@ -34,6 +40,17 @@ _INTENT_TO_TOOL = {
     "pdf.verify": "pdf.verify",
     "pdf.inspect": "pdf.inspect",
     "workspace.list_files": "workspace.list_files",
+    "office.inspect": "office.inspect",
+    "office.csv_inspect": "office.csv_inspect",
+    "office.csv_to_json": "office.csv_to_json",
+    "office.json_to_csv": "office.json_to_csv",
+    "office.csv_to_xlsx": "office.csv_to_xlsx",
+    "desktop.system_info": "desktop.system_info",
+    "files.copy": "files.copy",
+    "files.move": "files.move",
+    "files.rename": "files.rename",
+    "files.organize": "files.organize",
+    "files.search": "files.search",
 }
 
 
@@ -128,6 +145,22 @@ class DeterministicPlanner:
             return self._plan_pdf_verify(instruction, options)
         if _looks_like_inspect(lowered):
             return self._plan_pdf_inspect(instruction, options)
+        if _looks_like_system_info(lowered):
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="desktop.system_info",
+                    tool_id="desktop.system_info",
+                    arguments={},
+                    summary="Report local system information.",
+                    planner="deterministic",
+                )
+            )
+        office_outcome = self._plan_office(instruction, options)
+        if office_outcome is not None:
+            return office_outcome
+        files_outcome = self._plan_files(instruction, options)
+        if files_outcome is not None:
+            return files_outcome
         if _looks_like_list_files(lowered):
             return self._plan_list_files(instruction, options)
         return None
@@ -224,6 +257,232 @@ class DeterministicPlanner:
             )
         )
 
+    def _plan_office(
+        self, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome | None:
+        lowered = instruction.lower()
+        explicit_raw = options.target_path or (
+            options.input_files[0] if options.input_files else None
+        )
+        explicit_suffix = (
+            Path(str(explicit_raw)).suffix.lower() if explicit_raw else ""
+        )
+        output_suffix = (
+            Path(options.output_path).suffix.lower() if options.output_path else ""
+        )
+        conversion = _office_conversion(
+            lowered,
+            input_suffix=explicit_suffix,
+            output_suffix=output_suffix,
+        )
+        office_words = (
+            "docx",
+            "xlsx",
+            "pptx",
+            "csv",
+            "spreadsheet",
+            "workbook",
+            "presentation",
+            "word document",
+            "office document",
+        )
+        has_office_context = (
+            conversion is not None
+            or explicit_suffix in {".docx", ".xlsx", ".pptx", ".csv", ".json"}
+            or any(word in lowered for word in office_words)
+            or bool(_extract_office_tokens(instruction))
+        )
+        if not has_office_context:
+            return None
+
+        if conversion is not None:
+            tool_id, input_suffix, result_suffix, label = conversion
+            raw_input = (
+                str(explicit_raw)
+                if explicit_raw and explicit_suffix == input_suffix
+                else next(
+                    iter(_extract_file_tokens(instruction, input_suffix)),
+                    str(explicit_raw) if explicit_raw else None,
+                )
+            )
+            if not raw_input:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            f"Which workspace {input_suffix} file should be converted? "
+                            "Pass --target or --input-file."
+                        ),
+                    )
+                )
+            resolved = self._extract_office_target(raw_input, input_suffix)
+            if isinstance(resolved, PlanningOutcome):
+                return resolved
+            output_tokens = [
+                item
+                for item in _extract_file_tokens(instruction, result_suffix)
+                if item.casefold() != raw_input.casefold()
+            ]
+            raw_output = options.output_path or next(iter(output_tokens), None)
+            default_output = (
+                Path(resolved.argument).with_suffix(result_suffix).as_posix()
+            )
+            output_check = self._workspace_output(
+                raw_output,
+                default_name=default_output,
+                expected_suffix=result_suffix,
+                format_label=result_suffix.lstrip(".").upper(),
+            )
+            if isinstance(output_check, PlanningOutcome):
+                return output_check
+            arguments: dict[str, Any] = {
+                "input_path": resolved.argument,
+                "output_path": output_check,
+            }
+            if tool_id == "office.csv_to_xlsx":
+                arguments["sheet_name"] = "Sheet1"
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent=tool_id,
+                    tool_id=tool_id,
+                    arguments=arguments,
+                    summary=f"Convert {resolved.argument} {label} {output_check}.",
+                    planner="deterministic",
+                )
+            )
+
+        wants_extract = any(
+            phrase in lowered
+            for phrase in (
+                "extract text",
+                "extract the text",
+                "read text",
+                "get text",
+                "text extract",
+                "text nikalo",
+            )
+        )
+        wants_inspect = any(
+            phrase in lowered
+            for phrase in (
+                "inspect",
+                "analyze",
+                "analyse",
+                "summarize",
+                "summarise",
+                "statistics",
+                "stats",
+                "how many rows",
+                "row count",
+                "check",
+            )
+        )
+        if not wants_extract and not wants_inspect:
+            return None
+
+        raw_input = str(explicit_raw) if explicit_raw else next(
+            iter(_extract_office_tokens(instruction)), None
+        )
+        if not raw_input:
+            return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "Which workspace DOCX/XLSX/PPTX/CSV file should be used? "
+                            "Pass --target or --input-file."
+                        ),
+                    )
+            )
+        input_suffix = Path(raw_input).suffix.lower()
+        if input_suffix not in {".docx", ".xlsx", ".pptx", ".csv"}:
+            return PlanningOutcome(
+                missing_information=(
+                    "Office tasks support DOCX, XLSX, PPTX and CSV inputs.",
+                )
+            )
+        resolved = self._extract_office_target(raw_input, input_suffix)
+        if isinstance(resolved, PlanningOutcome):
+            return resolved
+
+        if wants_extract:
+            arguments = {"path": resolved.argument, "max_chars": 100_000}
+            if options.output_path:
+                raw_output_suffix = Path(options.output_path).suffix.lower()
+                if raw_output_suffix not in {".txt", ".md"}:
+                    return PlanningOutcome(
+                        missing_information=(
+                            "Extracted-text output must end with .txt or .md.",
+                        )
+                    )
+                output_check = self._workspace_output(
+                    options.output_path,
+                    default_name="extracted.txt",
+                    expected_suffix=raw_output_suffix,
+                    format_label="text",
+                )
+                if isinstance(output_check, PlanningOutcome):
+                    return output_check
+                arguments["output_path"] = output_check
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="office.extract_text",
+                    tool_id="office.extract_text",
+                    arguments=arguments,
+                    summary=f"Extract text from {resolved.argument}.",
+                    planner="deterministic",
+                )
+            )
+
+        use_csv_stats = input_suffix == ".csv" and any(
+            phrase in lowered
+            for phrase in (
+                "csv",
+                "stat",
+                "analyze",
+                "analyse",
+                "summarize",
+                "summarise",
+                "row",
+                "column",
+            )
+        )
+        tool_id = "office.csv_inspect" if use_csv_stats else "office.inspect"
+        arguments = {"path": resolved.argument}
+        if use_csv_stats:
+            arguments["sample_rows"] = 5
+        return PlanningOutcome(
+            plan=TaskPlan(
+                intent=tool_id,
+                tool_id=tool_id,
+                arguments=arguments,
+                summary=f"Inspect {resolved.argument}.",
+                planner="deterministic",
+            )
+        )
+
+    def _extract_office_target(
+        self, raw_target: str, expected_suffix: str
+    ) -> _ResolvedInput | PlanningOutcome:
+        if Path(raw_target).suffix.lower() != expected_suffix:
+            return PlanningOutcome(
+                missing_information=(
+                    f"This Office task needs a {expected_suffix} input: {raw_target}",
+                )
+            )
+        resolved = self._resolve_input(raw_target)
+        if resolved is None or not resolved.resolved.is_file():
+            return PlanningOutcome(
+                missing_information=(f"Office file was not found: {raw_target}",)
+            )
+        if resolved.external_root is not None:
+            return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "Office task inputs must be inside the workspace in Phase 4. "
+                            "Copy the file into the workspace or use a workspace path."
+                        ),
+                    )
+            )
+        return resolved
+
     def _plan_pdf_verify(
         self, instruction: str, options: PlannerOptions
     ) -> PlanningOutcome:
@@ -266,6 +525,167 @@ class DeterministicPlanner:
                 ),
             )
         )
+
+    def _plan_files(
+        self, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome | None:
+        lowered = instruction.lower()
+        verb = _file_operation_verb(lowered)
+        if verb is None:
+            return None
+
+        if verb == "organize":
+            raw_folder = (
+                options.target_path
+                or (options.input_folders[0] if options.input_folders else None)
+                or "."
+            )
+            resolved = self._resolve_input(str(raw_folder))
+            if resolved is None or not resolved.resolved.is_dir():
+                return PlanningOutcome(
+                    missing_information=(
+                        f"Folder '{raw_folder}' was not found. Pass --target or --input-folder.",
+                    )
+                )
+            if resolved.external_root is not None:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "File operations are workspace-only in this phase. "
+                            "Choose a folder inside the workspace."
+                        ),
+                    )
+                )
+            by = "extension" if "extension" in lowered else "category"
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="files.organize",
+                    tool_id="files.organize",
+                    arguments={"directory": resolved.argument, "by": by},
+                    summary=f"Organize files in {resolved.argument} by {by}.",
+                    planner="deterministic",
+                )
+            )
+
+        if verb == "search":
+            query = options.target_path or next(iter(_extract_quoted(instruction)), None)
+            if not query:
+                return PlanningOutcome(
+                    missing_information=(
+                        "What should be searched? Quote the text or pass --target <text>.",
+                    )
+                )
+            directory = "."
+            if options.input_folders:
+                resolved_folder = self._resolve_input(options.input_folders[0])
+                if (
+                    resolved_folder is None
+                    or not resolved_folder.resolved.is_dir()
+                    or resolved_folder.external_root is not None
+                ):
+                    return PlanningOutcome(
+                        missing_information=(
+                            "Search folder must be an existing workspace folder.",
+                        )
+                    )
+                directory = resolved_folder.argument
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="files.search",
+                    tool_id="files.search",
+                    arguments={
+                        "query": str(query),
+                        "directory": directory,
+                        "search_content": any(
+                            phrase in lowered
+                            for phrase in ("content", "containing", "inside files")
+                        ),
+                    },
+                    summary=f"Search workspace files for '{query}'.",
+                    planner="deterministic",
+                )
+            )
+
+        # copy / move / rename operate on one explicit workspace file.
+        raw_source = options.target_path or (
+            options.input_files[0] if options.input_files else None
+        )
+        if not raw_source:
+            return PlanningOutcome(
+                missing_information=(
+                    f"Which file should be handled? Pass --target <path> to {verb} it.",
+                )
+            )
+        resolved = self._resolve_input(str(raw_source))
+        if resolved is None or not resolved.resolved.is_file():
+            return PlanningOutcome(
+                missing_information=(f"File was not found: {raw_source}",)
+            )
+        if resolved.external_root is not None:
+            return PlanningOutcome(
+                missing_information=(
+                    (
+                        "File operations are workspace-only in this phase. "
+                        "Choose a file inside the workspace."
+                    ),
+                )
+            )
+
+        if verb == "rename":
+            new_name = options.output_path
+            if not new_name:
+                return PlanningOutcome(
+                    missing_information=(
+                        "What is the new name? Pass --output <new-file-name>.",
+                    )
+                )
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="files.rename",
+                    tool_id="files.rename",
+                    arguments={"path": resolved.argument, "new_name": new_name},
+                    summary=f"Rename {resolved.argument} to {new_name}.",
+                    planner="deterministic",
+                )
+            )
+
+        if not options.output_path:
+            past = "copied" if verb == "copy" else "moved"
+            return PlanningOutcome(
+                missing_information=(
+                    f"Where should the file be {past}? Pass --output <path>.",
+                )
+            )
+        destination = self._file_destination(options.output_path)
+        if isinstance(destination, PlanningOutcome):
+            return destination
+        return PlanningOutcome(
+            plan=TaskPlan(
+                intent=f"files.{verb}",
+                tool_id=f"files.{verb}",
+                arguments={"path": resolved.argument, "output_path": destination},
+                summary=f"{verb.capitalize()} {resolved.argument} to {destination}.",
+                planner="deterministic",
+            )
+        )
+
+    def _file_destination(self, raw_output: str) -> str | PlanningOutcome:
+        candidate = Path(raw_output).expanduser()
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (self._workspace / candidate).resolve()
+        )
+        if resolved == self._workspace or not resolved.is_relative_to(self._workspace):
+            return PlanningOutcome(
+                missing_information=(
+                    (
+                        "The destination must be a file inside the workspace. "
+                        "Choose a workspace output path."
+                    ),
+                )
+            )
+        return resolved.relative_to(self._workspace).as_posix()
 
     def _plan_list_files(
         self, instruction: str, options: PlannerOptions
@@ -359,7 +779,12 @@ class DeterministicPlanner:
         )
 
     def _workspace_output(
-        self, raw_output: str | None, *, default_name: str
+        self,
+        raw_output: str | None,
+        *,
+        default_name: str,
+        expected_suffix: str = ".pdf",
+        format_label: str = "PDF",
     ) -> str | PlanningOutcome:
         if raw_output:
             candidate = Path(raw_output).expanduser()
@@ -371,25 +796,32 @@ class DeterministicPlanner:
             if not resolved.is_relative_to(self._workspace):
                 return PlanningOutcome(
                     missing_information=(
-                        "The output PDF must be inside the workspace. Choose a workspace output path.",
+                        (
+                            f"The output {format_label} must be inside the workspace. "
+                            "Choose a workspace output path."
+                        ),
                     )
                 )
-            if resolved.suffix.lower() != ".pdf":
+            if resolved.suffix.lower() != expected_suffix:
                 return PlanningOutcome(
-                    missing_information=("The output filename must end with .pdf.",)
+                    missing_information=(
+                        f"The output filename must end with {expected_suffix}.",
+                    )
                 )
             return resolved.relative_to(self._workspace).as_posix()
 
         candidate = self._workspace / default_name
         if not candidate.exists():
-            return default_name
+            return Path(default_name).as_posix()
         stamp = self._now().strftime("%Y%m%d-%H%M%S")
-        stem = Path(default_name).stem
-        suffix = Path(default_name).suffix
-        candidate_name = f"{stem}-{stamp}{suffix}"
+        default_path = Path(default_name)
+        stem = default_path.stem
+        suffix = default_path.suffix
+        parent = default_path.parent
+        candidate_name = (parent / f"{stem}-{stamp}{suffix}").as_posix()
         counter = 2
         while (self._workspace / candidate_name).exists():
-            candidate_name = f"{stem}-{stamp}-{counter}{suffix}"
+            candidate_name = (parent / f"{stem}-{stamp}-{counter}{suffix}").as_posix()
             counter += 1
         return candidate_name
 
@@ -524,6 +956,12 @@ def _validate_ai_arguments(intent: str, raw: Mapping[str, Any]) -> dict[str, Any
         "pdf.verify": {"path", "expected_pages"},
         "pdf.inspect": {"path"},
         "workspace.list_files": {"directory", "pattern", "recursive", "max_results"},
+        "office.inspect": {"path"},
+        "office.csv_inspect": {"path", "sample_rows"},
+        "office.csv_to_json": {"input_path", "output_path"},
+        "office.json_to_csv": {"input_path", "output_path"},
+        "office.csv_to_xlsx": {"input_path", "output_path", "sheet_name"},
+        "desktop.system_info": set(),
     }
     if set(raw) - allowed_by_intent[intent]:
         raise PlanningError("AI plan contained unknown tool arguments.")
@@ -543,6 +981,47 @@ def _validate_ai_arguments(intent: str, raw: Mapping[str, Any]) -> dict[str, Any
             if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
                 raise PlanningError("AI plan expected_pages is invalid.")
             result["expected_pages"] = expected
+    elif intent == "office.inspect":
+        path = _ai_relative_path(raw.get("path"), "path")
+        if Path(path).suffix.lower() not in {".docx", ".xlsx", ".pptx", ".csv"}:
+            raise PlanningError("AI office.inspect path must be DOCX, XLSX, PPTX or CSV.")
+        result["path"] = path
+    elif intent == "office.csv_inspect":
+        path = _ai_relative_path(raw.get("path"), "path")
+        if Path(path).suffix.lower() != ".csv":
+            raise PlanningError("AI office.csv_inspect path must end with .csv.")
+        result["path"] = path
+        if raw.get("sample_rows") is not None:
+            sample_rows = raw["sample_rows"]
+            if (
+                not isinstance(sample_rows, int)
+                or isinstance(sample_rows, bool)
+                or not 0 <= sample_rows <= 20
+            ):
+                raise PlanningError("AI plan sample_rows is invalid.")
+            result["sample_rows"] = sample_rows
+    elif intent in {"office.csv_to_json", "office.json_to_csv", "office.csv_to_xlsx"}:
+        expected_suffixes = {
+            "office.csv_to_json": (".csv", ".json"),
+            "office.json_to_csv": (".json", ".csv"),
+            "office.csv_to_xlsx": (".csv", ".xlsx"),
+        }
+        input_suffix, output_suffix = expected_suffixes[intent]
+        input_path = _ai_relative_path(raw.get("input_path"), "input_path")
+        if Path(input_path).suffix.lower() != input_suffix:
+            raise PlanningError(f"AI plan input_path must end with {input_suffix}.")
+        result["input_path"] = input_path
+        result["output_path"] = _ai_output_path(
+            raw.get("output_path"), expected_suffix=output_suffix
+        )
+        if intent == "office.csv_to_xlsx" and raw.get("sheet_name") is not None:
+            sheet_name = raw["sheet_name"]
+            if not isinstance(sheet_name, str) or not 1 <= len(sheet_name.strip()) <= 31:
+                raise PlanningError("AI plan sheet_name is invalid.")
+            result["sheet_name"] = sheet_name.strip()
+    elif intent == "desktop.system_info":
+        if raw:
+            raise PlanningError("AI desktop.system_info plan takes no arguments.")
     else:
         result["directory"] = _ai_relative_path(raw.get("directory", "."), "directory")
         pattern = str(raw.get("pattern") or "*")
@@ -564,10 +1043,10 @@ def _ai_path_list(value: Any, field: str, *, min_items: int = 1) -> list[str]:
     return [_ai_relative_path(item, field) for item in value]
 
 
-def _ai_output_path(value: Any) -> str:
+def _ai_output_path(value: Any, *, expected_suffix: str = ".pdf") -> str:
     path = _ai_relative_path(value, "output_path")
-    if not path.lower().endswith(".pdf"):
-        raise PlanningError("AI plan output_path must end with .pdf.")
+    if not path.lower().endswith(expected_suffix):
+        raise PlanningError(f"AI plan output_path must end with {expected_suffix}.")
     return path
 
 
@@ -633,6 +1112,64 @@ def _looks_like_inspect(lowered: str) -> bool:
     )
 
 
+def _looks_like_system_info(lowered: str) -> bool:
+    return any(
+        phrase in lowered
+        for phrase in (
+            "system info",
+            "system information",
+            "computer info",
+            "computer information",
+            "pc info",
+            "pc information",
+            "machine info",
+        )
+    )
+
+
+def _office_conversion(
+    lowered: str, *, input_suffix: str, output_suffix: str
+) -> tuple[str, str, str, str] | None:
+    def pair(source: str, target: str) -> bool:
+        return (
+            re.search(rf"\b{source}\b.*\b(?:to|into)\b.*\b{target}\b", lowered)
+            is not None
+        )
+
+    if pair("csv", "json") or (
+        input_suffix == ".csv" and output_suffix == ".json" and "convert" in lowered
+    ):
+        return "office.csv_to_json", ".csv", ".json", "to JSON"
+    if pair("json", "csv") or (
+        input_suffix == ".json" and output_suffix == ".csv" and "convert" in lowered
+    ):
+        return "office.json_to_csv", ".json", ".csv", "to CSV"
+    if pair("csv", "xlsx") or pair("csv", "excel") or (
+        input_suffix == ".csv" and output_suffix == ".xlsx" and "convert" in lowered
+    ):
+        return "office.csv_to_xlsx", ".csv", ".xlsx", "to XLSX"
+    return None
+
+
+def _file_operation_verb(lowered: str) -> str | None:
+    """Detect a Phase 8 file-operation verb, most specific first."""
+
+    if re.search(r"\b(organize|organise|organizing|organising|tidy)\b", lowered):
+        return "organize"
+    if re.search(r"\brename\b", lowered):
+        return "rename"
+    if re.search(r"\b(copy|duplicate)\b", lowered):
+        return "copy"
+    if re.search(r"\bmove\b", lowered):
+        return "move"
+    if re.search(r"\bsearch\b", lowered) or (
+        re.search(r"\bfind\b", lowered)
+        and any(phrase in lowered for phrase in ("named", "containing", "content"))
+    ):
+        return "search"
+    return None
+
+
 def _looks_like_list_files(lowered: str) -> bool:
     return any(word in lowered for word in ("list", "show", "find")) and any(
         word in lowered for word in ("file", "files", "pdf", "folder", "directory")
@@ -685,6 +1222,29 @@ def _extract_pdf_tokens(instruction: str) -> list[str]:
         value = match.group(0).strip().strip("\"'`")
         if value and value not in tokens:
             tokens.append(value)
+    return tokens
+
+
+def _extract_file_tokens(instruction: str, suffix: str) -> list[str]:
+    normalized_suffix = suffix.lower()
+    tokens: list[str] = []
+    for value in _extract_quoted(instruction):
+        if value.lower().endswith(normalized_suffix) and value not in tokens:
+            tokens.append(value)
+    pattern = re.compile(rf"(?i)[^\s,;\"]+?{re.escape(normalized_suffix)}")
+    for match in pattern.finditer(instruction):
+        value = match.group(0).strip().strip("\"'`")
+        if value and value not in tokens:
+            tokens.append(value)
+    return tokens
+
+
+def _extract_office_tokens(instruction: str) -> list[str]:
+    tokens: list[str] = []
+    for suffix in (".csv", ".json", ".docx", ".xlsx", ".pptx"):
+        for value in _extract_file_tokens(instruction, suffix):
+            if value not in tokens:
+                tokens.append(value)
     return tokens
 
 

@@ -8,6 +8,7 @@ files are opened read-only and are never modified.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import uuid
 from dataclasses import dataclass
@@ -24,6 +25,11 @@ def _load_pypdf() -> tuple[Any, Any]:
         raise ToolError(
             'PDF support needs the pypdf package. Run: python -m pip install -e ".[dev]"'
         ) from exc
+    pypdf_logger = logging.getLogger("pypdf")
+    if pypdf_logger.level == logging.NOTSET:
+        # Library/test callers get the same clean behaviour as the CLI unless
+        # the host application has explicitly chosen a pypdf level itself.
+        pypdf_logger.setLevel(logging.ERROR)
     return PdfReader, PdfWriter
 
 

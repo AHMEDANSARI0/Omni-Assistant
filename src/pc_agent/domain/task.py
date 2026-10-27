@@ -65,6 +65,7 @@ _VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     ),
     TaskStatus.RUNNING: frozenset(
         {
+            TaskStatus.PLANNING,  # resume of an interrupted task re-enters planning
             TaskStatus.WAITING_FOR_APPROVAL,
             TaskStatus.VERIFYING,
             TaskStatus.RETRYING,
@@ -76,7 +77,9 @@ _VALID_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.VERIFYING: frozenset(
         {
             TaskStatus.SUCCEEDED,
+            TaskStatus.PLANNING,  # resume of an interrupted task re-enters planning
             TaskStatus.RETRYING,
+            TaskStatus.NEEDS_INPUT,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         }

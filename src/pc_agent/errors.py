@@ -50,3 +50,15 @@ class PlanningError(PcAgentError):
 
 class ApprovalUnavailableError(PcAgentError):
     """Approval was required but no approval decision could be collected."""
+
+
+class ToolBuilderError(PcAgentError):
+    """A dynamic-tool candidate, test, approval or lifecycle action was invalid."""
+
+
+class RecoveryError(PcAgentError):
+    """A task cannot be diagnosed or recovered safely within the allowed bounds."""
+
+
+class LicenseError(PcAgentError):
+    """A license is missing/invalid/expired, or a feature is not licensed."""

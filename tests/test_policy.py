@@ -55,7 +55,14 @@ def test_credential_access_is_always_denied(engine: PolicyEngine, workspace: Pat
 
 def test_shell_and_network_need_approval(engine: PolicyEngine) -> None:
     assert engine.evaluate(ActionRequest(Action.RUN_SHELL)).requires_approval
-    assert engine.evaluate(ActionRequest(Action.NETWORK_ACCESS)).requires_approval
+    # Without an exact URL, network access is denied outright; a URL still
+    # needs approval unless the dedicated direct web command granted it.
+    assert not engine.evaluate(ActionRequest(Action.NETWORK_ACCESS)).allowed
+    assert engine.evaluate(
+        ActionRequest(
+            Action.NETWORK_ACCESS, target_url="https://example.com/"
+        )
+    ).requires_approval
 
 
 def test_path_traversal_is_rejected(tmp_path: Path) -> None:

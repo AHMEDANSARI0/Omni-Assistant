@@ -47,6 +47,22 @@ def test_default_registry_contains_expected_tools() -> None:
         "pdf.verify",
         "pdf.merge",
         "pdf.merge_folders",
+        "office.inspect",
+        "office.extract_text",
+        "office.csv_inspect",
+        "office.csv_to_json",
+        "office.json_to_csv",
+        "office.create_docx",
+        "office.csv_to_xlsx",
+        "web.fetch",
+        "desktop.system_info",
+        "desktop.open_path",
+        "desktop.open_url",
+        "files.copy",
+        "files.move",
+        "files.rename",
+        "files.organize",
+        "files.search",
     }
 
 

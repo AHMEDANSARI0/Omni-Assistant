@@ -1,8 +1,9 @@
-"""Versioned in-code registry for approved built-in tools.
+"""Versioned registry for reviewed built-ins and approved dynamic tools.
 
-Phase 1B intentionally keeps built-in tool definitions in reviewed source
-code. Dynamic, persisted tool registration belongs to Phase 2, where generated
-candidates must pass validation and approval before they reach this registry.
+Built-in definitions remain in reviewed source code. Phase 2 dynamic tools are
+loaded from persisted candidates only after validation, sandbox tests and
+explicit approval; this registry then applies the same schema boundary to both
+kinds of handler.
 """
 
 from __future__ import annotations
@@ -35,12 +36,25 @@ class ToolContext:
     workspace_dir: Path
     policy_engine: PolicyEngine
     approved_read_roots: tuple[Path, ...] = ()
+    network_access_allowed: bool = False
+    allow_private_network: bool = False
+    desktop_open_allowed: bool = False
+    web_timeout_seconds: float = 15.0
+    web_max_bytes: int = 2_000_000
+    desktop_opener: Callable[[str], None] | None = None
 
     @classmethod
     def for_workspace(
         cls,
         workspace_dir: Path,
         approved_read_roots: tuple[Path, ...] = (),
+        *,
+        network_access_allowed: bool = False,
+        allow_private_network: bool = False,
+        desktop_open_allowed: bool = False,
+        web_timeout_seconds: float = 15.0,
+        web_max_bytes: int = 2_000_000,
+        desktop_opener: Callable[[str], None] | None = None,
     ) -> ToolContext:
         resolved = workspace_dir.expanduser().resolve()
         roots = tuple(
@@ -55,8 +69,20 @@ class ToolContext:
         )
         return cls(
             workspace_dir=resolved,
-            policy_engine=PolicyEngine(resolved, approved_read_roots=roots),
+            policy_engine=PolicyEngine(
+                resolved,
+                approved_read_roots=roots,
+                network_access_allowed=network_access_allowed,
+                allow_private_network=allow_private_network,
+                desktop_open_allowed=desktop_open_allowed,
+            ),
             approved_read_roots=roots,
+            network_access_allowed=network_access_allowed,
+            allow_private_network=allow_private_network,
+            desktop_open_allowed=desktop_open_allowed,
+            web_timeout_seconds=web_timeout_seconds,
+            web_max_bytes=web_max_bytes,
+            desktop_opener=desktop_opener,
         )
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import enum
 import json
+import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -18,6 +19,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from ..errors import ProviderError
+from ..http_tls import create_tls_context
 from ..logging_config import redact_text
 
 _MAX_RESPONSE_BYTES = 2_000_000
@@ -140,13 +142,17 @@ class UrllibJsonTransport:
     def __call__(self, request: HttpJsonRequest) -> Mapping[str, Any]:
         _validate_http_url(request.url)
         body = json.dumps(dict(request.payload)).encode("utf-8")
-        headers = {"Content-Type": "application/json", "User-Agent": "pc-agent/0.3"}
+        headers = {"Content-Type": "application/json", "User-Agent": "pc-agent/0.4"}
         headers.update({str(key): str(value) for key, value in request.headers.items()})
         http_request = Request(request.url, data=body, headers=headers, method="POST")
 
         try:
             # URL scheme/host were validated by _validate_http_url above.
-            with urlopen(http_request, timeout=request.timeout_seconds) as response:
+            with urlopen(
+                http_request,
+                timeout=request.timeout_seconds,
+                context=create_tls_context(),
+            ) as response:
                 raw = response.read(_MAX_RESPONSE_BYTES + 1)
         except HTTPError as exc:
             detail = _http_error_detail(exc)
@@ -157,6 +163,18 @@ class UrllibJsonTransport:
                 status_code=exc.code,
             ) from exc
         except (URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, ssl.SSLCertVerificationError) or (
+                "certificate verify failed" in str(reason).lower()
+            ):
+                raise ProviderError(
+                    "Provider TLS certificate verification failed. The agent "
+                    "used the system, Windows (when present) and Certifi CA "
+                    "stores and did not disable verification. Check the PC "
+                    "date/time or antivirus HTTPS filtering, then inspect "
+                    "pc-agent doctor.",
+                    retryable=False,
+                ) from exc
             raise ProviderError(
                 f"Provider network error: {redact_text(str(exc))}", retryable=True
             ) from exc

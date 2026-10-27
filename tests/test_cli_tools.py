@@ -29,6 +29,8 @@ def test_tools_list_includes_pdf_tools(capsys: pytest.CaptureFixture[str]) -> No
     out = capsys.readouterr().out
     assert "pdf.merge_folders v1.0.0" in out
     assert "workspace.list_files" in out
+    assert "  provenance=builtin" in out
+    assert max(len(line) for line in out.splitlines()) <= 90
 
 
 def test_demo_pdf_then_merge_folders_end_to_end(

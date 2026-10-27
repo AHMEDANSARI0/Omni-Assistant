@@ -34,7 +34,8 @@ def test_doctor_initializes_database(tmp_path: Path, capsys: pytest.CaptureFixtu
 
     out = capsys.readouterr().out
     assert "Status: OK" in out
-    assert "schema v2" in out
+    assert "schema v6" in out
+    assert "Approved dynamic tools: 0" in out
     assert "Usable provider route: mock" in out
     assert (tmp_path / "data" / "pc_agent.db").is_file()
     assert (tmp_path / "workspace").is_dir()

@@ -4,14 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-healing-pc-agent"
-version = "0.3.0"
-description = "Autonomous self-healing PC AI agent (local core)"
+version = "0.10.0"
+description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file operations)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 # Runtime dependencies are added per phase only when an implemented feature
-# actually needs them. Phase 1B's PDF tools use pypdf.
+# actually needs them. Phase 1B's PDF tools use pypdf; the Phase 4.1 TLS
+# hotfix uses certifi as a portable Mozilla CA bundle.
 dependencies = [
+    "certifi>=2024.7.4",
     "pypdf>=5.0,<7",
 ]
 
@@ -23,6 +25,12 @@ dev = [
 
 [project.scripts]
 pc-agent = "pc_agent.cli:main"
+# Vendor-only license issuing tool; customer production builds should keep
+# private keys (and may omit this launcher) off end-user machines.
+pc-agent-license-admin = "pc_agent.licensing.admin:main"
+
+[project.gui-scripts]
+pc-agent-gui = "pc_agent.gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -35,3 +43,4 @@ addopts = "-ra"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = [".patcher-backups"]

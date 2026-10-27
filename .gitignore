@@ -26,3 +26,6 @@ workspace/*
 .idea/
 Thumbs.db
 desktop.ini
+hide
+.hide
+/hide

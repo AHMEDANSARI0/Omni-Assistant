@@ -1,0 +1,55 @@
+{
+  "tool_id": "custom.text_reverse",
+  "name": "Reverse text",
+  "version": "1.0.0",
+  "description": "Reverse the characters in a text value.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "maxLength": 100000
+      }
+    },
+    "required": [
+      "text"
+    ]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "maxLength": 100000
+      }
+    },
+    "required": [
+      "text"
+    ]
+  },
+  "source_code": "def run(arguments):\n    return {'text': arguments['text'][::-1]}\n",
+  "test_cases": [
+    {
+      "name": "reverse abc",
+      "arguments": {
+        "text": "abc"
+      },
+      "expected_output": {
+        "text": "cba"
+      }
+    },
+    {
+      "name": "empty text",
+      "arguments": {
+        "text": ""
+      },
+      "expected_output": {
+        "text": ""
+      }
+    }
+  ],
+  "dependencies": [],
+  "timeout_seconds": 5,
+  "permissions": [],
+  "network_required": false
+}

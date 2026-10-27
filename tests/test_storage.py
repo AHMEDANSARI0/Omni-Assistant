@@ -23,9 +23,9 @@ def database(tmp_path: Path) -> Database:
 
 
 def test_migrations_are_idempotent(database: Database) -> None:
-    assert database.schema_version() == 2
-    assert database.initialize() == 2
-    assert database.schema_version() == 2
+    assert database.schema_version() == 6
+    assert database.initialize() == 6
+    assert database.schema_version() == 6
 
 
 def test_task_round_trip(database: Database) -> None:
