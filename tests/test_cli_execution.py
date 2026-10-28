@@ -27,14 +27,16 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_providers_list_and_ask_use_offline_mock_without_keys(
-    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["providers", "list"]) == 0
+    # Rooted at tmp_path so a developer's real .env (with provider keys)
+    # in the working directory can never leak into this offline test.
+    assert main(["--root", str(tmp_path), "providers", "list"]) == 0
     providers_out = capsys.readouterr().out
     assert "Fallback route: mock" in providers_out
     assert "No provider network call" in providers_out
 
-    assert main(["ask", "Hello"]) == 0
+    assert main(["--root", str(tmp_path), "ask", "Hello"]) == 0
     captured = capsys.readouterr()
     assert "Offline mock response" in captured.out
     assert "mock/offline-mock" in captured.err

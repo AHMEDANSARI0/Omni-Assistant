@@ -19,6 +19,7 @@ from .base import (
 
 class OllamaProvider:
     implemented = True
+    supports_vision = True
 
     def __init__(
         self,
@@ -49,10 +50,7 @@ class OllamaProvider:
             headers["Authorization"] = f"Bearer {self._api_key}"
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [
-                {"role": message.role.value, "content": message.content}
-                for message in request.messages
-            ],
+            "messages": [_message_payload(message) for message in request.messages],
             "stream": False,
             "options": {
                 "temperature": request.temperature,
@@ -88,3 +86,13 @@ class OllamaProvider:
             model=str(data.get("model") or self.model),
             usage=usage,
         )
+
+
+def _message_payload(message: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "role": message.role.value,
+        "content": message.content,
+    }
+    if message.images:
+        payload["images"] = [image.base64_data for image in message.images]
+    return payload

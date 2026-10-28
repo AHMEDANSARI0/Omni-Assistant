@@ -16,11 +16,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .errors import ConfigError
+from .credentials import (
+    SUPPORTED_CREDENTIAL_PROVIDERS,
+    CredentialStore,
+    build_credential_store,
+    canonical_credential_provider,
+)
+from .errors import ConfigError, CredentialError
 
 _ALLOWED_ENVIRONMENTS = frozenset({"development", "test", "production"})
 _ALLOWED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _ALLOWED_LICENSE_ENFORCEMENT = frozenset({"off", "warn", "enforce"})
+_ALLOWED_CREDENTIAL_STORES = frozenset({"auto", "windows", "env"})
 # Provider slots understood by the replaceable provider-abstraction layer.
 # `providers list` says which slots have a direct adapter in this build.
 _ALLOWED_PROVIDERS = frozenset(
@@ -96,6 +103,40 @@ class Settings:
     recovery_stale_after_minutes: int = 10
     web_timeout_seconds: float = 15.0
     web_max_bytes: int = 2_000_000
+    # Phase 12 approved subprocess. Off by default: every subprocess tool
+    # fails closed until the user explicitly opts in.
+    allow_subprocess: bool = False
+    command_allowlist: tuple[str, ...] = (
+        "git",
+        "python",
+        "python3",
+        "py",
+        "node",
+        "npm",
+    )
+    command_timeout_seconds: float = 60.0
+    # Phase 13 browser automation. Off by default: the user starts a debug
+    # browser explicitly and every browser tool fails closed until opted in.
+    allow_browser: bool = False
+    browser_port: int = 9222
+    browser_timeout_seconds: float = 20.0
+    # Phase 14 Windows UI Automation. Off by default; native desktop
+    # actions fail closed until explicitly enabled and separately approved.
+    allow_desktop_automation: bool = False
+    desktop_automation_timeout_seconds: float = 30.0
+    # Phase 15 provider vision. Local image tools work without this gate;
+    # sending one selected image to a model is opt-in and separately approved.
+    allow_vision: bool = False
+    vision_max_image_bytes: int = 10_000_000
+    # Phase 16 secure credential storage. Environment/.env values remain
+    # authoritative when present; otherwise Windows Credential Manager is
+    # consulted in production loads. Explicit test environ mappings never
+    # silently read the developer's real OS vault.
+    credential_store: str = "auto"
+    credential_store_backend: str = "environment-only"
+    credential_store_available: bool = False
+    credential_store_detail: str = ""
+    credential_sources: tuple[tuple[str, str], ...] = ()
     # Phase 6 licensing. Enforcement defaults to "off" so development and
     # existing installs keep working; commercial builds opt in explicitly.
     license_enforcement: str = "off"
@@ -122,6 +163,12 @@ class Settings:
     ollama_base_url: str = DEFAULT_OLLAMA_BASE_URL
     anthropic_base_url: str = DEFAULT_ANTHROPIC_BASE_URL
 
+    def credential_source(self, provider: str) -> str:
+        """Where a provider key came from: environment, OS store or missing."""
+
+        canonical = canonical_credential_provider(provider)
+        return dict(self.credential_sources).get(canonical, "missing")
+
     @property
     def providers_with_credentials(self) -> tuple[str, ...]:
         """Providers from provider_order for which a key is present (names only)."""
@@ -143,6 +190,10 @@ class Settings:
     def public_summary(self) -> dict[str, str]:
         """Non-secret values safe to show in CLI output and logs."""
         configured = ", ".join(self.providers_with_credentials) or "none"
+        credential_sources = ", ".join(
+            f"{name}={self.credential_source(name)}"
+            for name in self.providers_with_credentials
+        )
         return {
             "environment": self.environment,
             "root": str(self.root_dir),
@@ -155,6 +206,26 @@ class Settings:
             "recovery_stale_after_minutes": str(self.recovery_stale_after_minutes),
             "web_timeout_seconds": str(self.web_timeout_seconds),
             "web_max_bytes": str(self.web_max_bytes),
+            "allow_subprocess": "yes" if self.allow_subprocess else "no",
+            "command_allowlist": ", ".join(self.command_allowlist) or "none",
+            "command_timeout_seconds": str(self.command_timeout_seconds),
+            "allow_browser": "yes" if self.allow_browser else "no",
+            "browser_port": str(self.browser_port),
+            "browser_timeout_seconds": str(self.browser_timeout_seconds),
+            "allow_desktop_automation": (
+                "yes" if self.allow_desktop_automation else "no"
+            ),
+            "desktop_automation_timeout_seconds": str(
+                self.desktop_automation_timeout_seconds
+            ),
+            "allow_vision": "yes" if self.allow_vision else "no",
+            "vision_max_image_bytes": str(self.vision_max_image_bytes),
+            "credential_store": self.credential_store,
+            "credential_store_backend": self.credential_store_backend,
+            "credential_store_available": (
+                "yes" if self.credential_store_available else "no"
+            ),
+            "provider_credential_sources": credential_sources or "none",
             "license_enforcement": self.license_enforcement,
             "license_public_key_configured": "yes" if self.license_public_key else "no",
             "license_file": str(self.license_file),
@@ -168,6 +239,7 @@ class Settings:
         *,
         environ: Mapping[str, str] | None = None,
         load_dotenv: bool = True,
+        credential_store: CredentialStore | None = None,
     ) -> Settings:
         real_environ: Mapping[str, str] = os.environ if environ is None else environ
         root_candidate: str | Path
@@ -222,6 +294,43 @@ class Settings:
             get("PC_AGENT_WEB_TIMEOUT_SECONDS", "15")
         )
         web_max_bytes = _parse_web_max_bytes(get("PC_AGENT_WEB_MAX_BYTES", "2000000"))
+        allow_subprocess = _parse_allow_subprocess(
+            get("PC_AGENT_ALLOW_SUBPROCESS", "0")
+        )
+        command_allowlist = _parse_command_allowlist(
+            get("PC_AGENT_COMMAND_ALLOWLIST", "git,python,python3,py,node,npm")
+        )
+        command_timeout_seconds = _parse_command_timeout(
+            get("PC_AGENT_COMMAND_TIMEOUT_SECONDS", "60")
+        )
+        allow_browser = _parse_allow_browser(get("PC_AGENT_ALLOW_BROWSER", "0"))
+        browser_port = _parse_browser_port(get("PC_AGENT_BROWSER_PORT", "9222"))
+        browser_timeout_seconds = _parse_browser_timeout(
+            get("PC_AGENT_BROWSER_TIMEOUT_SECONDS", "20")
+        )
+        allow_desktop_automation = _parse_allow_desktop_automation(
+            get("PC_AGENT_ALLOW_DESKTOP_AUTOMATION", "0")
+        )
+        desktop_automation_timeout_seconds = _parse_desktop_automation_timeout(
+            get("PC_AGENT_DESKTOP_AUTOMATION_TIMEOUT_SECONDS", "30")
+        )
+        allow_vision = _parse_allow_vision(get("PC_AGENT_ALLOW_VISION", "0"))
+        vision_max_image_bytes = _parse_vision_max_image_bytes(
+            get("PC_AGENT_VISION_MAX_IMAGE_BYTES", "10000000")
+        )
+        credential_store_mode = _parse_credential_store(
+            get("PC_AGENT_CREDENTIAL_STORE", "auto")
+        )
+        status_store = credential_store or build_credential_store(
+            credential_store_mode
+        )
+        credential_status = status_store.status(include_stored=False)
+        lookup_store = (
+            status_store
+            if credential_store_mode != "env"
+            and (credential_store is not None or environ is None)
+            else None
+        )
 
         license_enforcement = get("PC_AGENT_LICENSE_ENFORCEMENT", "off").lower()
         if license_enforcement not in _ALLOWED_LICENSE_ENFORCEMENT:
@@ -288,6 +397,33 @@ class Settings:
             get("PC_AGENT_ANTHROPIC_BASE_URL", DEFAULT_ANTHROPIC_BASE_URL),
         )
 
+        api_key_env_names = {
+            "gemini": "GEMINI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
+            "ollama": "OLLAMA_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+        }
+        api_keys: dict[str, str | None] = {}
+        credential_sources: list[tuple[str, str]] = []
+        for provider in SUPPORTED_CREDENTIAL_PROVIDERS:
+            value = get(api_key_env_names[provider]) or None
+            if value:
+                api_keys[provider] = value
+                credential_sources.append((provider, "environment"))
+                continue
+            if lookup_store is not None and lookup_store.available:
+                try:
+                    value = lookup_store.get_api_key(provider)
+                except CredentialError as exc:
+                    raise ConfigError(str(exc)) from exc
+            api_keys[provider] = value
+            if value:
+                credential_sources.append(
+                    (provider, "windows-credential-manager")
+                )
+
         return cls(
             root_dir=root,
             environment=environment,
@@ -303,17 +439,32 @@ class Settings:
             recovery_stale_after_minutes=recovery_stale_after_minutes,
             web_timeout_seconds=web_timeout_seconds,
             web_max_bytes=web_max_bytes,
+            allow_subprocess=allow_subprocess,
+            command_allowlist=command_allowlist,
+            command_timeout_seconds=command_timeout_seconds,
+            allow_browser=allow_browser,
+            browser_port=browser_port,
+            browser_timeout_seconds=browser_timeout_seconds,
+            allow_desktop_automation=allow_desktop_automation,
+            desktop_automation_timeout_seconds=desktop_automation_timeout_seconds,
+            allow_vision=allow_vision,
+            vision_max_image_bytes=vision_max_image_bytes,
+            credential_store=credential_store_mode,
+            credential_store_backend=credential_status.backend,
+            credential_store_available=credential_status.available,
+            credential_store_detail=credential_status.detail,
+            credential_sources=tuple(credential_sources),
             license_enforcement=license_enforcement,
             license_file=license_file,
             license_public_key=license_public_key,
             license_key_id=license_key_id,
             trial_days=trial_days,
-            gemini_api_key=get("GEMINI_API_KEY") or None,
-            openrouter_api_key=get("OPENROUTER_API_KEY") or None,
-            openai_api_key=get("OPENAI_API_KEY") or None,
-            openai_compatible_api_key=get("OPENAI_COMPATIBLE_API_KEY") or None,
-            ollama_api_key=get("OLLAMA_API_KEY") or None,
-            anthropic_api_key=get("ANTHROPIC_API_KEY") or None,
+            gemini_api_key=api_keys["gemini"],
+            openrouter_api_key=api_keys["openrouter"],
+            openai_api_key=api_keys["openai"],
+            openai_compatible_api_key=api_keys["openai-compatible"],
+            ollama_api_key=api_keys["ollama"],
+            anthropic_api_key=api_keys["anthropic"],
             gemini_model=gemini_model,
             openrouter_model=openrouter_model,
             openai_model=openai_model,
@@ -408,6 +559,136 @@ def _parse_web_timeout(raw: str) -> float:
         raise ConfigError("PC_AGENT_WEB_TIMEOUT_SECONDS must be a number.") from exc
     if value <= 0 or value > 60:
         raise ConfigError("PC_AGENT_WEB_TIMEOUT_SECONDS must be greater than 0 and at most 60.")
+    return value
+
+
+def _parse_allow_subprocess(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        "PC_AGENT_ALLOW_SUBPROCESS must be a boolean (1/0, true/false, yes/no, on/off)."
+    )
+
+
+def _parse_command_allowlist(raw: str) -> tuple[str, ...]:
+    names: list[str] = []
+    for item in raw.split(","):
+        name = item.strip().lower()
+        if not name:
+            continue
+        if "/" in name or "\\" in name or len(name) > 100:
+            raise ConfigError(
+                "PC_AGENT_COMMAND_ALLOWLIST entries must be bare program names, not paths."
+            )
+        if name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _parse_allow_browser(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        "PC_AGENT_ALLOW_BROWSER must be a boolean (1/0, true/false, yes/no, on/off)."
+    )
+
+
+def _parse_browser_port(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_BROWSER_PORT must be a port number.") from exc
+    if value < 1 or value > 65535:
+        raise ConfigError("PC_AGENT_BROWSER_PORT must be between 1 and 65535.")
+    return value
+
+
+def _parse_browser_timeout(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_BROWSER_TIMEOUT_SECONDS must be a number.") from exc
+    if value <= 0 or value > 120:
+        raise ConfigError(
+            "PC_AGENT_BROWSER_TIMEOUT_SECONDS must be greater than 0 and at most 120."
+        )
+    return value
+
+
+def _parse_allow_desktop_automation(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        "PC_AGENT_ALLOW_DESKTOP_AUTOMATION must be a boolean "
+        "(1/0, true/false, yes/no, on/off)."
+    )
+
+
+def _parse_desktop_automation_timeout(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            "PC_AGENT_DESKTOP_AUTOMATION_TIMEOUT_SECONDS must be a number."
+        ) from exc
+    if value <= 0 or value > 300:
+        raise ConfigError(
+            "PC_AGENT_DESKTOP_AUTOMATION_TIMEOUT_SECONDS must be greater "
+            "than 0 and at most 300."
+        )
+    return value
+
+
+def _parse_allow_vision(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        "PC_AGENT_ALLOW_VISION must be a boolean (1/0, true/false, yes/no, on/off)."
+    )
+
+
+def _parse_vision_max_image_bytes(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_VISION_MAX_IMAGE_BYTES must be an integer.") from exc
+    if value < 1024 or value > 20_000_000:
+        raise ConfigError(
+            "PC_AGENT_VISION_MAX_IMAGE_BYTES must be between 1024 and 20000000."
+        )
+    return value
+
+
+def _parse_credential_store(raw: str) -> str:
+    value = raw.strip().lower() or "auto"
+    if value not in _ALLOWED_CREDENTIAL_STORES:
+        raise ConfigError(
+            "PC_AGENT_CREDENTIAL_STORE must be one of: auto, windows, env."
+        )
+    return value
+
+
+def _parse_command_timeout(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_COMMAND_TIMEOUT_SECONDS must be a number.") from exc
+    if value <= 0 or value > 300:
+        raise ConfigError(
+            "PC_AGENT_COMMAND_TIMEOUT_SECONDS must be greater than 0 and at most 300."
+        )
     return value
 
 

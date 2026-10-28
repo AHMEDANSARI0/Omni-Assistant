@@ -42,6 +42,18 @@ class ToolContext:
     web_timeout_seconds: float = 15.0
     web_max_bytes: int = 2_000_000
     desktop_opener: Callable[[str], None] | None = None
+    desktop_automation_allowed: bool = False
+    desktop_automation_timeout_seconds: float = 30.0
+    desktop_automation_backend_factory: Callable[[], Any] | None = None
+    vision_allowed: bool = False
+    vision_max_image_bytes: int = 10_000_000
+    vision_router_factory: Callable[[], Any] | None = None
+    command_allowlist: tuple[str, ...] = ()
+    command_timeout_seconds: float = 60.0
+    browser_allowed: bool = False
+    browser_port: int = 9222
+    browser_timeout_seconds: float = 20.0
+    browser_client_factory: Callable[[], Any] | None = None
 
     @classmethod
     def for_workspace(
@@ -55,6 +67,19 @@ class ToolContext:
         web_timeout_seconds: float = 15.0,
         web_max_bytes: int = 2_000_000,
         desktop_opener: Callable[[str], None] | None = None,
+        desktop_automation_allowed: bool = False,
+        desktop_automation_timeout_seconds: float = 30.0,
+        desktop_automation_backend_factory: Callable[[], Any] | None = None,
+        vision_allowed: bool = False,
+        vision_max_image_bytes: int = 10_000_000,
+        vision_router_factory: Callable[[], Any] | None = None,
+        subprocess_allowed: bool = False,
+        command_allowlist: tuple[str, ...] = (),
+        command_timeout_seconds: float = 60.0,
+        browser_allowed: bool = False,
+        browser_port: int = 9222,
+        browser_timeout_seconds: float = 20.0,
+        browser_client_factory: Callable[[], Any] | None = None,
     ) -> ToolContext:
         resolved = workspace_dir.expanduser().resolve()
         roots = tuple(
@@ -75,6 +100,9 @@ class ToolContext:
                 network_access_allowed=network_access_allowed,
                 allow_private_network=allow_private_network,
                 desktop_open_allowed=desktop_open_allowed,
+                desktop_automation_allowed=desktop_automation_allowed,
+                vision_allowed=vision_allowed,
+                subprocess_allowed=subprocess_allowed,
             ),
             approved_read_roots=roots,
             network_access_allowed=network_access_allowed,
@@ -83,6 +111,18 @@ class ToolContext:
             web_timeout_seconds=web_timeout_seconds,
             web_max_bytes=web_max_bytes,
             desktop_opener=desktop_opener,
+            desktop_automation_allowed=desktop_automation_allowed,
+            desktop_automation_timeout_seconds=desktop_automation_timeout_seconds,
+            desktop_automation_backend_factory=desktop_automation_backend_factory,
+            vision_allowed=vision_allowed,
+            vision_max_image_bytes=vision_max_image_bytes,
+            vision_router_factory=vision_router_factory,
+            command_allowlist=tuple(command_allowlist),
+            command_timeout_seconds=command_timeout_seconds,
+            browser_allowed=browser_allowed,
+            browser_port=browser_port,
+            browser_timeout_seconds=browser_timeout_seconds,
+            browser_client_factory=browser_client_factory,
         )
 
 

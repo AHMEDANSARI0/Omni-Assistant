@@ -23,6 +23,7 @@ from .base import (
 
 class OpenAICompatibleProvider:
     implemented = True
+    supports_vision = True
 
     def __init__(
         self,
@@ -62,10 +63,7 @@ class OpenAICompatibleProvider:
 
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [
-                {"role": message.role.value, "content": message.content}
-                for message in request.messages
-            ],
+            "messages": [_message_payload(message) for message in request.messages],
             "temperature": request.temperature,
             "max_tokens": request.max_output_tokens,
         }
@@ -85,6 +83,20 @@ class OpenAICompatibleProvider:
             model=str(data.get("model") or self.model),
             usage=dict(usage),
         )
+
+
+def _message_payload(message: Any) -> dict[str, Any]:
+    if not message.images:
+        return {"role": message.role.value, "content": message.content}
+    content: list[dict[str, Any]] = [{"type": "text", "text": message.content}]
+    for image in message.images:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": image.data_url, "detail": "auto"},
+            }
+        )
+    return {"role": message.role.value, "content": content}
 
 
 def _extract_output(data: Mapping[str, Any], provider: str) -> str:

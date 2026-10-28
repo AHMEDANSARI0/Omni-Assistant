@@ -1,5 +1,240 @@
 # Changelog
 
+## 0.18.1 - PHASE 16.1 Credential Manager Hotfix
+
+- **Simulated Win32 `ERROR_NOT_FOUND` on real Windows**: the credential
+  backend checked `ctypes.get_last_error()` before an injected library's
+  own `last_error`. A simulated `CredReadW` miss therefore appeared as
+  Win32 error 0 on Windows (but passed on Linux, where ctypes has no
+  `get_last_error`). Injected test doubles are now authoritative; the
+  real uninjected `advapi32` path still uses ctypes' captured last error.
+- **Live GUI tab count**: the Windows-only GUI construction test still
+  expected 7 notebook tabs after Phase 15 added Images. It now expects 8.
+- No production feature, schema, dependency or credential-format change.
+  Automated suite: 335 passed, 1 skipped; Ruff clean.
+
+## 0.18.0 - PHASE 16 Windows Credential Manager
+
+- **Secure provider-key storage**: one Windows generic credential per
+  provider slot, accessed through native `CredReadW`, `CredWriteW`,
+  `CredDeleteW` and `CredFree` calls in `advapi32.dll`. No new runtime
+  dependency is added.
+- **Non-breaking resolution**: environment/`.env` keys still win. When a
+  key is absent there, production Settings loads fall back to Windows
+  Credential Manager according to `PC_AGENT_CREDENTIAL_STORE=auto|windows|env`.
+- **Dedicated CLI**: `pc-agent credentials status|list|set|delete|migrate`.
+  `set` uses a hidden double prompt and accepts no secret argument;
+  `migrate` copies existing environment keys after approval but never
+  edits `.env`; status output contains provider names/sources only.
+- **Doctor/GUI visibility**: backend availability, stored provider names
+  and effective credential sources are shown without values. No task or
+  AI tool can read credentials, and there is no credential `get/show`
+  command.
+- **Test isolation**: the suite defaults to `PC_AGENT_CREDENTIAL_STORE=env`
+  and exercises OS storage through injected in-memory/simulated Win32
+  backends, never a developer's real vault. Automated suite: 334 passed,
+  1 skipped; Ruff clean.
+
+## 0.17.0 - PHASE 15 Image Tools + Vision
+
+- **Five new image tools**: `image.inspect`, `image.convert`,
+  `image.transform`, `image.compare` and `image.analyze`; the built-in
+  count grows from 49 to 54.
+- **Local Pillow engine**: PNG/JPEG/GIF/BMP/WebP/TIFF input inspection;
+  PNG/JPEG/WebP/BMP/TIFF outputs; crop/resize/thumbnail/rotate/flip/
+  grayscale; 20 MB, 10,000 px and 40 megapixel caps; EXIF orientation
+  normalization; metadata-free, never-overwrite outputs.
+- **Provider vision**: `CompletionRequest` now carries bounded image input.
+  Gemini receives an inline Interactions image part,
+  OpenRouter/OpenAI-compatible providers receive data URLs, and Ollama
+  receives its native base64 `images` array. The offline mock refuses
+  image requests, and routing skips providers that do not declare vision
+  capability.
+- **New default-off settings**: `PC_AGENT_ALLOW_VISION` and
+  `PC_AGENT_VISION_MAX_IMAGE_BYTES`. Every orchestrated or direct vision
+  call requires approval for the exact image/question before bytes leave
+  the PC. AI planning may propose only local inspect/compare; vision is
+  excluded from automatic recovery retries.
+- **Surfaces**: `pc-agent image inspect|convert|transform|compare|analyze`,
+  task `--image-*` options, doctor diagnostics, and a GUI Images tab.
+- **Verification**: local outputs are independently re-inspected. Vision
+  answers are bound to a re-inspection of the exact approved image without
+  sending it a second time. Automated suite: 325 passed, 1 skipped; Ruff
+  clean.
+
+## 0.16.0 - PHASE 14 Windows Desktop UI Automation
+
+- **Seven new desktop tools**: `desktop.windows`, `desktop.window_inspect`,
+  `desktop.window_focus`, `desktop.window_click`, `desktop.window_type`,
+  `desktop.send_keys` and `desktop.screenshot`; the built-in count grows
+  from 42 to 49.
+- **Native Windows backend**: Win32 enumerates/foregrounds windows and
+  captures screenshots; Microsoft UI Automation control patterns inspect,
+  click and set exact elements. Windows installs now also depend on
+  `comtypes>=1.4,<2`; that dependency is skipped on macOS/Linux.
+- **New default-off settings**: `PC_AGENT_ALLOW_DESKTOP_AUTOMATION` and
+  `PC_AGENT_DESKTOP_AUTOMATION_TIMEOUT_SECONDS`.
+- **Direct and task surfaces**: `pc-agent desktop
+  windows|inspect|focus|click|type|keys|screenshot`, deterministic task
+  options, doctor diagnostics, and GUI Desktop-tab windows/inspect/
+  screenshot controls.
+- **Safety**: focus/click/type/keys require a fresh approval bound to exact
+  arguments. Windows/elements must resolve exactly; password elements,
+  agent self-targeting, unreadable editors and dangerous key chords are
+  refused. Typing is read back. All desktop automation tools are excluded
+  from automatic recovery retries, and AI planning may propose only the two
+  read-only desktop tools.
+- **Verification**: automated suite 313 passed, 1 skipped; Ruff clean.
+  Desktop tests use a simulated UIA backend because the build sandbox is
+  Linux, so `pc-agent desktop windows` on the target Windows machine is the
+  first live native confirmation.
+
+## 0.15.1 - PHASE 13.1 Gemini Routing Fix
+
+- **Gemini could never be routed**: config parsing lowercases provider
+  names (`gemini`), but the router factory/status compared against
+  `"Gemini"`, so a configured Gemini key was silently skipped and
+  `providers list` showed it as an unknown, reserved slot. Names are
+  now canonical lowercase end-to-end (factory, model lookup, status,
+  adapter name), with a regression test that builds the route from
+  settings. Found on a real Windows install whose `.env` had a live
+  provider order.
+- Tests are hermetic again: three CLI tests that invoked `main()`
+  without `--root` now run against a temp root, so a developer's real
+  `.env` (provider keys, gates) cannot leak into offline tests.
+
+## 0.15.0 - PHASE 13 Browser Automation
+
+- The agent can now drive a **real browser session you start yourself**
+  (Edge/Chrome with `--remote-debugging-port` and a throwaway profile)
+  through a standard-library Chromium DevTools client — off until
+  `PC_AGENT_ALLOW_BROWSER=1`, localhost-only. Six tools (42 built-ins):
+  `browser.status`, `browser.snapshot` (read-only), `browser.open`,
+  `browser.click` (unique selector/exact text; refuses to guess),
+  `browser.type` (framework-safe fill with read-back; password/file
+  fields refused) and `browser.screenshot` (new verified workspace
+  PNGs). Actions need fresh per-argument approvals and are never
+  auto-retried; AI planning may propose only the two read-only tools.
+- New direct `pc-agent browser ...` commands (actions confirm unless
+  `--yes`; `--allow-private` for one exact local open), `run`
+  `--browser-open/--browser-click-*/--browser-type-*` options,
+  deterministic browser intents, GUI Web-tab status/page-read buttons,
+  and `doctor` reports the gate plus live connectivity.
+- Verified against a real Chromium 131 (local test pages + Wikipedia:
+  open/click/type/screenshot, password refusal, approval and
+  read-back verification) plus 14 deterministic fake-CDP/WebSocket
+  tests. No new dependency; schema stays v6.
+
+Still not included: launching/stopping the browser for you, downloads
+or uploads, tab management, login automation (password typing stays
+refused by design), Windows UI automation of other apps, image
+analysis, or secure OS credential storage.
+
+## 0.14.3 - PHASE 12.3 One-Key Confirmations
+
+- Interactive-terminal confirmations now read a **single keypress**
+  (`Y` approves, `N`/Ctrl+C cancels, no Enter). Line-based `input()`
+  proved unreliable under Windows Terminal (ConPTY could feed phantom
+  empty lines), so terminals use `msvcrt` (Windows) / cbreak reads
+  (POSIX), while piped stdin keeps the typed-word prompt from 12.2.
+- Paste bursts cannot approve: keys already queued before the prompt
+  are drained via `msvcrt` (replacing the ConPTY-unfriendly
+  console-buffer approach), and a `Y` with more text queued behind it
+  (e.g. a pasted `--yes`) is discarded with a note. A trailing Enter
+  after a lone `Y` is tolerated; stray Enter presses show a hint
+  instead of cancelling.
+- 6 additional prompt tests (19 in the prompt-fix file) plus live
+  terminal (PTY) verification of the paste, Enter-mashing and
+  pasted-`yes` scenarios. No dependency or schema change.
+
+## 0.14.2 - PHASE 12.2 Approval Prompt Robustness
+
+- Confirmation prompts no longer deny instantly on an empty or wrong
+  answer. An empty line (typically the leftover newline of a pasted
+  command) re-asks; a wrong non-empty answer is shown back and re-asked
+  up to 3 times; Ctrl+C cancels cleanly without a traceback. Only the
+  exact word (`APPROVE`, or case-sensitive `DEACTIVATE` for license
+  removal) ever confirms, so re-asking grants nothing.
+- The Windows console-input flush now uses fully declared ctypes
+  signatures (`HANDLE` return type, typed arguments) and validates the
+  console handle, so the 12.1 paste guard works reliably; the re-ask
+  loop above protects every platform even if flushing is unavailable.
+- 5 additional prompt tests (13 in the prompt-fix file); no dependency
+  or schema change.
+
+## 0.14.1 - PHASE 12.1 Approval Prompt Fix
+
+- CLI confirmation prompts (Git writes, task approvals, license
+  deactivation) now discard console input that was typed or pasted
+  *before* the prompt appeared, so pasting several commands at once can
+  no longer feed the next command into an approval prompt (and a
+  pre-pasted `APPROVE` cannot approve anything either). When pending
+  text is discarded, the prompt says so. Piped stdin is untouched;
+  `--yes` remains the non-interactive path.
+- A denied direct Git write now prints the exact command to re-run with
+  `--yes`, and a denied task approval explains that only the word
+  `APPROVE` typed after the prompt counts. Matching stays
+  case-insensitive for `APPROVE`. 8 new tests; no dependency or schema
+  change.
+
+## 0.14.0 - PHASE 12 Approved Subprocess & Git
+
+- Command execution is now possible behind a **default-off** policy gate
+  (`PC_AGENT_ALLOW_SUBPROCESS=1`). Only bare program names on the
+  allow-list (`PC_AGENT_COMMAND_ALLOWLIST`, default
+  `git,python,python3,py,node,npm`) can run, always as an argv array with
+  `shell=False`; Windows `.cmd`/`.bat` shims (e.g. npm) run through
+  `cmd.exe /d /s /c` only after rejecting cmd-special characters. The
+  engine scrubs the child environment (no API keys/secrets), silences
+  stdin, enforces a hard timeout with process kill (1-300s,
+  `PC_AGENT_COMMAND_TIMEOUT_SECONDS`) and caps captured output at 64 KiB
+  per stream.
+- Six local Git tools (`git.status/log/diff_summary` read-only,
+  `git.init/add/commit` writes) plus `commands.run` — 36 built-ins in
+  total. Commands and Git writes always need a **fresh approval bound to
+  the exact arguments** (never inherited, never from workflow memory) and
+  are **never auto-retried** by recovery; verification re-reads Git state
+  (e.g. HEAD must match the new commit) or the exit code independently.
+- Deterministic planner understands Git requests (`Show git status`,
+  `Git add the file`, `Git commit "message"`); `commands.run` is only
+  reachable via `run --command "..."`. AI planning may propose read-only
+  Git queries only. New direct `pc-agent git ...` commands prompt before
+  writes (`--yes` pre-approves), and the GUI gains a Git Status button;
+  `doctor` reports the subprocess gate and git availability.
+- No new dependency or database migration (schema stays v6); 16 new
+  tests covering the engine, policy gate, approvals, timeouts, Git
+  end-to-end workflow, CLI and GUI paths.
+
+Still not included: remote Git operations (clone/fetch/pull/push),
+branch/checkout/merge/reset, arbitrary shells or pipes, browser or
+Windows UI automation, image tools, or secure OS credential storage.
+
+## 0.13.0 - PHASE 11 Multi-Step Planner
+
+- Tasks can now chain 2-5 tools in one instruction with **then**. Each
+  clause is planned by the existing single-step deterministic planner;
+  later clauses may reference earlier steps' promised outputs, inherit the
+  previous output implicitly ("then extract pages 1-2"), and are bound at
+  run time to the previous step's actual output (recovery renames are
+  followed). AI planning accepts a strictly-validated `steps` array with
+  `$step<N>.output_path` references as the only allowed binding syntax.
+- Every step runs the unchanged pipeline: fresh per-step approvals for
+  external roots (never inherited), acceptance criteria, deterministic
+  verification, per-step checkpoints and the bounded recovery budget
+  (applied per step, attempt numbers unique across the pipeline). Reports
+  (CLI text/JSON, GUI) list each step's status; resume continues at the
+  first unfinished step without re-running checkpointed tools.
+- Verified chains are recorded as multi-step workflows and replayed by
+  `workflow run` / the planner fallback after live revalidation of every
+  step. Manual `task recover` clones re-run the stored chain.
+- No new dependency or database migration (schema stays v6); 16 new tests
+  including crash-resume, approval denial mid-chain, AI forward-reference
+  rejection and a forged multi-step workflow.
+
+Still not included: list/folder output bindings, branching or parallel
+steps, mid-flight re-planning, subprocess/Git adapters, browser or Windows
+UI automation, image tools, or secure OS credential storage.
+
 ## 0.12.0 - PHASE 10 Verified Workflow Reuse
 
 - Workflow memory now stores the exact reusable plan material (normalized

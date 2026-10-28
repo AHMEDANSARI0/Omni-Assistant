@@ -237,6 +237,7 @@ class PcAgentGuiApp:
         self.dashboard_tab = ttk.Frame(self.notebook, padding=10)
         self.tasks_tab = ttk.Frame(self.notebook, padding=10)
         self.documents_tab = ttk.Frame(self.notebook, padding=10)
+        self.images_tab = ttk.Frame(self.notebook, padding=10)
         self.web_tab = ttk.Frame(self.notebook, padding=10)
         self.desktop_tab = ttk.Frame(self.notebook, padding=10)
         self.tools_tab = ttk.Frame(self.notebook, padding=10)
@@ -245,6 +246,7 @@ class PcAgentGuiApp:
         self.notebook.add(self.dashboard_tab, text="Dashboard")
         self.notebook.add(self.tasks_tab, text="Tasks")
         self.notebook.add(self.documents_tab, text="Documents")
+        self.notebook.add(self.images_tab, text="Images")
         self.notebook.add(self.web_tab, text="Web")
         self.notebook.add(self.desktop_tab, text="Desktop")
         self.notebook.add(self.tools_tab, text="Tools")
@@ -264,6 +266,7 @@ class PcAgentGuiApp:
         self._build_dashboard_tab()
         self._build_tasks_tab()
         self._build_documents_tab()
+        self._build_images_tab()
         self._build_web_tab()
         self._build_desktop_tab()
         self._build_tools_tab()
@@ -423,6 +426,9 @@ class PcAgentGuiApp:
         ttk.Button(
             buttons, text="Run Verified Workflow...", command=self._run_workflow
         ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            buttons, text="Git Status...", command=self._git_status
+        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=2)
         buttons.columnconfigure(0, weight=1)
         buttons.columnconfigure(1, weight=1)
 
@@ -749,6 +755,15 @@ class PcAgentGuiApp:
             style="Accent.TButton",
             command=self._fetch_web,
         ).grid(row=2, column=3, sticky="e", pady=(4, 2))
+        ttk.Label(form, text="Debug browser").grid(
+            row=3, column=0, sticky="w", pady=(6, 2)
+        )
+        ttk.Button(
+            form, text="Browser Status", command=self._browser_status
+        ).grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(6, 2))
+        ttk.Button(
+            form, text="Read Current Page", command=self._browser_snapshot
+        ).grid(row=3, column=3, sticky="e", pady=(6, 2))
 
         ttk.Label(
             tab,
@@ -759,6 +774,96 @@ class PcAgentGuiApp:
         ).grid(row=1, column=0, sticky="w", pady=(0, 6))
         self.web_output_text = self._make_text(tab, height=24, width=96)
         self.web_output_text.grid(row=2, column=0, sticky="nsew")
+
+    def _build_images_tab(self) -> None:
+        tab = self.images_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        form = ttk.LabelFrame(
+            tab,
+            text="Workspace image tools and approved provider vision",
+            style="Section.TLabelframe",
+            padding=8,
+        )
+        form.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        form.columnconfigure(1, weight=1)
+
+        self.image_input_var = tk.StringVar(value="desktop-screenshot.png")
+        self.image_second_var = tk.StringVar(value="")
+        self.image_output_var = tk.StringVar(value="image-output.jpg")
+        self.image_max_dimension_var = tk.StringVar(value="1024")
+        self.image_question_var = tk.StringVar(value="Describe this image in detail.")
+        self.image_grayscale_var = tk.BooleanVar(value=False)
+
+        ttk.Label(form, text="Input image").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(form, textvariable=self.image_input_var).grid(
+            row=0, column=1, sticky="ew", padx=(8, 8), pady=2
+        )
+        ttk.Button(
+            form,
+            text="Browse...",
+            command=lambda: self._browse_workspace_file(self.image_input_var),
+        ).grid(row=0, column=2, sticky="e", pady=2)
+        ttk.Button(form, text="Inspect", command=self._image_inspect).grid(
+            row=0, column=3, sticky="e", padx=(6, 0), pady=2
+        )
+
+        ttk.Label(form, text="Second image").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Entry(form, textvariable=self.image_second_var).grid(
+            row=1, column=1, sticky="ew", padx=(8, 8), pady=2
+        )
+        ttk.Button(
+            form,
+            text="Browse...",
+            command=lambda: self._browse_workspace_file(self.image_second_var),
+        ).grid(row=1, column=2, sticky="e", pady=2)
+        ttk.Button(form, text="Compare", command=self._image_compare).grid(
+            row=1, column=3, sticky="e", padx=(6, 0), pady=2
+        )
+
+        ttk.Label(form, text="New output image").grid(
+            row=2, column=0, sticky="w", pady=2
+        )
+        ttk.Entry(form, textvariable=self.image_output_var).grid(
+            row=2, column=1, sticky="ew", padx=(8, 8), pady=2
+        )
+        ttk.Button(form, text="Convert", command=self._image_convert).grid(
+            row=2, column=3, sticky="e", pady=2
+        )
+
+        ttk.Label(form, text="Thumbnail max side").grid(
+            row=3, column=0, sticky="w", pady=2
+        )
+        ttk.Entry(form, textvariable=self.image_max_dimension_var).grid(
+            row=3, column=1, sticky="ew", padx=(8, 8), pady=2
+        )
+        ttk.Checkbutton(
+            form, text="Grayscale", variable=self.image_grayscale_var
+        ).grid(row=3, column=2, sticky="e", pady=2)
+        ttk.Button(
+            form, text="Make Thumbnail", command=self._image_thumbnail
+        ).grid(row=3, column=3, sticky="e", padx=(6, 0), pady=2)
+
+        ttk.Label(form, text="Vision question").grid(
+            row=4, column=0, sticky="w", pady=2
+        )
+        ttk.Entry(form, textvariable=self.image_question_var).grid(
+            row=4, column=1, sticky="ew", padx=(8, 8), pady=2, columnspan=2
+        )
+        ttk.Button(form, text="Analyze", command=self._image_analyze).grid(
+            row=4, column=3, sticky="e", pady=2
+        )
+        ttk.Label(
+            form,
+            text=(
+                "Local image tools never overwrite. Analyze is gated by "
+                "PC_AGENT_ALLOW_VISION and asks before sending the exact image."
+            ),
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        self.images_output_text = self._make_text(tab, height=22, width=96)
+        self.images_output_text.grid(row=1, column=0, sticky="nsew")
 
     def _build_desktop_tab(self) -> None:
         tab = self.desktop_tab
@@ -776,6 +881,8 @@ class PcAgentGuiApp:
 
         self.desktop_path_var = tk.StringVar(value=".")
         self.desktop_url_var = tk.StringVar(value="https://example.com/")
+        self.desktop_window_query_var = tk.StringVar(value="")
+        self.desktop_screenshot_var = tk.StringVar(value="desktop-screenshot.png")
 
         ttk.Button(form, text="System Info", command=self._desktop_info).grid(
             row=0, column=0, sticky="w", pady=2
@@ -803,13 +910,34 @@ class PcAgentGuiApp:
         ttk.Button(form, text="Open URL", command=self._open_desktop_url).grid(
             row=2, column=3, sticky="e", pady=2
         )
+        ttk.Label(form, text="Window title contains").grid(
+            row=3, column=0, sticky="w", pady=2
+        )
+        ttk.Entry(form, textvariable=self.desktop_window_query_var).grid(
+            row=3, column=1, sticky="ew", padx=(8, 8), pady=2
+        )
+        ttk.Button(form, text="List Windows", command=self._desktop_windows).grid(
+            row=3, column=2, sticky="e", pady=2
+        )
+        ttk.Button(
+            form, text="Inspect Window", command=self._inspect_desktop_window
+        ).grid(row=3, column=3, sticky="e", padx=(6, 0), pady=2)
+        ttk.Label(form, text="Screenshot output").grid(
+            row=4, column=0, sticky="w", pady=2
+        )
+        ttk.Entry(form, textvariable=self.desktop_screenshot_var).grid(
+            row=4, column=1, sticky="ew", padx=(8, 8), pady=2
+        )
+        ttk.Button(
+            form, text="Desktop Screenshot", command=self._desktop_screenshot
+        ).grid(row=4, column=3, sticky="e", pady=2)
         ttk.Label(
             form,
             text=(
-                "Open actions use the default app/browser only. There is no "
-                "shell, screenshot, clicking or typing automation."
+                "UI Automation is gated by PC_AGENT_ALLOW_DESKTOP_AUTOMATION. "
+                "Window actions from tasks still require the approval dialog."
             ),
-        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         self.desktop_output_text = self._make_text(tab, height=22, width=96)
         self.desktop_output_text.grid(row=1, column=0, sticky="nsew")
@@ -1497,6 +1625,27 @@ class PcAgentGuiApp:
             done,
         )
 
+    def _git_status(self) -> None:
+        if self._busy:
+            return
+        repository = simpledialog.askstring(
+            "Git status",
+            "Workspace repository folder ('.' for the workspace root):",
+            initialvalue=".",
+            parent=self.root,
+        )
+        if repository is None:
+            return
+
+        def done(result: Any) -> None:
+            self._set_text(self.task_details_text, format_tool_result(result))
+
+        self._run_async(
+            "Git status",
+            lambda: self.controller.git_status(repository.strip() or "."),
+            done,
+        )
+
     def _recover_selected_task(self) -> None:
         task_id = self._require_selected_task()
         if task_id is None:
@@ -1810,6 +1959,98 @@ class PcAgentGuiApp:
             done,
         )
 
+    def _browser_status(self) -> None:
+        self._run_async(
+            "Browser status",
+            self.controller.browser_status,
+            lambda result: self._set_text(
+                self.web_output_text, format_tool_result(result)
+            ),
+        )
+
+    def _browser_snapshot(self) -> None:
+        self._run_async(
+            "Read browser page",
+            self.controller.browser_snapshot,
+            lambda result: self._set_text(
+                self.web_output_text, format_tool_result(result)
+            ),
+        )
+
+    def _image_inspect(self) -> None:
+        path = self.image_input_var.get()
+        self._run_async(
+            "Inspect image",
+            lambda: self.controller.image_inspect(path),
+            lambda result: self._show_tool_result(self.images_output_text, result),
+        )
+
+    def _image_compare(self) -> None:
+        first = self.image_input_var.get()
+        second = self.image_second_var.get()
+        self._run_async(
+            "Compare images",
+            lambda: self.controller.image_compare(first, second),
+            lambda result: self._show_tool_result(self.images_output_text, result),
+        )
+
+    def _image_convert(self) -> None:
+        source = self.image_input_var.get()
+        output = self.image_output_var.get()
+        self._run_async(
+            "Convert image",
+            lambda: self.controller.image_convert(source, output),
+            lambda result: self._show_tool_result(self.images_output_text, result),
+        )
+
+    def _image_thumbnail(self) -> None:
+        source = self.image_input_var.get()
+        output = self.image_output_var.get()
+        grayscale = bool(self.image_grayscale_var.get())
+        try:
+            max_dimension = parse_optional_int(
+                self.image_max_dimension_var.get(), label="Thumbnail max side"
+            )
+        except PcAgentError as exc:
+            messagebox.showerror("Invalid number", str(exc), parent=self.root)
+            return
+        if max_dimension is None or not 1 <= max_dimension <= 10000:
+            messagebox.showerror(
+                "Invalid number",
+                "Thumbnail max side must be between 1 and 10000.",
+                parent=self.root,
+            )
+            return
+        self._run_async(
+            "Transform image",
+            lambda: self.controller.image_transform(
+                source,
+                output,
+                max_dimension=max_dimension,
+                grayscale=grayscale,
+            ),
+            lambda result: self._show_tool_result(self.images_output_text, result),
+        )
+
+    def _image_analyze(self) -> None:
+        path = self.image_input_var.get()
+        question = self.image_question_var.get()
+        if not messagebox.askokcancel(
+            "Send image to vision provider",
+            (
+                "Send this exact workspace image and question to the configured "
+                "provider route? External providers will receive the image bytes.\n\n"
+                f"Image: {path}\nQuestion: {question}"
+            ),
+            parent=self.root,
+        ):
+            return
+        self._run_async(
+            "Analyze image",
+            lambda: self.controller.image_analyze(path, question),
+            lambda result: self._show_tool_result(self.images_output_text, result),
+        )
+
     def _desktop_info(self) -> None:
         self._run_async(
             "Desktop info",
@@ -1828,6 +2069,41 @@ class PcAgentGuiApp:
         self._run_async(
             "Open workspace path",
             lambda: self.controller.open_workspace_path(path),
+            lambda result: self._show_tool_result(self.desktop_output_text, result),
+        )
+
+    def _desktop_windows(self) -> None:
+        self._run_async(
+            "List desktop windows",
+            self.controller.desktop_windows,
+            lambda result: self._show_tool_result(self.desktop_output_text, result),
+        )
+
+    def _inspect_desktop_window(self) -> None:
+        query = self.desktop_window_query_var.get()
+        self._run_async(
+            "Inspect desktop window",
+            lambda: self.controller.desktop_window_inspect(query),
+            lambda result: self._show_tool_result(self.desktop_output_text, result),
+        )
+
+    def _desktop_screenshot(self) -> None:
+        output = self.desktop_screenshot_var.get()
+        query = self.desktop_window_query_var.get()
+        target = (
+            f"the window whose title contains {query!r}"
+            if query.strip()
+            else "the full desktop"
+        )
+        if not messagebox.askokcancel(
+            "Capture desktop screenshot",
+            f"Capture {target} to this new workspace PNG?\n\n{output}",
+            parent=self.root,
+        ):
+            return
+        self._run_async(
+            "Desktop screenshot",
+            lambda: self.controller.desktop_screenshot(output, title_contains=query),
             lambda result: self._show_tool_result(self.desktop_output_text, result),
         )
 

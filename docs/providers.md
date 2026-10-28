@@ -1,4 +1,4 @@
-# AI providers - through Phase 5
+# AI providers - through Phase 16.1
 
 ## Implemented adapters
 
@@ -13,9 +13,27 @@
 | `anthropic` | **Reserved direct slot, not implemented yet** | not used directly |
 
 Run `pc-agent providers list` to see the exact route on a machine. It never
-prints keys and makes no network call. Anthropic models can be reached
+prints keys and makes no network call. Phase 16 also shows each key's
+non-secret source: `environment`, `windows-credential-manager` or
+`missing`. Anthropic models can be reached
 through an OpenRouter model choice; a direct Anthropic adapter is a future
 addition behind the same provider interface.
+
+## Credential storage (Phase 16)
+
+Provider keys resolve in this order:
+
+1. environment variable or local `.env`;
+2. Windows Credential Manager when no environment value exists;
+3. missing.
+
+Use `pc-agent credentials status|list|set|delete|migrate` to manage the
+Windows generic credentials. `credentials set` reads the key twice through
+a hidden prompt and deliberately has no command-line key argument. Set
+`PC_AGENT_CREDENTIAL_STORE=env` to disable OS lookup, `windows` to select
+the Windows backend explicitly, or leave the default `auto`. See
+`docs/phase16.md` for the migration sequence and the same-Windows-user
+security boundary.
 
 ## Routing and retries
 
@@ -35,7 +53,7 @@ addition behind the same provider interface.
 
 | Command | External provider call? |
 |---|---|
-| `providers list`, `doctor`, GUI Dashboard/Providers refresh | No |
+| `providers list`, `credentials status/list`, `doctor`, GUI Dashboard/Providers refresh | No |
 | Supported deterministic `run` task (CLI or GUI Tasks tab) | No |
 | Direct `office`, `web fetch` or `desktop` command, or the matching GUI tab | No provider call; web fetch contacts only the exact requested site |
 | Automatic recovery retry | No; local deterministic rules only |
@@ -81,8 +99,9 @@ private file contents in that requirement.
 
 ## Privacy and HTTP safety
 
-- Keys are read only from environment/local `.env` and excluded from
-  summaries and normal CLI output.
+- Keys are read only from environment/local `.env` or the Phase 16
+  Windows Credential Manager fallback, and are excluded from summaries and
+  normal CLI/GUI output.
 - A provider receives the prompt/instruction needed for `ask` or optional AI
   planning. It does not receive file contents or your API keys for other
   providers.

@@ -46,6 +46,10 @@ _WRITER_TOOLS = frozenset(
         "office.docx_replace_text",
         "office.docx_append_paragraphs",
         "office.xlsx_set_cells",
+        "browser.screenshot",
+        "desktop.screenshot",
+        "image.convert",
+        "image.transform",
     }
 )
 _PDF_PAGE_TOOLS = frozenset(

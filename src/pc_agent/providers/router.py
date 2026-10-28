@@ -46,6 +46,7 @@ class UnsupportedProvider:
     """A reserved provider slot with no direct adapter in this build."""
 
     implemented = False
+    supports_vision = False
 
     def __init__(self, name: str, model: str = "") -> None:
         self.name = name
@@ -95,6 +96,23 @@ class ModelRouter:
         attempts: list[ProviderAttempt] = []
         failures: list[str] = []
         providers = self._providers if allow_fallback else self._providers[:1]
+        if request.has_images:
+            if allow_fallback:
+                providers = tuple(
+                    provider
+                    for provider in providers
+                    if getattr(provider, "supports_vision", False)
+                )
+                if not providers:
+                    raise ProviderError(
+                        "No vision-capable provider is available in the configured route. "
+                        "Configure Gemini, OpenRouter/OpenAI with a vision model, or a "
+                        "vision-capable Ollama model."
+                    )
+            elif not getattr(providers[0], "supports_vision", False):
+                raise ProviderError(
+                    f"Provider {providers[0].name} does not accept image inputs in this build."
+                )
 
         for provider in providers:
             for attempt_number in range(1, self._max_retries + 2):
@@ -204,7 +222,7 @@ def _build_provider(
     timeout = settings.provider_timeout_seconds
     if name == "mock":
         return MockProvider()
-    if name == "Gemini" and settings.gemini_api_key:
+    if name == "gemini" and settings.gemini_api_key:
         return GeminiProvider(
             api_key=settings.gemini_api_key,
             model=settings.gemini_model,
@@ -258,7 +276,7 @@ def _build_provider(
 def _model_for(name: str, settings: Settings) -> str:
     return {
         "mock": "offline-mock",
-        "Gemini": settings.gemini_model,
+        "gemini": settings.gemini_model,
         "openrouter": settings.openrouter_model,
         "openai": settings.openai_model,
         "openai-compatible": settings.openai_compatible_model,
@@ -270,7 +288,7 @@ def _model_for(name: str, settings: Settings) -> str:
 def _status_detail(name: str, settings: Settings) -> tuple[bool, bool, str]:
     if name == "mock":
         return True, True, "Offline deterministic mock; no network or key."
-    if name == "Gemini":
+    if name == "gemini":
         return bool(settings.gemini_api_key), True, "Gemini Interactions REST adapter."
     if name == "openrouter":
         return bool(settings.openrouter_api_key), True, "OpenAI-compatible Chat Completions adapter."

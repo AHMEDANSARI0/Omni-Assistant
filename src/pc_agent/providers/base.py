@@ -8,6 +8,7 @@ run.
 
 from __future__ import annotations
 
+import base64
 import enum
 import json
 import ssl
@@ -23,6 +24,10 @@ from ..http_tls import create_tls_context
 from ..logging_config import redact_text
 
 _MAX_RESPONSE_BYTES = 2_000_000
+_MAX_IMAGE_INPUT_BYTES = 20_000_000
+_ALLOWED_IMAGE_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/webp", "image/gif"}
+)
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 409, 425, 429})
 
 
@@ -33,21 +38,54 @@ class MessageRole(str, enum.Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ImageInput:
+    """One bounded inline image supplied with a user message."""
+
+    data: bytes = field(repr=False)
+    mime_type: str = "image/png"
+
+    def __post_init__(self) -> None:
+        normalized = self.mime_type.strip().lower()
+        object.__setattr__(self, "mime_type", normalized)
+        if normalized not in _ALLOWED_IMAGE_MIME_TYPES:
+            raise ValueError("Image input MIME type must be PNG, JPEG, WebP or GIF.")
+        if not isinstance(self.data, bytes) or not self.data:
+            raise ValueError("Image input data must be non-empty bytes.")
+        if len(self.data) > _MAX_IMAGE_INPUT_BYTES:
+            raise ValueError("Image input exceeds the 20000000-byte provider limit.")
+
+    @property
+    def base64_data(self) -> str:
+        return base64.b64encode(self.data).decode("ascii")
+
+    @property
+    def data_url(self) -> str:
+        return f"data:{self.mime_type};base64,{self.base64_data}"
+
+
+@dataclass(frozen=True, slots=True)
 class ChatMessage:
     role: MessageRole
     content: str
+    images: tuple[ImageInput, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.content.strip():
             raise ValueError("Chat message content must not be empty.")
+        if self.images and self.role is not MessageRole.USER:
+            raise ValueError("Only user messages may carry image inputs.")
+        if len(self.images) > 4:
+            raise ValueError("A chat message may carry at most four image inputs.")
 
     @classmethod
     def system(cls, content: str) -> ChatMessage:
         return cls(MessageRole.SYSTEM, content)
 
     @classmethod
-    def user(cls, content: str) -> ChatMessage:
-        return cls(MessageRole.USER, content)
+    def user(
+        cls, content: str, *, images: tuple[ImageInput, ...] = ()
+    ) -> ChatMessage:
+        return cls(MessageRole.USER, content, images)
 
     @classmethod
     def assistant(cls, content: str) -> ChatMessage:
@@ -80,11 +118,12 @@ class CompletionRequest:
         temperature: float = 0.0,
         max_output_tokens: int = 1024,
         json_mode: bool = False,
+        images: tuple[ImageInput, ...] = (),
     ) -> CompletionRequest:
         messages: list[ChatMessage] = []
         if system_instruction:
             messages.append(ChatMessage.system(system_instruction))
-        messages.append(ChatMessage.user(prompt))
+        messages.append(ChatMessage.user(prompt, images=images))
         return cls(
             messages=tuple(messages),
             temperature=temperature,
@@ -97,6 +136,14 @@ class CompletionRequest:
         return "\n\n".join(
             message.content for message in self.messages if message.role is MessageRole.SYSTEM
         )
+
+    @property
+    def images(self) -> tuple[ImageInput, ...]:
+        return tuple(image for message in self.messages for image in message.images)
+
+    @property
+    def has_images(self) -> bool:
+        return bool(self.images)
 
     @property
     def last_user_message(self) -> str:
@@ -118,6 +165,7 @@ class AIProvider(Protocol):
     name: str
     model: str
     implemented: bool
+    supports_vision: bool
 
     @property
     def configured(self) -> bool: ...

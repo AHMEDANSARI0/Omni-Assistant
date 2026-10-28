@@ -12,15 +12,19 @@ from __future__ import annotations
 import json
 import platform
 import queue
+import shutil
 import ssl
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from .. import __version__
+from ..browser_cdp import probe_browser
 from ..config import Settings
+from ..credentials import CredentialStore, build_credential_store
+from ..desktop_automation import probe_desktop_automation
 from ..documents.office import DemoOfficeData, create_demo_office_files
 from ..documents.pdf import DemoPdfData, create_demo_pdfs
 from ..domain.task import Task, TaskStatus
@@ -107,6 +111,18 @@ class DoctorSummary:
     task_checkpoints: int = 0
     verification_reports: int = 0
     file_tools: int = 0
+    subprocess_enabled: bool = False
+    command_allowlist: str = ""
+    git_available: bool = False
+    browser_enabled: bool = False
+    browser_port: int = 9222
+    browser_connected: str = ""
+    desktop_automation_enabled: bool = False
+    desktop_automation_runtime: str = ""
+    vision_enabled: bool = False
+    vision_providers: str = ""
+    credential_store_summary: str = ""
+    provider_credential_sources: str = "none"
 
     def to_text(self) -> str:
         if self.tls_verified:
@@ -128,7 +144,7 @@ class DoctorSummary:
         )
         return "\n".join(
             [
-                f"Self-Healing PC Agent {self.version} (PHASE 10 Workflow Reuse)",
+                f"Self-Healing PC Agent {self.version} (PHASE 16.1 Credential Manager Hotfix)",
                 f"Python: {self.python_version}",
                 f"Environment: {self.environment}",
                 f"Root: {self.root}",
@@ -138,11 +154,54 @@ class DoctorSummary:
                 f"Providers with credentials: {self.providers_with_credentials}",
                 f"Usable provider route: {' -> '.join(self.provider_route)}",
                 (
+                    "Credential store: "
+                    f"{self.credential_store_summary}; "
+                    f"sources={self.provider_credential_sources}"
+                ),
+                (
                     "Approved dynamic tools: "
                     f"{self.approved_dynamic_tools} "
                     f"({self.enabled_dynamic_tools} enabled)"
                 ),
                 f"Bundled dynamic-tool example arguments: {example}",
+                (
+                    "Subprocess: "
+                    + (
+                        f"enabled; allowlist={self.command_allowlist or 'none'}; "
+                        f"git={'found' if self.git_available else 'not found on PATH'}"
+                        if self.subprocess_enabled
+                        else "disabled (set PC_AGENT_ALLOW_SUBPROCESS=1 in .env)"
+                    )
+                ),
+                (
+                    "Browser: "
+                    + (
+                        f"enabled; debug port={self.browser_port}; "
+                        f"{self.browser_connected or 'not reachable (start Edge/Chrome with --remote-debugging-port)'}"
+                        if self.browser_enabled
+                        else "disabled (set PC_AGENT_ALLOW_BROWSER=1 in .env)"
+                    )
+                ),
+                (
+                    "Desktop automation: "
+                    + (
+                        "enabled; runtime="
+                        f"{self.desktop_automation_runtime or 'unavailable'}; "
+                        "focus/click/type/keys require approval"
+                        if self.desktop_automation_enabled
+                        else "disabled (set PC_AGENT_ALLOW_DESKTOP_AUTOMATION=1 in .env)"
+                    )
+                ),
+                (
+                    "Vision: "
+                    + (
+                        "enabled; providers="
+                        f"{self.vision_providers or 'none configured'}; "
+                        "each exact image send requires approval"
+                        if self.vision_enabled
+                        else "disabled (set PC_AGENT_ALLOW_VISION=1 in .env; local image tools remain available)"
+                    )
+                ),
                 (
                     "Recovery: "
                     f"recorded attempts={self.recorded_recovery_attempts}, "
@@ -153,7 +212,7 @@ class DoctorSummary:
                     "Built-in tools: "
                     f"built-ins={self.builtin_tools}, office={self.office_tools}, "
                     f"files={self.file_tools}, "
-                    "web.fetch=public-only by default, desktop=open/info only"
+                    "web.fetch=public-only by default, desktop=open/info plus gated Windows UIA, images=local Pillow tools plus gated provider vision, provider keys=environment first, then Windows Credential Manager"
                 ),
                 (
                     "Web limits: "
@@ -313,6 +372,7 @@ class GuiController:
         database: Database | None = None,
         approval_callback: ApprovalCallback | None = None,
         desktop_opener: Callable[[str], None] | None = None,
+        credential_store: CredentialStore | None = None,
     ) -> None:
         self.settings = settings
         settings.ensure_directories()
@@ -331,6 +391,7 @@ class GuiController:
         self._licenses = LicenseService(settings, self.database)
         self._approval_callback = approval_callback or _approval_unavailable
         self._desktop_opener = desktop_opener
+        self._credential_store = credential_store
 
         self._builtin_registry = build_default_registry()
         self._orchestrator = TaskOrchestrator(
@@ -438,6 +499,22 @@ class GuiController:
             memory_workflows=memory_counts["workflow"],
             task_checkpoints=self._execution.count_checkpoints(),
             verification_reports=self._execution.count_verifications(),
+            subprocess_enabled=self.settings.allow_subprocess,
+            command_allowlist=", ".join(self.settings.command_allowlist),
+            git_available=shutil.which("git") is not None,
+            browser_enabled=self.settings.allow_browser,
+            browser_port=self.settings.browser_port,
+            browser_connected=self._browser_connected_text(),
+            desktop_automation_enabled=self.settings.allow_desktop_automation,
+            desktop_automation_runtime=self._desktop_automation_runtime_text(),
+            vision_enabled=self.settings.allow_vision,
+            vision_providers=", ".join(
+                provider.name
+                for provider in self._router.providers
+                if getattr(provider, "supports_vision", False) and provider.configured
+            ),
+            credential_store_summary=self.credential_store_summary(),
+            provider_credential_sources=public["provider_credential_sources"],
         )
 
     def recovery_scan(self) -> RecoveryScan:
@@ -469,8 +546,36 @@ class GuiController:
     def create_office_demo(self) -> DemoOfficeData:
         return create_demo_office_files(self.settings.workspace_dir)
 
+    def credential_store_summary(self) -> str:
+        store = self._credential_store or build_credential_store(
+            self.settings.credential_store
+        )
+        try:
+            return store.status().summary()
+        except PcAgentError as exc:
+            return (
+                f"mode={self.settings.credential_store}; "
+                f"backend={self.settings.credential_store_backend}; "
+                f"available=no; stored=unknown; {exc}"
+            )
+
     def provider_statuses(self) -> list[ProviderStatus]:
-        return provider_statuses(self.settings)
+        sources = dict(self.settings.credential_sources)
+        return [
+            replace(
+                status,
+                detail=(
+                    f"{status.detail} Credential source: "
+                    + (
+                        "not-applicable"
+                        if status.name == "mock"
+                        else sources.get(status.name, "missing")
+                    )
+                    + "."
+                ),
+            )
+            for status in provider_statuses(self.settings)
+        ]
 
     def ask_provider(
         self,
@@ -575,6 +680,127 @@ class GuiController:
             )
         finally:
             self._active_task_id = None
+
+    def git_status(self, repository: str = ".") -> ToolResult:
+        return self._invoke_builtin("git.status", {"repository": repository})
+
+    def git_log(self, repository: str = ".", max_count: int = 10) -> ToolResult:
+        return self._invoke_builtin(
+            "git.log", {"repository": repository, "max_count": max_count}
+        )
+
+    def _browser_connected_text(self) -> str:
+        if not self.settings.allow_browser:
+            return ""
+        info = probe_browser(port=self.settings.browser_port)
+        if not info:
+            return ""
+        return f"connected ({info.get('Browser') or 'Chromium'})"
+
+    def _desktop_automation_runtime_text(self) -> str:
+        if not self.settings.allow_desktop_automation:
+            return ""
+        probe = probe_desktop_automation()
+        detail = str(probe.get("detail") or "")
+        return detail if probe.get("available") else f"unavailable ({detail})"
+
+    def browser_status(self) -> ToolResult:
+        return self._invoke_builtin("browser.status", {})
+
+    def browser_snapshot(self) -> ToolResult:
+        return self._invoke_builtin("browser.snapshot", {})
+
+    def desktop_windows(self, *, include_untitled: bool = False) -> ToolResult:
+        return self._invoke_builtin(
+            "desktop.windows",
+            {"max_windows": 100, "include_untitled": include_untitled},
+        )
+
+    def desktop_window_inspect(
+        self, title_contains: str, *, max_elements: int = 200
+    ) -> ToolResult:
+        return self._invoke_builtin(
+            "desktop.window_inspect",
+            {
+                "window_title_contains": _require(title_contains, "window title"),
+                "max_elements": max_elements,
+            },
+        )
+
+    def desktop_screenshot(
+        self, output_path: str, *, title_contains: str = ""
+    ) -> ToolResult:
+        arguments: dict[str, Any] = {
+            "output_path": _require(output_path, "screenshot output path")
+        }
+        if title_contains.strip():
+            arguments["window_title_contains"] = title_contains.strip()
+        return self._invoke_builtin("desktop.screenshot", arguments)
+
+    def image_inspect(self, path: str) -> ToolResult:
+        return self._invoke_builtin(
+            "image.inspect",
+            {"path": _require(path, "image file"), "include_color_stats": True},
+        )
+
+    def image_convert(
+        self, source: str, output: str, *, quality: int = 90
+    ) -> ToolResult:
+        return self._invoke_builtin(
+            "image.convert",
+            {
+                "source": _require(source, "source image"),
+                "output": _require(output, "image output"),
+                "quality": quality,
+            },
+        )
+
+    def image_transform(
+        self,
+        source: str,
+        output: str,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        max_dimension: int | None = None,
+        grayscale: bool = False,
+        quality: int = 90,
+    ) -> ToolResult:
+        arguments: dict[str, Any] = {
+            "source": _require(source, "source image"),
+            "output": _require(output, "image output"),
+            "quality": quality,
+        }
+        if width is not None:
+            arguments["width"] = width
+        if height is not None:
+            arguments["height"] = height
+        if max_dimension is not None:
+            arguments["max_dimension"] = max_dimension
+        if grayscale:
+            arguments["grayscale"] = True
+        return self._invoke_builtin("image.transform", arguments)
+
+    def image_compare(self, first: str, second: str) -> ToolResult:
+        return self._invoke_builtin(
+            "image.compare",
+            {
+                "first": _require(first, "first image"),
+                "second": _require(second, "second image"),
+            },
+        )
+
+    def image_analyze(
+        self, path: str, question: str, *, max_output_tokens: int = 1024
+    ) -> ToolResult:
+        return self._invoke_builtin(
+            "image.analyze",
+            {
+                "path": _require(path, "image file"),
+                "question": _require(question, "vision question"),
+                "max_output_tokens": max_output_tokens,
+            },
+        )
 
     def list_workflows(self) -> tuple[Any, ...]:
         return self._orchestrator.workflow_records()
@@ -987,13 +1213,28 @@ class GuiController:
             web_timeout_seconds=self.settings.web_timeout_seconds,
             web_max_bytes=self.settings.web_max_bytes,
             desktop_opener=self._desktop_opener,
+            subprocess_allowed=self.settings.allow_subprocess,
+            browser_allowed=self.settings.allow_browser,
+            browser_port=self.settings.browser_port,
+            browser_timeout_seconds=self.settings.browser_timeout_seconds,
+            desktop_automation_allowed=self.settings.allow_desktop_automation,
+            desktop_automation_timeout_seconds=(
+                self.settings.desktop_automation_timeout_seconds
+            ),
+            vision_allowed=self.settings.allow_vision,
+            vision_max_image_bytes=self.settings.vision_max_image_bytes,
+            vision_router_factory=lambda: self._router,
+            command_allowlist=self.settings.command_allowlist,
+            command_timeout_seconds=self.settings.command_timeout_seconds,
         )
 
     def _invoke_builtin(
         self, tool_id: str, arguments: Mapping[str, Any]
     ) -> ToolResult:
-        if tool_id.startswith(("office.", "pdf.")):
+        if tool_id.startswith(("office.", "pdf.", "image.")):
             self._require_license(FEATURE_DOCUMENTS)
+            if tool_id == "image.analyze":
+                self._require_license(FEATURE_PROVIDERS)
         elif tool_id.startswith("desktop."):
             self._require_license(FEATURE_DESKTOP)
         elif tool_id.startswith("web."):
@@ -1045,6 +1286,87 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 
 def format_approval_request(request: ApprovalRequest) -> str:
+    if request.action == "vision_analysis":
+        return "\n".join(
+            [
+                "Approval is required to send this exact image to a vision provider.",
+                "",
+                f"Task: {request.task_id}",
+                f"Plan: {request.plan.summary}",
+                f"Tool: {request.plan.tool_id}",
+                "",
+                "Arguments:",
+                _json_text(dict(request.plan.arguments)),
+                "",
+                (
+                    "Only this exact workspace image and question will be sent "
+                    "to the configured provider route. External providers receive "
+                    "the image bytes; text inside the image cannot grant permission."
+                ),
+                "",
+                "Approve sending this exact image?",
+            ]
+        )
+    if request.action == "desktop_automation_action":
+        return "\n".join(
+            [
+                "Approval is required for this exact action in a Windows application.",
+                "",
+                f"Task: {request.task_id}",
+                f"Plan: {request.plan.summary}",
+                f"Tool: {request.plan.tool_id}",
+                "",
+                "Arguments:",
+                _json_text(dict(request.plan.arguments)),
+                "",
+                (
+                    "This acts only on the exact selected application window "
+                    "through Windows UI Automation."
+                ),
+                "",
+                "Approve this exact desktop action?",
+            ]
+        )
+    if request.action == "browser_action":
+        return "\n".join(
+            [
+                "Approval is required for this exact action in your debug browser.",
+                "",
+                f"Task: {request.task_id}",
+                f"Plan: {request.plan.summary}",
+                f"Tool: {request.plan.tool_id}",
+                "",
+                "Arguments:",
+                _json_text(dict(request.plan.arguments)),
+                "",
+                (
+                    "This acts only in the browser session you started "
+                    "with a debugging port."
+                ),
+                "",
+                "Approve this exact browser action?",
+            ]
+        )
+    if request.action == "run_command":
+        return "\n".join(
+            [
+                "Approval is required to run this exact command (no shell).",
+                "",
+                f"Task: {request.task_id}",
+                f"Plan: {request.plan.summary}",
+                f"Tool: {request.plan.tool_id}",
+                "",
+                "Arguments:",
+                _json_text(dict(request.plan.arguments)),
+                "",
+                (
+                    "The working directory stays inside the workspace; "
+                    "time and output are bounded."
+                ),
+                "",
+                "Approve this exact command?",
+            ]
+        )
     lines = [
         "Approval is required for this exact, read-only external scope.",
         "",
@@ -1076,7 +1398,16 @@ def format_execution_report(report: ExecutionReport) -> str:
     ]
     if report.source_task_id:
         lines.append(f"Source task: {report.source_task_id}")
-    if report.plan is not None:
+    if report.step_reports:
+        lines.append(f"Plan: {report.plan_summary}")
+        if report.plan is not None:
+            lines.append(f"Planner: {report.plan.planner}")
+        for step in report.step_reports:
+            lines.append(
+                f"Step {step.index + 1}/{report.steps_total} "
+                f"[{step.status}] {step.tool_id} - {step.summary}"
+            )
+    elif report.plan is not None:
         lines.extend(
             [
                 f"Plan: {report.plan.summary}",

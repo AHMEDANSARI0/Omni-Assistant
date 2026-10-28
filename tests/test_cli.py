@@ -24,8 +24,10 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def test_help_returns_zero(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main([]) == 0
+def test_help_returns_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["--root", str(tmp_path)]) == 0
     assert "pc-agent" in capsys.readouterr().out
 
 

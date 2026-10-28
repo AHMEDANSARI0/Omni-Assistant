@@ -1,4 +1,4 @@
-# Registered tools - through Phase 5
+# Registered tools - through Phase 16.1
 
 Built-in tools are reviewed source-code handlers. Phase 2 adds approved
 `custom.*` dynamic tools loaded from SQLite. Both kinds expose a stable id,
@@ -39,6 +39,31 @@ arguments before execution and validates the returned object afterwards.
 | `desktop.system_info` | 1.0.0 | Report OS/CPU/memory/workspace-disk information without a shell | none |
 | `desktop.open_path` | 1.0.0 | Open one workspace document/folder in its default app; direct desktop command/GUI tab context required | read_file, list_files, desktop_open |
 | `desktop.open_url` | 1.0.0 | Open one exact HTTP(S) URL in the default browser; direct desktop command/GUI tab context required | desktop_open |
+| `git.status` | 1.0.0 | Read-only repository status (staged/unstaged/untracked, branch, ahead/behind); needs `PC_AGENT_ALLOW_SUBPROCESS=1` | shell |
+| `git.log` | 1.0.0 | Read-only recent commit history (1-50 entries) | shell |
+| `git.diff_summary` | 1.0.0 | Read-only unstaged diff summary (files changed, +/- lines) | shell |
+| `git.init` | 1.0.0 | Initialize a new repository in a workspace folder; fresh approval every run | shell |
+| `git.add` | 1.0.0 | Stage explicit existing paths; fresh approval every run | shell |
+| `git.commit` | 1.0.0 | Commit staged changes with a single-line message; fresh approval every run | shell |
+| `commands.run` | 1.0.0 | Run one allow-listed program with fixed argv (never a shell); fresh approval every run; full output even on non-zero exit | shell |
+| `browser.status` | 1.0.0 | Report the user-started debug browser and its tabs; needs `PC_AGENT_ALLOW_BROWSER=1` | none |
+| `browser.open` | 1.0.0 | Open one exact http(s) URL in a new tab of the debug browser; fresh approval every run | network_access |
+| `browser.snapshot` | 1.0.0 | Read current tab URL/title/visible text/links (bounded) | network_access |
+| `browser.click` | 1.0.0 | Click the unique element matching a CSS selector or exact visible text; fresh approval | network_access |
+| `browser.type` | 1.0.0 | Set one text field's value (password/file fields refused); fresh approval; value read back | network_access |
+| `browser.screenshot` | 1.0.0 | Save a PNG screenshot of the current tab as a new workspace file | write_file, network_access |
+| `desktop.windows` | 1.0.0 | List visible Windows top-level windows (read-only); needs `PC_AGENT_ALLOW_DESKTOP_AUTOMATION=1` | desktop_automation |
+| `desktop.window_inspect` | 1.0.0 | Inspect one selected window's bounded UIA elements/patterns/readable values (read-only) | desktop_automation |
+| `desktop.window_focus` | 1.0.0 | Foreground exactly one selected window; fresh approval in tasks | desktop_automation |
+| `desktop.window_click` | 1.0.0 | Click exactly one selected UIA element, patterns first; fresh approval in tasks | desktop_automation |
+| `desktop.window_type` | 1.0.0 | Replace one readable text element's value with read-back; password elements refused; fresh approval in tasks | desktop_automation |
+| `desktop.send_keys` | 1.0.0 | Send one allow-listed key chord to a foreground-verified window; fresh approval in tasks | desktop_automation |
+| `desktop.screenshot` | 1.0.0 | Save the full desktop or one selected window as a new workspace PNG | write_file, desktop_automation |
+| `image.inspect` | 1.0.0 | Local image metadata, hash and color statistics | none |
+| `image.convert` | 1.0.0 | Convert a workspace image to a new PNG/JPEG/WebP/BMP/TIFF file | write_file |
+| `image.transform` | 1.0.0 | Crop/resize/thumbnail/rotate/flip/grayscale into a new workspace image | write_file |
+| `image.compare` | 1.0.0 | Compare two local images by bytes, pixels and bounded similarity | none |
+| `image.analyze` | 1.0.0 | Send one exact image/question to a vision provider; needs `PC_AGENT_ALLOW_VISION=1` and fresh approval in tasks | network_access |
 
 ## Approved dynamic tools
 
@@ -112,8 +137,11 @@ the non-OS-sandbox limitation.
 - **Desktop opening is also context-gated.** Only `pc-agent desktop open` or
   `open-url`, plus the GUI Desktop tab's confirmed exact open actions, grant
   that operation. Workspace targets are limited to files/folders and
-  executable/script/installer/shortcut extensions are rejected. No handler
-  exposes shell, screenshots or external-app GUI input.
+  executable/script/installer/shortcut extensions are rejected. Phase 14
+  desktop UI Automation is separate and default-off: handlers require the
+  context gate plus the evolving `PolicyEngine` DESKTOP_AUTOMATION decision,
+  exact window/element selectors, and (for task focus/click/type/keys) a
+  fresh approval bound to the arguments.
 
 ## Orchestration allow-list
 
@@ -128,7 +156,28 @@ plans for them are rejected). Phase 9 adds deterministic-only
 `office.xlsx_verify_formulas`. AI planning has a smaller Office subset
 (inspection and conversions, not extraction or DOCX creation). `web.fetch`,
 `desktop.open_path`, `desktop.open_url`, `workspace.read_text` and
-`workspace.write_text` are never orchestrated generic-task choices.
+`workspace.write_text` are never orchestrated generic-task choices. Phase 12 adds deterministic-only
+`git.*` and `commands.run`; AI planning may additionally propose only the
+read-only trio `git.status`, `git.log` and `git.diff_summary` — never
+`commands.run` or any Git mutation. All seven require the subprocess
+policy gate (off by default) and the mutations always need a fresh
+per-argument approval, including on workflow replay. Phase 13 adds
+`browser.*`: AI planning may propose only `browser.status` and
+`browser.snapshot`; open/click/type are deterministic-only, need fresh
+approvals, and every browser tool is excluded from automatic recovery
+retries. Phase 14 adds the seven `desktop.*` Windows UIA tools above: AI
+planning may propose only `desktop.windows` and `desktop.window_inspect`;
+focus/click/type/send-keys are deterministic-only with fresh approvals,
+and all desktop automation tools are excluded from automatic recovery.
+Phase 15 adds the five `image.*` tools above. The four local tools are
+deterministic; `image.convert`/`image.transform` only create new workspace
+outputs and are independently re-inspected. AI planning may propose only
+`image.inspect` and `image.compare`. `image.analyze` is deterministic-only,
+requires the vision gate and fresh approval, and is never auto-retried.
+
+Phase 16 does not add a tool. Provider credentials remain outside the tool
+registry and task/AI surfaces; only Settings and the dedicated local
+`pc-agent credentials` commands can access them.
 
 ## Known limitations
 

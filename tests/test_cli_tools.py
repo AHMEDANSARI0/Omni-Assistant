@@ -23,8 +23,10 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-def test_tools_list_includes_pdf_tools(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["tools", "list"]) == 0
+def test_tools_list_includes_pdf_tools(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["--root", str(tmp_path), "tools", "list"]) == 0
 
     out = capsys.readouterr().out
     assert "pdf.merge_folders v1.0.0" in out

@@ -361,8 +361,8 @@ def test_cli_files_commands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
 
     assert main([*root, "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 10 Workflow Reuse" in doctor
-    assert "built-ins=29" in doctor and "files=5" in doctor
+    assert "PHASE 16.1 Credential Manager Hotfix" in doctor
+    assert "built-ins=54" in doctor and "files=5" in doctor
 
 
 def test_gui_controller_file_tools(tmp_path: Path) -> None:
@@ -382,6 +382,6 @@ def test_gui_controller_file_tools(tmp_path: Path) -> None:
     assert (settings.workspace_dir / "gui-final.txt").is_file()
 
     summary = controller.doctor_summary()
-    assert summary.builtin_tools == 29
+    assert summary.builtin_tools == 54
     assert summary.file_tools == 5
     assert "files=5" in summary.to_text()

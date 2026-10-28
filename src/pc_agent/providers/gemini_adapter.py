@@ -20,6 +20,7 @@ from .base import (
 
 class GeminiProvider:
     implemented = True
+    supports_vision = True
 
     def __init__(
         self,
@@ -30,7 +31,7 @@ class GeminiProvider:
         timeout_seconds: float,
         transport: JsonTransport | None = None,
     ) -> None:
-        self.name = "Gemini"
+        self.name = "gemini"
         self._api_key = api_key
         self.model = model
         self._base_url = base_url.rstrip("/")
@@ -45,10 +46,9 @@ class GeminiProvider:
         if not self.configured:
             raise ProviderError("Gemini is not configured. Set GEMINI_API_KEY in .env.")
 
-        input_text = _transcript(request)
         payload: dict[str, Any] = {
             "model": self.model,
-            "input": input_text,
+            "input": _interaction_input(request),
             # Do not retain local task prompts server-side for later state use.
             "store": False,
             "generation_config": {
@@ -71,6 +71,32 @@ class GeminiProvider:
         usage = data.get("usage") if isinstance(data.get("usage"), Mapping) else {}
         returned_model = str(data.get("model") or self.model)
         return CompletionResponse(content, self.name, returned_model, dict(usage))
+
+
+def _interaction_input(request: CompletionRequest) -> str | list[dict[str, str]]:
+    if not request.has_images:
+        return _transcript(request)
+    non_system = [
+        message for message in request.messages if message.role is not MessageRole.SYSTEM
+    ]
+    labels = {MessageRole.USER: "User", MessageRole.ASSISTANT: "Assistant"}
+    parts: list[dict[str, str]] = []
+    for message in non_system:
+        text = (
+            message.content
+            if len(non_system) == 1
+            else f"{labels[message.role]}: {message.content}"
+        )
+        parts.append({"type": "text", "text": text})
+        for image in message.images:
+            parts.append(
+                {
+                    "type": "image",
+                    "data": image.base64_data,
+                    "mime_type": image.mime_type,
+                }
+            )
+    return parts
 
 
 def _transcript(request: CompletionRequest) -> str:

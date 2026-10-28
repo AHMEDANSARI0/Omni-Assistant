@@ -407,7 +407,7 @@ def test_cli_doctor_reports_phase7_memory(
 ) -> None:
     assert main(["--root", str(tmp_path), "doctor"]) == 0
     out = capsys.readouterr().out
-    assert "PHASE 10 Workflow Reuse" in out
+    assert "PHASE 16.1 Credential Manager Hotfix" in out
     assert "schema v6" in out
     assert "Memory: preferences=0" in out
 

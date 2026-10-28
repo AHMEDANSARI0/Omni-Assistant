@@ -1,4 +1,4 @@
-# Architecture - through PHASE 10
+# Architecture - through PHASE 16.1
 
 ## Shape
 
@@ -94,6 +94,20 @@ front-ends. Enforcement defaults to `off`; `warn` reports and continues,
 surfaces (`doctor`, license commands, listing/showing records) are never
 gated. `admin.py` is vendor-side tooling only and is never imported by the
 client runtime. See `docs/phase6.md`.
+
+## Phase 11 multi-step planning
+
+`MultiStepPlan` is an ordered tuple of ordinary single-tool `TaskPlan` steps
+plus run-time bindings (`path`/`input_path` <- earlier step's `output_path`).
+The deterministic planner splits a `then` instruction outside quotes and
+plans each clause with the single-step planner; promised outputs make
+not-yet-created inputs plannable, and the AI planner emits the same shape
+via a validated `steps` array. Execution extracts the original attempt
+loop into `_execute_step` (which never completes the task) and drives it
+per step: fresh approval, criteria, checkpoint at the step's index,
+per-step recovery budget, and stop-on-first-failure. Resume consults
+per-step checkpoints and continues at the first unfinished step; workflow
+records store the whole chain for revalidated replay.
 
 ## Phase 10 verified workflow reuse
 
@@ -282,3 +296,113 @@ This is restricted subprocess isolation, not a kernel/VM sandbox.
 - There is no Tool Builder lifecycle GUI, settings/API-key editor,
   production installer/shortcut, autonomous repair of the core
   runtime/source code, or deletion-based cleanup yet.
+
+## Phase 12 approved subprocess and Git
+
+The `commands.py` engine is the only place built-in tools may start a
+child process. It executes argv arrays with `shell=False` after
+requiring (a) the policy gate (`PolicyEngine` RUN_SHELL with
+subprocess enabled and the working directory inside the workspace),
+(b) a bare program name on the configured allow-list resolved via
+`shutil.which`, and (c) bounded, NUL-free arguments. Windows
+`.cmd`/`.bat` shims are bridged through `cmd.exe /d /s /c` only when
+every argument is free of cmd-special characters. Children get a
+scrubbed environment (PATH/system essentials only), closed stdin, a
+hard timeout enforced by killing the process (group), and 64 KiB
+output caps per stream.
+
+Tools never accept raw flags: the six `git.*` tools and `commands.run`
+build fixed argv from validated inputs. `commands.run`, `git.init`,
+`git.add` and `git.commit` raise `ApprovalRequest(action="run_command")`
+on every execution; the stored grant only matches identical arguments,
+so resume and workflow replay re-ask. All seven ids sit in recovery's
+no-retry set: a failed command never re-executes automatically.
+Verification is independent: Git reads are re-invoked and compared,
+commits must match HEAD and subject, `commands.run` must echo the
+approved program/argv with the expected exit code while still
+returning full output for non-zero exits. AI planning only allows the
+read-only Git trio; deterministic Git intents and `run --command`
+are the other entry points, and direct `pc-agent git` commands carry
+their own visible confirmation.
+
+## Phase 13 browser automation (CDP)
+
+`browser_cdp.py` is a standard-library Chromium DevTools client: a
+minimal RFC 6455 WebSocket implementation plus CDP request/event
+routing with per-request deadlines and message-size caps. It only
+connects to a localhost DevTools endpoint of a browser the user
+started with `--remote-debugging-port` (never launches one). Page
+JavaScript is a set of fixed templates; user values enter exclusively
+through `json.dumps`, so page text and arguments cannot become code.
+
+`browser.status/snapshot` are read-only; `browser.open/click/type`
+raise `ApprovalRequest(action="browser_action")` bound to exact
+arguments, and all six tools sit in recovery's no-retry set. Typing
+uses the native value setter + input/change events (framework-safe)
+with an `Input.insertText` fallback, refuses password/file fields,
+and is verified by reading the field back. Screenshots are the only
+file writes: new workspace PNGs checked by magic bytes, size and
+SHA-256 like other artifacts. The whole surface is gated by
+`PC_AGENT_ALLOW_BROWSER` (off by default); AI planning can only
+propose the two read-only tools.
+## Phase 14 Windows desktop UI Automation
+
+`desktop_automation.py` is the native boundary. Win32 enumerates top-level
+windows, restores/foregrounds one exact HWND and captures screenshots
+through GDI + a standard-library PNG encoder. Microsoft UI Automation is
+reached through the Windows-only `comtypes` package and the operating
+system's `UIAutomationCore.dll` type library; no element search is performed
+through coordinates or image templates.
+
+Window and element selectors are data, not grants. A selector must resolve
+uniquely, passwords are refused, typing requires a readable UIA value/text
+contract and exact read-back, and key input is limited to one allow-listed
+chord rechecked against the foreground window before every repeat. The
+surface is gated by `PC_AGENT_ALLOW_DESKTOP_AUTOMATION` and the
+`DESKTOP_AUTOMATION` policy action. `desktop.window_focus`,
+`desktop.window_click`, `desktop.window_type` and `desktop.send_keys` raise
+`ApprovalRequest(action="desktop_automation_action")` on every orchestrated
+execution, and all seven tools sit in recovery's no-retry set. AI planning
+can only propose `desktop.windows` / `desktop.window_inspect`. The backend
+is injectable through `ToolContext`, which lets the automated suite exercise
+all task/verification behavior with a simulated desktop on non-Windows
+hosts while the live backend fails closed off Windows.
+
+## Phase 15 image tools and provider vision
+
+`images.py` is the local Pillow boundary. It imposes file/pixel caps,
+normalizes EXIF orientation, uses only the first frame for processing,
+discards embedded metadata in outputs, and creates outputs through a
+temporary file plus hard link so an existing file is never overwritten.
+Inspection, conversion, transformation and comparison make no provider
+call. Their task results are verified by independently reopening the image
+and checking format/dimensions/mode/statistics.
+
+Provider requests gained immutable `ImageInput` values. Gemini receives an
+Interactions image part, OpenAI-compatible providers receive an `image_url`
+data URL, native Ollama receives base64 in `images`, and the offline mock
+refuses image input. The router restricts image-carrying requests to
+providers declaring vision capability. `image.analyze` additionally needs
+`PC_AGENT_ALLOW_VISION=1`, a context-supplied router, and the orchestrator's
+`vision_analysis` approval before the handler can read-and-send the exact
+workspace image. It is excluded from AI planning and automatic recovery, so
+no failed path silently resends image bytes.
+
+## Phase 16 Windows Credential Manager
+
+`credentials.py` is the only OS-secret boundary. Its Windows backend stores
+one generic credential per provider through `CredWriteW`, reads it with
+`CredReadW`/`CredFree`, and deletes it with `CredDeleteW`. Fixed-width
+Win32 types are used for the `CREDENTIALW` layout so tests on LP64 hosts
+check the same 4-byte DWORD/BOOL ABI as Windows. The backend is injectable
+and the suite simulates `advapi32`; production uses no third-party secret
+package.
+
+Settings resolves each key from environment/``.env`` first and only then
+from the credential store. This preserves existing installs and makes
+migration non-breaking. Production CLI/GUI loads may consult the auto
+Windows backend, while an explicitly supplied test environment mapping
+does not silently read the developer's vault unless a store is injected;
+the test suite additionally defaults to ``PC_AGENT_CREDENTIAL_STORE=env``.
+Credential values never enter tool schemas, task plans, logs or status
+objects—only provider names and source labels are exposed.

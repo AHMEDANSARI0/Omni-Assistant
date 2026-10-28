@@ -216,3 +216,49 @@ def test_provider_config_rejects_plaintext_remote_endpoint_and_bad_model(tmp_pat
             tmp_path,
             environ={"PC_AGENT_GEMINI_MODEL": "bad model"},
         )
+
+
+def test_gemini_route_builds_from_settings_with_key(tmp_path: Path) -> None:
+    """Regression: config lowercases provider names ("gemini") while the
+    router factory compared against "Gemini", so the Gemini adapter could
+    never be built from settings and its status showed "Unknown provider
+    slot". Caught on a real Windows install during Phase 13 verification.
+    """
+
+    settings = Settings.from_env(
+        tmp_path,
+        environ={
+            "PC_AGENT_PROVIDER_ORDER": "gemini",
+            "GEMINI_API_KEY": "gemini-secret",
+            "PC_AGENT_GEMINI_MODEL": "gemini-test",
+        },
+    )
+    transport = FakeTransport(
+        {
+            "status": "completed",
+            "model": "gemini-test",
+            "steps": [
+                {
+                    "type": "model_output",
+                    "content": [{"type": "text", "text": "Hello from routed Gemini"}],
+                },
+            ],
+            "usage": {"total_tokens": 5},
+        }
+    )
+    router = build_model_router(settings, transport=transport)
+
+    assert router.provider_names == ("gemini",)
+    routed = router.complete(CompletionRequest.from_prompt("hello"))
+    assert routed.response.provider == "gemini"
+    assert routed.response.content == "Hello from routed Gemini"
+    assert "gemini-secret" not in repr(settings.public_summary())
+
+    status = next(
+        item for item in provider_statuses(settings) if item.name == "gemini"
+    )
+    assert status.implemented is True
+    assert status.configured is True
+    assert status.in_route is True
+    assert status.model == "gemini-test"
+    assert "Unknown" not in status.detail

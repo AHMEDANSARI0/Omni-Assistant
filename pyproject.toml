@@ -4,17 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-healing-pc-agent"
-version = "0.12.0"
-description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file/Office operations + verified workflow reuse)"
+version = "0.18.1"
+description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file/Office operations + verified workflow reuse + multi-step planning)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 # Runtime dependencies are added per phase only when an implemented feature
 # actually needs them. Phase 1B's PDF tools use pypdf; the Phase 4.1 TLS
-# hotfix uses certifi as a portable Mozilla CA bundle.
+# hotfix uses certifi as a portable Mozilla CA bundle. Phase 14 uses
+# comtypes only on Windows for Microsoft UI Automation COM interop. Phase 15
+# uses Pillow for bounded local image decoding/encoding and transformations.
 dependencies = [
     "certifi>=2024.7.4",
     "pypdf>=5.0,<7",
+    "Pillow>=10.4,<14",
+    "comtypes>=1.4,<2; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

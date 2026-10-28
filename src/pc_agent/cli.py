@@ -14,17 +14,29 @@ from __future__ import annotations
 
 import argparse
 import copy
+import getpass
 import json
+import os
 import platform
+import shlex
+import shutil
 import ssl
 import sys
 import textwrap
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .browser_cdp import probe_browser
 from .config import Settings
+from .credentials import (
+    SUPPORTED_CREDENTIAL_PROVIDERS,
+    build_credential_store,
+    canonical_credential_provider,
+)
+from .desktop_automation import probe_desktop_automation
 from .documents.office import create_demo_office_files
 from .documents.pdf import create_demo_pdfs
 from .domain.task import Task, TaskStatus
@@ -87,6 +99,136 @@ def _add_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--value", default=None, help='Spreadsheet cell value/formula, e.g. "=SUM(A1:A3)"'
     )
+    parser.add_argument(
+        "--command",
+        dest="run_command_text",
+        default=None,
+        help='Allow-listed command to run with approval, e.g. "python -m pytest -q" (needs PC_AGENT_ALLOW_SUBPROCESS=1)',
+    )
+    parser.add_argument(
+        "--command-timeout",
+        type=int,
+        default=None,
+        help="Timeout seconds for --command (capped by PC_AGENT_COMMAND_TIMEOUT_SECONDS)",
+    )
+    parser.add_argument(
+        "--browser-open",
+        default=None,
+        metavar="URL",
+        help="Open this exact URL in the debug browser with approval (needs PC_AGENT_ALLOW_BROWSER=1)",
+    )
+    parser.add_argument(
+        "--browser-click-selector",
+        default=None,
+        help="CSS selector to click in the debug browser with approval",
+    )
+    parser.add_argument(
+        "--browser-click-text",
+        default=None,
+        help="Exact visible text to click in the debug browser with approval",
+    )
+    parser.add_argument(
+        "--browser-type-selector",
+        default=None,
+        help="CSS selector of a text field to type into with approval",
+    )
+    parser.add_argument(
+        "--browser-type-text",
+        default=None,
+        help="Text for --browser-type-selector (never a password field)",
+    )
+    parser.add_argument(
+        "--desktop-window",
+        dest="desktop_window_title_contains",
+        default=None,
+        metavar="TEXT",
+        help="Exact title text contained in the target desktop window",
+    )
+    parser.add_argument(
+        "--desktop-window-handle",
+        default=None,
+        help="Exact desktop window handle from pc-agent desktop windows",
+    )
+    parser.add_argument(
+        "--desktop-click-name",
+        default=None,
+        help="Exact UIA element name to click in the selected desktop window",
+    )
+    parser.add_argument(
+        "--desktop-click-automation-id",
+        default=None,
+        help="Exact UIA AutomationId to click in the selected desktop window",
+    )
+    parser.add_argument(
+        "--desktop-type-name",
+        default=None,
+        help="Exact UIA text element name in the selected desktop window",
+    )
+    parser.add_argument(
+        "--desktop-type-automation-id",
+        default=None,
+        help="Exact UIA text element AutomationId in the selected desktop window",
+    )
+    parser.add_argument(
+        "--desktop-type-text",
+        default=None,
+        help="Text for the selected desktop element (password elements are refused)",
+    )
+    parser.add_argument(
+        "--desktop-keys",
+        default=None,
+        metavar="CHORD",
+        help="One allow-listed desktop key chord for the selected window, e.g. Ctrl+S",
+    )
+    parser.add_argument("--image-width", type=int, default=None, help="Exact output image width")
+    parser.add_argument("--image-height", type=int, default=None, help="Exact output image height")
+    parser.add_argument(
+        "--image-max-dimension",
+        type=int,
+        default=None,
+        help="Shrink an image so neither side exceeds this many pixels",
+    )
+    parser.add_argument("--image-crop-left", type=int, default=None, help="Image crop left pixel")
+    parser.add_argument("--image-crop-top", type=int, default=None, help="Image crop top pixel")
+    parser.add_argument("--image-crop-right", type=int, default=None, help="Image crop right pixel")
+    parser.add_argument(
+        "--image-crop-bottom", type=int, default=None, help="Image crop bottom pixel"
+    )
+    parser.add_argument(
+        "--image-rotate",
+        dest="image_rotate_degrees",
+        type=float,
+        default=None,
+        help="Rotate an image clockwise by these degrees (-360 to 360)",
+    )
+    parser.add_argument(
+        "--image-flip",
+        choices=["horizontal", "vertical", "both"],
+        default=None,
+        help="Flip an image horizontally, vertically, or both ways",
+    )
+    parser.add_argument(
+        "--image-grayscale",
+        action="store_true",
+        help="Convert the transformed image to grayscale",
+    )
+    parser.add_argument(
+        "--image-quality",
+        type=int,
+        default=None,
+        help="JPEG/WebP quality for image conversion/transformation (1-100)",
+    )
+    parser.add_argument(
+        "--image-question",
+        default=None,
+        help="Exact question for approved provider vision analysis of --target image",
+    )
+    parser.add_argument(
+        "--image-compare",
+        dest="image_compare_path",
+        default=None,
+        help="Second exact image path for an image comparison task",
+    )
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument(
         "--use-ai",
@@ -115,10 +257,45 @@ def _add_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Print the execution report as JSON")
 
 
+def _add_desktop_window_selector_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--window-handle", default=None, help="Exact window handle")
+    parser.add_argument("--window-title", default=None, help="Exact window title")
+    parser.add_argument(
+        "--window-title-contains", default=None, help="Text contained in the window title"
+    )
+    parser.add_argument("--window-class", default=None, help="Exact window class name")
+    parser.add_argument(
+        "--window-process-id", type=int, default=None, help="Exact owning process id"
+    )
+
+
+def _add_desktop_element_selector_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--element-runtime-id", default=None, help="Exact UIA runtime id")
+    parser.add_argument("--element-name", default=None, help="Exact UIA element name")
+    parser.add_argument(
+        "--element-name-contains", default=None, help="Text contained in the UIA element name"
+    )
+    parser.add_argument(
+        "--element-automation-id", default=None, help="Exact UIA AutomationId"
+    )
+    parser.add_argument("--element-class", default=None, help="Exact UIA class name")
+    parser.add_argument(
+        "--element-control-type",
+        default=None,
+        help="UIA control type name or numeric id, e.g. Button or Edit",
+    )
+    parser.add_argument(
+        "--element-index",
+        type=int,
+        default=None,
+        help="1-based choice when the other selector fields match several elements",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent",
-        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 10)",
+        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 14)",
     )
     parser.add_argument("--version", action="version", version=f"pc-agent {__version__}")
     parser.add_argument(
@@ -200,6 +377,105 @@ def build_parser() -> argparse.ArgumentParser:
         "clear", help="Delete all preferences, notes and workflow memory (tasks are kept)"
     )
     memory_clear_parser.add_argument("--yes", action="store_true")
+
+    git_parser = subparsers.add_parser(
+        "git", help="Local Git tools (approved subprocess; no network operations)"
+    )
+    git_subparsers = git_parser.add_subparsers(dest="git_command")
+    git_status_parser = git_subparsers.add_parser(
+        "status", help="Show repository status (read-only)"
+    )
+    git_status_parser.add_argument("--repo", default=".")
+    git_status_parser.add_argument("--json", action="store_true")
+    git_log_parser = git_subparsers.add_parser(
+        "log", help="Show recent commits (read-only)"
+    )
+    git_log_parser.add_argument("--repo", default=".")
+    git_log_parser.add_argument("--count", type=int, default=10)
+    git_log_parser.add_argument("--json", action="store_true")
+    git_diff_parser = git_subparsers.add_parser(
+        "diff", help="Summarize changes as a diffstat (read-only)"
+    )
+    git_diff_parser.add_argument("--repo", default=".")
+    git_diff_parser.add_argument("--staged", action="store_true")
+    git_diff_parser.add_argument("--json", action="store_true")
+    git_init_parser = git_subparsers.add_parser(
+        "init", help="Initialize a repository in a workspace folder"
+    )
+    git_init_parser.add_argument("directory", nargs="?", default=".")
+    git_init_parser.add_argument("--yes", action="store_true")
+    git_init_parser.add_argument("--json", action="store_true")
+    git_add_parser = git_subparsers.add_parser(
+        "add", help="Stage repository-relative paths"
+    )
+    git_add_parser.add_argument("paths", nargs="+")
+    git_add_parser.add_argument("--repo", default=".")
+    git_add_parser.add_argument("--yes", action="store_true")
+    git_add_parser.add_argument("--json", action="store_true")
+    git_commit_parser = git_subparsers.add_parser(
+        "commit", help="Commit staged changes with a one-line message"
+    )
+    git_commit_parser.add_argument("--message", "-m", required=True)
+    git_commit_parser.add_argument("--repo", default=".")
+    git_commit_parser.add_argument("--yes", action="store_true")
+    git_commit_parser.add_argument("--json", action="store_true")
+
+    browser_parser = subparsers.add_parser(
+        "browser",
+        help="Drive a user-started Edge/Chrome debug session (Phase 13)",
+    )
+    browser_subparsers = browser_parser.add_subparsers(dest="browser_command")
+    browser_status_parser = browser_subparsers.add_parser(
+        "status", help="Show connected debug browser and its tabs (read-only)"
+    )
+    browser_status_parser.add_argument("--json", action="store_true")
+    browser_open_parser = browser_subparsers.add_parser(
+        "open", help="Open one exact URL in a new tab (approval required)"
+    )
+    browser_open_parser.add_argument("url")
+    browser_open_parser.add_argument(
+        "--wait", type=int, default=None, help="Seconds to wait for load (1-60)"
+    )
+    browser_open_parser.add_argument(
+        "--target-id", default=None, help="Navigate this existing tab instead"
+    )
+    browser_open_parser.add_argument(
+        "--allow-private",
+        action="store_true",
+        help="Allow a private/local address for this exact open",
+    )
+    browser_open_parser.add_argument("--yes", action="store_true")
+    browser_open_parser.add_argument("--json", action="store_true")
+    browser_snapshot_parser = browser_subparsers.add_parser(
+        "snapshot", help="Read the current tab's text and links (read-only)"
+    )
+    browser_snapshot_parser.add_argument("--max-chars", type=int, default=None)
+    browser_snapshot_parser.add_argument("--target-id", default=None)
+    browser_snapshot_parser.add_argument("--json", action="store_true")
+    browser_click_parser = browser_subparsers.add_parser(
+        "click", help="Click one exact element (approval required)"
+    )
+    browser_click_parser.add_argument("--selector", default=None)
+    browser_click_parser.add_argument("--text", default=None)
+    browser_click_parser.add_argument("--target-id", default=None)
+    browser_click_parser.add_argument("--yes", action="store_true")
+    browser_click_parser.add_argument("--json", action="store_true")
+    browser_type_parser = browser_subparsers.add_parser(
+        "type", help="Type into one text field, never passwords (approval required)"
+    )
+    browser_type_parser.add_argument("selector")
+    browser_type_parser.add_argument("--text", required=True)
+    browser_type_parser.add_argument("--target-id", default=None)
+    browser_type_parser.add_argument("--yes", action="store_true")
+    browser_type_parser.add_argument("--json", action="store_true")
+    browser_shot_parser = browser_subparsers.add_parser(
+        "screenshot", help="Save a PNG screenshot of the current tab"
+    )
+    browser_shot_parser.add_argument(
+        "output", nargs="?", default="browser-screenshot.png"
+    )
+    browser_shot_parser.add_argument("--target-id", default=None)
+    browser_shot_parser.add_argument("--json", action="store_true")
 
     workflow_parser = subparsers.add_parser(
         "workflow", help="Inspect and re-run verified workflows (Phase 10)"
@@ -334,6 +610,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     providers_subparsers = providers_parser.add_subparsers(dest="providers_command")
     providers_subparsers.add_parser("list", help="List provider statuses without secrets")
+
+    credentials_parser = subparsers.add_parser(
+        "credentials",
+        help="Manage provider API keys in Windows Credential Manager (values never printed)",
+    )
+    credentials_subparsers = credentials_parser.add_subparsers(
+        dest="credentials_command"
+    )
+    credential_status_parser = credentials_subparsers.add_parser(
+        "status", help="Show credential-store status and stored provider names"
+    )
+    credential_status_parser.add_argument("--json", action="store_true")
+    credential_list_parser = credentials_subparsers.add_parser(
+        "list", help="List stored/effective provider-key sources without values"
+    )
+    credential_list_parser.add_argument("--json", action="store_true")
+    credential_provider_choices = (
+        *SUPPORTED_CREDENTIAL_PROVIDERS,
+        "openai_compatible",
+    )
+    credential_set_parser = credentials_subparsers.add_parser(
+        "set", help="Store one provider API key from a hidden prompt"
+    )
+    credential_set_parser.add_argument("provider", choices=credential_provider_choices)
+    credential_delete_parser = credentials_subparsers.add_parser(
+        "delete", help="Delete one stored provider API key"
+    )
+    credential_delete_parser.add_argument(
+        "provider", choices=credential_provider_choices
+    )
+    credential_delete_parser.add_argument("--yes", action="store_true")
+    credential_migrate_parser = credentials_subparsers.add_parser(
+        "migrate",
+        help="Copy existing environment/.env provider keys into Credential Manager",
+    )
+    credential_migrate_parser.add_argument(
+        "provider", nargs="?", default=None, choices=credential_provider_choices
+    )
+    credential_migrate_parser.add_argument("--yes", action="store_true")
 
     ask_parser = subparsers.add_parser(
         "ask", help="Ask the configured provider route (uses the network unless only mock is available)"
@@ -561,7 +876,8 @@ def build_parser() -> argparse.ArgumentParser:
     web_fetch_parser.add_argument("--json", action="store_true")
 
     desktop_parser = subparsers.add_parser(
-        "desktop", help="Read system info or open one exact workspace item/URL"
+        "desktop",
+        help="System info, exact desktop open, and gated Windows UI Automation (Phase 14)",
     )
     desktop_subparsers = desktop_parser.add_subparsers(dest="desktop_command")
     desktop_info_parser = desktop_subparsers.add_parser(
@@ -576,6 +892,118 @@ def build_parser() -> argparse.ArgumentParser:
         "open-url", help="Open one exact HTTP(S) URL in the default browser"
     )
     desktop_open_url_parser.add_argument("url", help="Exact http:// or https:// URL")
+    desktop_windows_parser = desktop_subparsers.add_parser(
+        "windows", help="List visible desktop windows (read-only; Phase 14 gate)"
+    )
+    desktop_windows_parser.add_argument("--max-windows", type=int, default=100)
+    desktop_windows_parser.add_argument("--include-untitled", action="store_true")
+    desktop_windows_parser.add_argument("--json", action="store_true")
+    desktop_inspect_parser = desktop_subparsers.add_parser(
+        "inspect", help="Inspect one window's UIA elements (read-only; Phase 14 gate)"
+    )
+    _add_desktop_window_selector_args(desktop_inspect_parser)
+    desktop_inspect_parser.add_argument("--max-elements", type=int, default=200)
+    desktop_inspect_parser.add_argument("--include-offscreen", action="store_true")
+    desktop_inspect_parser.add_argument("--json", action="store_true")
+    desktop_focus_parser = desktop_subparsers.add_parser(
+        "focus", help="Focus one exact desktop window (approval required)"
+    )
+    _add_desktop_window_selector_args(desktop_focus_parser)
+    desktop_focus_parser.add_argument("--yes", action="store_true")
+    desktop_focus_parser.add_argument("--json", action="store_true")
+    desktop_click_parser = desktop_subparsers.add_parser(
+        "click", help="Click one exact UIA element (approval required)"
+    )
+    _add_desktop_window_selector_args(desktop_click_parser)
+    _add_desktop_element_selector_args(desktop_click_parser)
+    desktop_click_parser.add_argument("--yes", action="store_true")
+    desktop_click_parser.add_argument("--json", action="store_true")
+    desktop_type_parser = desktop_subparsers.add_parser(
+        "type", help="Set one exact UIA text element, never passwords (approval required)"
+    )
+    _add_desktop_window_selector_args(desktop_type_parser)
+    _add_desktop_element_selector_args(desktop_type_parser)
+    desktop_type_parser.add_argument("--text", required=True)
+    desktop_type_parser.add_argument("--yes", action="store_true")
+    desktop_type_parser.add_argument("--json", action="store_true")
+    desktop_keys_parser = desktop_subparsers.add_parser(
+        "keys", help="Send one allow-listed key chord to one window (approval required)"
+    )
+    _add_desktop_window_selector_args(desktop_keys_parser)
+    desktop_keys_parser.add_argument("keys", help="One key chord, e.g. Ctrl+S or Enter")
+    desktop_keys_parser.add_argument("--repeat", type=int, default=1)
+    desktop_keys_parser.add_argument("--yes", action="store_true")
+    desktop_keys_parser.add_argument("--json", action="store_true")
+    desktop_screenshot_parser = desktop_subparsers.add_parser(
+        "screenshot", help="Save a full-desktop or selected-window PNG screenshot"
+    )
+    desktop_screenshot_parser.add_argument(
+        "output", nargs="?", default="desktop-screenshot.png"
+    )
+    _add_desktop_window_selector_args(desktop_screenshot_parser)
+    desktop_screenshot_parser.add_argument("--json", action="store_true")
+
+    image_parser = subparsers.add_parser(
+        "image",
+        help="Local image tools and gated provider vision (Phase 15)",
+    )
+    image_subparsers = image_parser.add_subparsers(dest="image_command")
+    image_inspect_parser = image_subparsers.add_parser(
+        "inspect", help="Inspect one workspace image locally (read-only)"
+    )
+    image_inspect_parser.add_argument("path")
+    image_inspect_parser.add_argument(
+        "--no-color-stats",
+        dest="include_color_stats",
+        action="store_false",
+        help="Skip average/dominant color statistics",
+    )
+    image_inspect_parser.set_defaults(include_color_stats=True)
+    image_inspect_parser.add_argument("--json", action="store_true")
+    image_convert_parser = image_subparsers.add_parser(
+        "convert", help="Convert an image to a new file chosen by output extension"
+    )
+    image_convert_parser.add_argument("source")
+    image_convert_parser.add_argument("output")
+    image_convert_parser.add_argument("--quality", type=int, default=90)
+    image_convert_parser.add_argument("--json", action="store_true")
+    image_transform_parser = image_subparsers.add_parser(
+        "transform", help="Create a resized/cropped/rotated/flipped/grayscale copy"
+    )
+    image_transform_parser.add_argument("source")
+    image_transform_parser.add_argument("output")
+    image_transform_parser.add_argument("--width", type=int, default=None)
+    image_transform_parser.add_argument("--height", type=int, default=None)
+    image_transform_parser.add_argument("--max-dimension", type=int, default=None)
+    image_transform_parser.add_argument("--crop-left", type=int, default=None)
+    image_transform_parser.add_argument("--crop-top", type=int, default=None)
+    image_transform_parser.add_argument("--crop-right", type=int, default=None)
+    image_transform_parser.add_argument("--crop-bottom", type=int, default=None)
+    image_transform_parser.add_argument(
+        "--rotate", dest="rotate_degrees", type=float, default=0.0,
+        help="Clockwise degrees (-360 to 360)",
+    )
+    image_transform_parser.add_argument(
+        "--flip", choices=["none", "horizontal", "vertical", "both"], default="none"
+    )
+    image_transform_parser.add_argument("--grayscale", action="store_true")
+    image_transform_parser.add_argument("--quality", type=int, default=90)
+    image_transform_parser.add_argument("--json", action="store_true")
+    image_compare_parser = image_subparsers.add_parser(
+        "compare", help="Deterministically compare two workspace images"
+    )
+    image_compare_parser.add_argument("first")
+    image_compare_parser.add_argument("second")
+    image_compare_parser.add_argument("--json", action="store_true")
+    image_analyze_parser = image_subparsers.add_parser(
+        "analyze",
+        help="Ask a configured vision provider about one image (gate + approval required)",
+    )
+    image_analyze_parser.add_argument("path")
+    image_analyze_parser.add_argument("--question", required=True)
+    image_analyze_parser.add_argument("--max-output-tokens", type=int, default=1024)
+    image_analyze_parser.add_argument("--yes", action="store_true")
+    image_analyze_parser.add_argument("--json", action="store_true")
 
     demo_parser = subparsers.add_parser("demo", help="Create deterministic local demo data")
     demo_subparsers = demo_parser.add_subparsers(dest="demo_command")
@@ -677,6 +1105,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_license_command(settings, args)
         if args.command == "memory":
             return _run_memory_command(settings, args)
+        if args.command == "git":
+            return _run_git_command(settings, args)
+        if args.command == "browser":
+            return _run_browser_command(settings, args)
         if args.command == "workflow":
             return _run_workflow_command(settings, args)
         if args.command == "task":
@@ -687,6 +1119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_recovery_command(settings, args)
         if args.command == "providers":
             return _run_providers_command(settings, args)
+        if args.command == "credentials":
+            return _run_credentials_command(settings, args)
         if args.command == "ask":
             return _run_ask_command(settings, args)
         if args.command == "tools":
@@ -699,6 +1133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_web_command(settings, args)
         if args.command == "desktop":
             return _run_desktop_command(settings, args)
+        if args.command == "image":
+            return _run_image_command(settings, args)
         if args.command == "demo":
             return _run_demo_command(settings, args)
         if args.command == "pdf":
@@ -807,16 +1243,17 @@ def _run_license_command(settings: Settings, args: argparse.Namespace) -> int:
         return 0
     if args.license_command == "deactivate":
         if not args.yes:
-            try:
-                answer = input(
-                    "This removes the locally activated license file. "
-                    "Type DEACTIVATE to continue: "
-                )
-            except EOFError as exc:
+            print("This removes the locally activated license file.")
+            outcome = _ask_confirmation(
+                "DEACTIVATE",
+                prompt="Type DEACTIVATE to continue: ",
+                case_sensitive=True,
+            )
+            if outcome is None:
                 raise ApprovalUnavailableError(
                     "Deactivation needs interactive confirmation or --yes."
-                ) from exc
-            if answer.strip() != "DEACTIVATE":
+                )
+            if not outcome:
                 print("Deactivation cancelled; the license file is unchanged.")
                 return 1
         status = service.deactivate()
@@ -981,7 +1418,7 @@ def _run_doctor(settings: Settings) -> int:
         / "dynamic-tools"
         / "word_count_arguments.json"
     )
-    print(f"Self-Healing PC Agent {__version__} (PHASE 10 Workflow Reuse)")
+    print(f"Self-Healing PC Agent {__version__} (PHASE 16.1 Credential Manager Hotfix)")
     print(f"Python: {platform.python_version()}")
     print(f"Environment: {summary['environment']}")
     print(f"Root: {summary['root']}")
@@ -990,6 +1427,11 @@ def _run_doctor(settings: Settings) -> int:
     print(f"Provider order: {summary['provider_order']}")
     print(f"Providers with credentials: {summary['providers_with_credentials']}")
     print(f"Usable provider route: {' -> '.join(route)}")
+    print(
+        "Credential store: "
+        f"{_credential_status_text(settings)}; "
+        f"sources={summary['provider_credential_sources']}"
+    )
     print(
         "Approved dynamic tools: "
         f"{len(approved_dynamic)} ({enabled_dynamic} enabled)"
@@ -1012,12 +1454,78 @@ def _run_doctor(settings: Settings) -> int:
     print(
         "Built-in tools: "
         f"built-ins={len(builtin_tools)}, office={office_tools}, files={file_tools}, "
-        "web.fetch=public-only by default, desktop=open/info only"
+        "web.fetch=public-only by default, desktop=open/info plus gated Windows UIA, "
+        "images=local Pillow tools plus gated provider vision, "
+        "provider keys=environment first, then Windows Credential Manager"
     )
     print(
         "Web limits: "
         f"timeout={settings.web_timeout_seconds:.1f}s, max_bytes={settings.web_max_bytes}"
     )
+    if settings.allow_subprocess:
+        print(
+            "Subprocess: enabled; "
+            f"allowlist={', '.join(settings.command_allowlist) or 'none'}; "
+            f"timeout cap={settings.command_timeout_seconds:.0f}s; "
+            f"git={'found' if shutil.which('git') else 'not found on PATH'}"
+        )
+    else:
+        print(
+            "Subprocess: disabled (set PC_AGENT_ALLOW_SUBPROCESS=1 in .env "
+            "to enable approved git/command tools)"
+        )
+    if settings.allow_browser:
+        browser_info = probe_browser(port=settings.browser_port)
+        connected = (
+            f"connected ({browser_info.get('Browser') or 'Chromium'})"
+            if browser_info
+            else "not reachable (start Edge/Chrome with --remote-debugging-port)"
+        )
+        print(
+            "Browser: enabled; "
+            f"debug endpoint=http://127.0.0.1:{settings.browser_port}; {connected}"
+        )
+    else:
+        print(
+            "Browser: disabled (set PC_AGENT_ALLOW_BROWSER=1 in .env to "
+            "enable debug-browser automation)"
+        )
+    if settings.allow_desktop_automation:
+        desktop_probe = probe_desktop_automation()
+        runtime = (
+            str(desktop_probe.get("detail") or "available")
+            if desktop_probe.get("available")
+            else f"unavailable ({desktop_probe.get('detail') or 'runtime missing'})"
+        )
+        print(
+            "Desktop automation: enabled; "
+            f"runtime={runtime}; "
+            f"timeout={settings.desktop_automation_timeout_seconds:.1f}s; "
+            "focus/click/type/keys require approval"
+        )
+    else:
+        print(
+            "Desktop automation: disabled (set "
+            "PC_AGENT_ALLOW_DESKTOP_AUTOMATION=1 in .env to enable Windows UIA tools)"
+        )
+    if settings.allow_vision:
+        vision_router = build_model_router(settings)
+        vision_providers = [
+            provider.name
+            for provider in vision_router.providers
+            if getattr(provider, "supports_vision", False) and provider.configured
+        ]
+        print(
+            "Vision: enabled; "
+            f"providers={', '.join(vision_providers) or 'none configured'}; "
+            f"max_image_bytes={settings.vision_max_image_bytes}; "
+            "each exact image send requires approval"
+        )
+    else:
+        print(
+            "Vision: disabled (set PC_AGENT_ALLOW_VISION=1 in .env to enable "
+            "approved image analysis; local image tools remain available)"
+        )
     tls_ok = False
     try:
         tls_info = tls_trust_info()
@@ -1450,6 +1958,17 @@ def _tool_context(
         desktop_open_allowed=allow_desktop_open,
         web_timeout_seconds=settings.web_timeout_seconds,
         web_max_bytes=settings.web_max_bytes,
+        subprocess_allowed=settings.allow_subprocess,
+        command_allowlist=settings.command_allowlist,
+        command_timeout_seconds=settings.command_timeout_seconds,
+        browser_allowed=settings.allow_browser,
+        browser_port=settings.browser_port,
+        browser_timeout_seconds=settings.browser_timeout_seconds,
+        desktop_automation_allowed=settings.allow_desktop_automation,
+        desktop_automation_timeout_seconds=settings.desktop_automation_timeout_seconds,
+        vision_allowed=settings.allow_vision,
+        vision_max_image_bytes=settings.vision_max_image_bytes,
+        vision_router_factory=lambda: build_model_router(settings),
     )
 
 
@@ -1982,6 +2501,538 @@ def _run_pdf_command(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _stdin_is_interactive() -> bool:
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:  # noqa: BLE001 - no usable console attached
+        return False
+
+
+def _flush_pending_console_input() -> bool:
+    """Discard console input typed/pasted before a confirmation prompt.
+
+    Returns True when pending typed text was found (and discarded), so the
+    caller can tell the user it was ignored. Only interactive terminals are
+    touched: piped stdin keeps its bytes. This stops a multi-line paste
+    (where the next pasted command lands in the input buffer) - or a
+    pre-pasted APPROVE - from answering the prompt; every confirmation
+    must be typed after the prompt is shown.
+    """
+
+    if not _stdin_is_interactive():
+        return False
+    try:
+        if os.name == "nt":
+            return _flush_pending_windows_input()
+        import select
+        import termios
+
+        readable, _w, _x = select.select([sys.stdin], [], [], 0)
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+        return bool(readable)
+    except Exception:  # noqa: BLE001 - best effort only; prompting still works
+        return False
+
+
+def _flush_pending_windows_input() -> bool:
+    """Discard already-queued key presses via msvcrt; never raises.
+
+    msvcrt is used instead of console-buffer APIs because those do not
+    work reliably under Windows Terminal (ConPTY). Two drain rounds with
+    a short settle in between catch paste chunks still in flight.
+    Returns True when real text (not just Enter keys) was discarded.
+    """
+
+    try:
+        import msvcrt
+
+        found_text = False
+        for _round in range(2):
+            while msvcrt.kbhit():
+                char = msvcrt.getwch()
+                if char in ("\x00", "\xe0"):
+                    msvcrt.getwch()  # swallow the scan code
+                elif char not in ("\r", "\n"):
+                    found_text = True
+            time.sleep(0.15)
+        return found_text
+    except Exception:  # noqa: BLE001 - best effort; the key loop still guards
+        return False
+
+
+def _key_available() -> bool:
+    """True when another key press is already queued (a paste signature)."""
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            return bool(msvcrt.kbhit())
+        import select
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd, termios.TCSANOW)
+            readable, _w, _x = select.select([fd], [], [], 0)
+            return bool(readable)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+    except Exception:  # noqa: BLE001 - if unsure, treat the key as lone
+        return False
+
+
+def _read_single_key() -> str | None:
+    """Read one key press without waiting for Enter; None if unavailable."""
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            char = msvcrt.getwch()
+            if char in ("\x00", "\xe0"):  # special key: swallow scan code
+                msvcrt.getwch()
+                return ""
+            return char
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        previous = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd, termios.TCSANOW)
+            data = os.read(fd, 1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, previous)
+        if not data:
+            return None
+        return data.decode("utf-8", errors="ignore")
+    except KeyboardInterrupt:
+        raise
+    except Exception:  # noqa: BLE001 - fall back to "no input available"
+        return None
+
+
+def _drain_available_keys(limit: int = 256) -> str:
+    """Read already-queued keys without blocking; returns what was drained."""
+
+    drained: list[str] = []
+    try:
+        while len(drained) < limit and _key_available():
+            char = _read_single_key()
+            if char is None:
+                break
+            drained.append(char)
+    except KeyboardInterrupt:
+        drained.append("\x03")
+    return "".join(drained)
+
+
+def _ask_key_confirmation(expected: str) -> bool | None:
+    """One-key confirmation for interactive terminals.
+
+    Only a lone Y confirms. If more keys are already queued behind the
+    Y (the signature of pasted text), the whole burst is discarded and
+    the user is asked again, so a pasted "--yes" can never approve.
+    Trailing Enter presses (from typing "y" then Enter out of habit)
+    are tolerated. Returns None when no input is available at all.
+    """
+
+    if _flush_pending_console_input():
+        print(
+            "Note: text that was already typed or pasted was ignored, so "
+            "it cannot answer this prompt - please answer now."
+        )
+    verb = "approve" if expected.upper() == "APPROVE" else "confirm"
+    prompt = f"Press Y to {verb}, N or Ctrl+C to cancel: "
+    print(prompt, end="", flush=True)
+    junk = 0
+    hinted = False
+    last_was_enter = False
+    while True:
+        try:
+            key = _read_single_key()
+        except KeyboardInterrupt:
+            print()
+            print("Cancelled with Ctrl+C.")
+            return False
+        if key is None:
+            print()
+            return None
+        if key == "\x03":  # Ctrl+C delivered as a character
+            print()
+            print("Cancelled with Ctrl+C.")
+            return False
+        lowered = key.lower()
+        if lowered in ("y", "n"):
+            trailing = _drain_available_keys()
+            leftovers = [
+                char
+                for char in trailing
+                if char not in ("\r", "\n") and char.lower() != lowered
+            ]
+            if leftovers:
+                print()
+                print(
+                    "That looked like pasted text, so it was ignored. "
+                    "Please press a single key now."
+                )
+                print(prompt, end="", flush=True)
+                hinted = True
+                last_was_enter = False
+                continue
+            print(key)
+            return lowered == "y"
+        junk += 1
+        if junk > 1000:
+            print()
+            return False
+        is_enter = key in ("\r", "\n")
+        if is_enter and last_was_enter:
+            continue
+        if is_enter or not hinted:
+            print()
+            print("Just press Y or N - there is no need to press Enter.")
+            print(prompt, end="", flush=True)
+            hinted = True
+        last_was_enter = is_enter
+
+
+def _ask_word_confirmation(
+    expected: str,
+    *,
+    prompt: str,
+    case_sensitive: bool = False,
+    max_wrong: int = 3,
+    max_empty: int = 5,
+) -> bool | None:
+    """Ask until the user types ``expected``; never trust pre-typed text.
+
+    Returns True when confirmed, False when denied/cancelled (too many
+    wrong or empty answers, or Ctrl+C), and None when no input is
+    available at all (EOF). An empty line - typically the leftover
+    newline of a pasted command - re-asks instead of denying instantly,
+    and a wrong non-empty answer is shown back, so a pasted command is
+    visibly rejected instead of being silently swallowed. Only the
+    exact word ever confirms; asking again grants nothing.
+    """
+
+    if _flush_pending_console_input():
+        print(
+            "Note: text that was already typed or pasted was ignored, so "
+            "it cannot answer this prompt - please type your answer now."
+        )
+    wanted = expected if case_sensitive else expected.upper()
+    wrong = 0
+    empties = 0
+    while True:
+        try:
+            answer = input(prompt).strip()
+        except EOFError:
+            return None
+        except KeyboardInterrupt:
+            print()
+            print("Cancelled with Ctrl+C.")
+            return False
+        candidate = answer if case_sensitive else answer.upper()
+        if candidate == wanted:
+            return True
+        if not answer:
+            empties += 1
+            if empties > max_empty:
+                return False
+            print(
+                f"Empty answer - nothing confirmed yet. Type {expected} "
+                "to continue, or press Ctrl+C to cancel."
+            )
+            continue
+        wrong += 1
+        shown = answer if len(answer) <= 60 else answer[:57] + "..."
+        print(f"Received {shown!r} - that is not {expected}.")
+        if wrong >= max_wrong:
+            return False
+        print(
+            f"Type {expected} to continue, or press Ctrl+C to cancel. "
+            f"({max_wrong - wrong} attempt(s) left)"
+        )
+
+
+_APPROVE_PROMPT = "Type APPROVE and press Enter to continue (Ctrl+C cancels): "
+
+
+def _ask_confirmation(
+    expected: str,
+    *,
+    prompt: str,
+    case_sensitive: bool = False,
+) -> bool | None:
+    """Confirm interactively: one Y keypress on a terminal, else the word.
+
+    Line-based ``input()`` is unreliable under modern Windows terminals
+    (ConPTY can deliver phantom empty lines), so interactive terminals
+    use single-key reads; pipes and redirected stdin keep the typed
+    word, which scripts and tests already understand.
+    """
+
+    if _stdin_is_interactive():
+        return _ask_key_confirmation(expected)
+    return _ask_word_confirmation(
+        expected, prompt=prompt, case_sensitive=case_sensitive
+    )
+
+
+def _confirm_direct_write(
+    summary: str,
+    *,
+    preapproved: bool,
+    retry_hint: str | None = None,
+    heading: str = "Approval required for this exact Git write operation:",
+) -> bool:
+    print(heading)
+    print(f"  {summary}")
+    if preapproved:
+        print("Decision: APPROVED by --yes.")
+        return True
+    outcome = _ask_confirmation("APPROVE", prompt=_APPROVE_PROMPT)
+    if outcome is None:
+        print("No interactive input available; re-run with --yes to approve.")
+        if retry_hint:
+            print(f"  {retry_hint}")
+        return False
+    print(f"Decision: {'APPROVED' if outcome else 'DENIED'}")
+    if not outcome and retry_hint:
+        print("To approve this exact operation without a prompt, re-run:")
+        print(f"  {retry_hint}")
+    return outcome
+
+
+def _print_git_output(command: str, output: dict[str, Any]) -> None:
+    if command == "status":
+        print(f"Repository: {output['repository']}")
+        print(
+            f"Branch: {output['branch'] or '(detached HEAD)'} "
+            f"(ahead {output['ahead']}, behind {output['behind']})"
+        )
+        print(f"Clean: {output['clean']}")
+        for label in ("staged", "unstaged", "untracked"):
+            items = output.get(label) or []
+            print(f"{label.capitalize()}: {len(items)}")
+            for item in items:
+                print(f"  {item}")
+    elif command == "log":
+        print(f"Repository: {output['repository']}")
+        for commit in output.get("commits") or []:
+            print(
+                f"{commit['short_hash']} {commit['subject']} "
+                f"({commit['author']}, {commit['date']})"
+            )
+        print(f"Count: {output['count']}")
+    elif command == "diff":
+        print(output.get("stat") or "(no changes)")
+    elif command == "init":
+        print(f"Initialized Git repository: {output['repository']}")
+    elif command == "add":
+        print("Staged:")
+        for item in output.get("added") or []:
+            print(f"  {item}")
+    elif command == "commit":
+        print(f"Committed: {output['commit']} - {output['message']}")
+
+
+def _run_git_command(settings: Settings, args: argparse.Namespace) -> int:
+    if args.git_command is None:
+        print(
+            "Usage: pc-agent git status|log|diff|init|add|commit ...",
+            file=sys.stderr,
+        )
+        return 2
+    registry = build_default_registry()
+    context = _tool_context(settings)
+    command = args.git_command
+    if command == "status":
+        result = registry.invoke(
+            "git.status", {"repository": args.repo}, context
+        )
+    elif command == "log":
+        result = registry.invoke(
+            "git.log",
+            {"repository": args.repo, "max_count": args.count},
+            context,
+        )
+    elif command == "diff":
+        result = registry.invoke(
+            "git.diff_summary",
+            {"repository": args.repo, "staged": bool(args.staged)},
+            context,
+        )
+    elif command in {"init", "add", "commit"}:
+        if command == "init":
+            tool_id = "git.init"
+            arguments: dict[str, Any] = {"directory": args.directory}
+            summary = f"Initialize a Git repository in {args.directory}"
+            retry_hint = f"pc-agent git init {args.directory} --yes"
+        elif command == "add":
+            tool_id = "git.add"
+            arguments = {"repository": args.repo, "paths": list(args.paths)}
+            summary = f"Stage {len(args.paths)} path(s) in {args.repo}"
+            retry_hint = (
+                "pc-agent git add " + " ".join(args.paths)
+                + f" --repo {args.repo} --yes"
+            )
+        else:
+            tool_id = "git.commit"
+            arguments = {"repository": args.repo, "message": args.message}
+            summary = f"Commit staged changes in {args.repo}: {args.message}"
+            safe_message = args.message.replace(chr(34), chr(39))
+            retry_hint = (
+                f'pc-agent git commit -m "{safe_message}" '
+                f"--repo {args.repo} --yes"
+            )
+        if not _confirm_direct_write(
+            summary, preapproved=bool(args.yes), retry_hint=retry_hint
+        ):
+            print("Nothing was executed.")
+            return 4
+        result = registry.invoke(tool_id, arguments, context)
+    else:
+        return 2
+    if args.json:
+        print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+    elif result.success and result.output is not None:
+        _print_git_output(command, dict(result.output))
+    if not result.success:
+        print(f"Error: {result.error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _hint_quote(value: str) -> str:
+    cleaned = value.replace(chr(34), chr(39))
+    return f'"{cleaned}"' if " " in cleaned else cleaned
+
+
+def _print_browser_output(command: str, output: dict[str, Any]) -> None:
+    if command == "status":
+        print(f"Browser: {output['browser']} at {output['endpoint']}")
+        print(f"Pages: {output['page_count']}")
+        for target in output.get("targets") or []:
+            print(
+                f"  [{target['type']}] {target['title'] or '(untitled)'}"
+                f" - {target['url']} (id: {target['id']})"
+            )
+    elif command == "open":
+        print(f"Opened: {output['url']}")
+        print(f"Title: {output['title']}")
+        print(f"Target: {output['target_id']}")
+    elif command == "snapshot":
+        print(f"URL: {output['url']}")
+        print(f"Title: {output['title']}")
+        print(output.get("text") or "(no visible text)")
+        links = output.get("links") or []
+        if links:
+            print("Links:")
+            for link in links:
+                print(f"  {link['text'] or '(no text)'} -> {link['href']}")
+    elif command == "click":
+        print(f"Clicked <{output['tag']}> {output['text']!r}")
+        print(f"URL: {output['url']}")
+    elif command == "type":
+        print(
+            f"Typed into {output['selector']}; "
+            f"field value is now {output['value']!r}"
+        )
+    elif command == "screenshot":
+        print(
+            f"Screenshot saved: {output['output_path']} "
+            f"({output['size_bytes']} bytes)"
+        )
+        print(f"SHA-256: {output['sha256']}")
+
+
+def _run_browser_command(settings: Settings, args: argparse.Namespace) -> int:
+    if args.browser_command is None:
+        print(
+            "Usage: pc-agent browser status|open|snapshot|click|type|screenshot ...",
+            file=sys.stderr,
+        )
+        return 2
+    registry = build_default_registry()
+    command = args.browser_command
+    context = _tool_context(
+        settings,
+        allow_private_network=bool(getattr(args, "allow_private", False)),
+    )
+    target_id = getattr(args, "target_id", None)
+    if command == "status":
+        result = registry.invoke("browser.status", {}, context)
+    elif command == "snapshot":
+        arguments: dict[str, Any] = {}
+        if args.max_chars:
+            arguments["max_chars"] = args.max_chars
+        if target_id:
+            arguments["target_id"] = target_id
+        result = registry.invoke("browser.snapshot", arguments, context)
+    elif command == "screenshot":
+        arguments = {"output_path": args.output}
+        if target_id:
+            arguments["target_id"] = target_id
+        result = registry.invoke("browser.screenshot", arguments, context)
+    elif command in {"open", "click", "type"}:
+        if command == "open":
+            tool_id = "browser.open"
+            arguments = {"url": args.url}
+            if args.wait:
+                arguments["wait_seconds"] = args.wait
+            summary = f"Open {args.url} in the debug browser"
+            retry_hint = f"pc-agent browser open {_hint_quote(args.url)} --yes"
+        elif command == "click":
+            tool_id = "browser.click"
+            arguments = {}
+            if args.selector:
+                arguments["selector"] = args.selector
+                summary = f"Click selector {args.selector!r} in the debug browser"
+                retry_hint = (
+                    f"pc-agent browser click --selector {_hint_quote(args.selector)} --yes"
+                )
+            else:
+                arguments["text"] = args.text
+                summary = f"Click text {args.text!r} in the debug browser"
+                retry_hint = (
+                    f"pc-agent browser click --text {_hint_quote(args.text or '')} --yes"
+                )
+        else:
+            tool_id = "browser.type"
+            arguments = {"selector": args.selector, "text": args.text}
+            summary = f"Type into {args.selector!r} in the debug browser"
+            retry_hint = (
+                f"pc-agent browser type {_hint_quote(args.selector)} "
+                f"--text {_hint_quote(args.text)} --yes"
+            )
+        if not _confirm_direct_write(
+            summary,
+            preapproved=bool(args.yes),
+            retry_hint=retry_hint,
+            heading="Approval required for this exact browser action:",
+        ):
+            print("Nothing was executed.")
+            return 4
+        if target_id:
+            arguments["target_id"] = target_id
+        result = registry.invoke(tool_id, arguments, context)
+    else:
+        return 2
+    if args.json:
+        print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+    elif result.success and result.output is not None:
+        _print_browser_output(command, dict(result.output))
+    if not result.success:
+        print(f"Error: {result.error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _run_workflow_command(settings: Settings, args: argparse.Namespace) -> int:
     if args.workflow_command is None:
         print("Usage: pc-agent workflow list|show|run|delete ...", file=sys.stderr)
@@ -2016,7 +3067,11 @@ def _run_workflow_command(settings: Settings, args: argparse.Namespace) -> int:
         print(f"Verified successes: {content.get('success_count', 0)}")
         print(f"Last task: {content.get('last_task_id', '-')}")
         arguments = content.get("arguments")
-        if isinstance(arguments, dict):
+        steps = content.get("steps")
+        if isinstance(steps, list) and steps:
+            print(f"Multi-step plan: {len(steps)} step(s)")
+            print(json.dumps(steps, indent=2, sort_keys=True, default=str))
+        elif isinstance(arguments, dict):
             print("Stored arguments:")
             print(json.dumps(arguments, indent=2, sort_keys=True, default=str))
         else:
@@ -2317,9 +3372,266 @@ def _safe_web_output_path(settings: Settings, raw_output: str) -> Path:
     return resolved
 
 
+def _desktop_window_arguments(args: argparse.Namespace) -> dict[str, Any]:
+    values = {
+        "window_handle": getattr(args, "window_handle", None),
+        "window_title": getattr(args, "window_title", None),
+        "window_title_contains": getattr(args, "window_title_contains", None),
+        "window_class_name": getattr(args, "window_class", None),
+        "window_process_id": getattr(args, "window_process_id", None),
+    }
+    return {key: value for key, value in values.items() if value not in (None, "")}
+
+
+def _desktop_element_arguments(args: argparse.Namespace) -> dict[str, Any]:
+    values = {
+        "element_runtime_id": getattr(args, "element_runtime_id", None),
+        "element_name": getattr(args, "element_name", None),
+        "element_name_contains": getattr(args, "element_name_contains", None),
+        "element_automation_id": getattr(args, "element_automation_id", None),
+        "element_class_name": getattr(args, "element_class", None),
+        "element_control_type": getattr(args, "element_control_type", None),
+        "element_index": getattr(args, "element_index", None),
+    }
+    return {key: value for key, value in values.items() if value not in (None, "")}
+
+
+def _desktop_selector_hint(args: argparse.Namespace, *, include_element: bool = False) -> str:
+    flag_by_key = {
+        "window_handle": "--window-handle",
+        "window_title": "--window-title",
+        "window_title_contains": "--window-title-contains",
+        "window_class_name": "--window-class",
+        "window_process_id": "--window-process-id",
+        "element_runtime_id": "--element-runtime-id",
+        "element_name": "--element-name",
+        "element_name_contains": "--element-name-contains",
+        "element_automation_id": "--element-automation-id",
+        "element_class_name": "--element-class",
+        "element_control_type": "--element-control-type",
+        "element_index": "--element-index",
+    }
+    values = _desktop_window_arguments(args)
+    if include_element:
+        values.update(_desktop_element_arguments(args))
+    return " ".join(
+        f"{flag_by_key[key]} {_hint_quote(str(value))}" for key, value in values.items()
+    )
+
+
+def _format_desktop_window(window: dict[str, Any]) -> str:
+    bounds = window.get("bounds") or {}
+    foreground = " foreground" if window.get("is_foreground") else ""
+    minimized = " minimized" if window.get("is_minimized") else ""
+    return (
+        f"handle={window.get('handle')} pid={window.get('process_id')} "
+        f"{window.get('process_name') or '-'} "
+        f"[{window.get('class_name') or '-'}] {window.get('title') or '(untitled)'!r} "
+        f"bounds=({bounds.get('left')},{bounds.get('top')})-"
+        f"({bounds.get('right')},{bounds.get('bottom')}){foreground}{minimized}"
+    )
+
+
+def _print_desktop_automation_output(command: str, output: dict[str, Any]) -> None:
+    if command == "windows":
+        print(f"Desktop windows: {output['count']}")
+        for window in output.get("windows") or []:
+            print(f"  {_format_desktop_window(window)}")
+    elif command == "inspect":
+        print(f"Window: {_format_desktop_window(output['window'])}")
+        print(
+            f"Elements: {output['element_count']} shown; "
+            f"visited={output['visited_count']}; reported={output['reported_count']}; "
+            f"truncated={output['truncated']}"
+        )
+        for element in output.get("elements") or []:
+            patterns = ",".join(element.get("patterns") or []) or "none"
+            print(
+                f"  [{element['index']}] {element['control_type']} "
+                f"name={element['name']!r} automation_id={element['automation_id']!r} "
+                f"class={element['class_name']!r} runtime={element['runtime_id'] or '-'} "
+                f"patterns={patterns}"
+            )
+            if element.get("value") is not None:
+                print(f"      value={element['value']!r}")
+    elif command == "focus":
+        print(f"Focused: {_format_desktop_window(output['window'])}")
+    elif command == "click":
+        element = output["element"]
+        print(
+            f"Clicked {element['control_type']} {element['name']!r} "
+            f"via {output['action_method']}"
+        )
+        after = output.get("window_after")
+        print("Window after: closed" if after is None else f"Window after: {_format_desktop_window(after)}")
+    elif command == "type":
+        print(
+            f"Typed into {output['element']['control_type']} via {output['value_method']}; "
+            f"value is now {output['value']!r}"
+        )
+    elif command == "keys":
+        print(f"Sent {output['keys']} x{output['sent_count']}")
+        after = output.get("window_after")
+        print("Window after: closed" if after is None else f"Window after: {_format_desktop_window(after)}")
+    elif command == "screenshot":
+        print(
+            f"Desktop screenshot saved: {output['output_path']} "
+            f"({output['size_bytes']} bytes; {output['width']}x{output['height']})"
+        )
+        print(f"Target: {output['target']}")
+        print(f"SHA-256: {output['sha256']}")
+
+
+def _print_image_output(command: str, output: dict[str, Any]) -> None:
+    if command == "compare":
+        print(f"First: {output['first_path']} [{output['first_format']}] ")
+        print(
+            f"  {output['first_width']}x{output['first_height']} "
+            f"sha256={output['first_sha256']}"
+        )
+        print(f"Second: {output['second_path']} [{output['second_format']}] ")
+        print(
+            f"  {output['second_width']}x{output['second_height']} "
+            f"sha256={output['second_sha256']}"
+        )
+        print(
+            "Comparison: "
+            f"bytes={'identical' if output['byte_identical'] else 'different'}; "
+            f"pixels={'identical' if output['pixel_identical'] else 'different'}; "
+            f"same_dimensions={output['same_dimensions']}"
+        )
+        print(
+            f"Similarity: {output['similarity_percent']}% "
+            f"(mean absolute error {output['mean_absolute_error']}; "
+            f"average-hash distance {output['average_hash_distance']}/64)"
+        )
+        return
+
+    if output.get("source_path"):
+        print(f"Source: {output['source_path']} [{output['source_format']}]")
+    print(f"Image: {output['path']} [{output['format']} {output['mime_type']}]")
+    print(
+        f"Dimensions: {output['width']}x{output['height']} | mode: {output['mode']} | "
+        f"frames: {output['frame_count']} | alpha: {output['has_alpha']}"
+    )
+    print(f"Size: {output['size_bytes']} bytes | sha256: {output['sha256']}")
+    if output.get("operations"):
+        print(f"Operations: {', '.join(output['operations'])}")
+    if command == "inspect":
+        print(
+            f"Average color: {output['average_color']} | "
+            f"dominant: {', '.join(output.get('dominant_colors') or []) or '(none)'}"
+        )
+        print(f"Average hash: {output['average_hash']}")
+        return
+    if command == "analyze":
+        print(
+            f"Sent: {output['sent_size_bytes']} bytes as {output['sent_mime_type']} "
+            f"(converted/resized: {output['sent_converted_or_resized']})"
+        )
+        print(f"Provider: {output['provider']} | model: {output['model']}")
+        print("Answer:")
+        print(output["answer"])
+
+
+def _run_image_command(settings: Settings, args: argparse.Namespace) -> int:
+    if args.image_command is None:
+        print(
+            "Usage: pc-agent image inspect|convert|transform|compare|analyze ...",
+            file=sys.stderr,
+        )
+        return 2
+    _require_license(settings, FEATURE_DOCUMENTS)
+    if args.image_command == "analyze":
+        _require_license(settings, FEATURE_PROVIDERS)
+
+    registry = build_default_registry()
+    context = _tool_context(settings)
+    command = args.image_command
+    if command == "inspect":
+        tool_id = "image.inspect"
+        arguments: dict[str, Any] = {
+            "path": args.path,
+            "include_color_stats": bool(args.include_color_stats),
+        }
+    elif command == "convert":
+        tool_id = "image.convert"
+        arguments = {
+            "source": args.source,
+            "output": args.output,
+            "quality": args.quality,
+        }
+    elif command == "transform":
+        tool_id = "image.transform"
+        arguments = {"source": args.source, "output": args.output}
+        for field_name in (
+            "width",
+            "height",
+            "max_dimension",
+            "crop_left",
+            "crop_top",
+            "crop_right",
+            "crop_bottom",
+        ):
+            value = getattr(args, field_name)
+            if value is not None:
+                arguments[field_name] = value
+        if args.rotate_degrees:
+            arguments["rotate_degrees"] = args.rotate_degrees
+        if args.flip != "none":
+            arguments["flip"] = args.flip
+        if args.grayscale:
+            arguments["grayscale"] = True
+        arguments["quality"] = args.quality
+    elif command == "compare":
+        tool_id = "image.compare"
+        arguments = {"first": args.first, "second": args.second}
+    elif command == "analyze":
+        route = " -> ".join(build_model_router(settings).provider_names)
+        summary = (
+            f"Send workspace image {args.path!r} and exact question "
+            f"{args.question!r} to the configured provider route ({route}). "
+            "External providers will receive the image bytes; the offline mock cannot analyze it."
+        )
+        retry_hint = (
+            f"pc-agent image analyze {_hint_quote(args.path)} "
+            f"--question {_hint_quote(args.question)} "
+            f"--max-output-tokens {args.max_output_tokens} --yes"
+        )
+        if not _confirm_direct_write(
+            summary,
+            preapproved=bool(args.yes),
+            retry_hint=retry_hint,
+            heading="Approval required to send this exact image to a vision provider:",
+        ):
+            print("Nothing was executed.")
+            return 4
+        tool_id = "image.analyze"
+        arguments = {
+            "path": args.path,
+            "question": args.question,
+            "max_output_tokens": args.max_output_tokens,
+        }
+    else:  # pragma: no cover - argparse limits choices.
+        return 2
+
+    result = registry.invoke(tool_id, arguments, context)
+    if args.json:
+        print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+    elif result.success and result.output is not None:
+        _print_image_output(command, dict(result.output))
+    if not result.success:
+        print(f"Error: {result.error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _run_desktop_command(settings: Settings, args: argparse.Namespace) -> int:
     if args.desktop_command is None:
-        print("Usage: pc-agent desktop info|open|open-url ...", file=sys.stderr)
+        print(
+            "Usage: pc-agent desktop info|open|open-url|windows|inspect|focus|click|type|keys|screenshot ...",
+            file=sys.stderr,
+        )
         return 2
     _require_license(settings, FEATURE_DESKTOP)
 
@@ -2336,24 +3648,113 @@ def _run_desktop_command(settings: Settings, args: argparse.Namespace) -> int:
             _print_direct_tool_output(result.output)
         return 0
 
-    context = _tool_context(settings, allow_desktop_open=True)
-    if args.desktop_command == "open":
-        result = registry.invoke(
-            "desktop.open_path", {"path": args.path}, context
+    if args.desktop_command in {"open", "open-url"}:
+        context = _tool_context(settings, allow_desktop_open=True)
+        if args.desktop_command == "open":
+            result = registry.invoke(
+                "desktop.open_path", {"path": args.path}, context
+            )
+        else:
+            result = registry.invoke(
+                "desktop.open_url", {"url": args.url}, context
+            )
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        _print_direct_tool_output(result.output)
+        return 0
+
+    command = args.desktop_command
+    context = _tool_context(settings)
+    if command == "windows":
+        arguments: dict[str, Any] = {
+            "max_windows": args.max_windows,
+            "include_untitled": bool(args.include_untitled),
+        }
+        tool_id = "desktop.windows"
+    elif command == "inspect":
+        arguments = _desktop_window_arguments(args)
+        arguments.update(
+            {
+                "max_elements": args.max_elements,
+                "include_offscreen": bool(args.include_offscreen),
+            }
         )
-    elif args.desktop_command == "open-url":
-        result = registry.invoke(
-            "desktop.open_url", {"url": args.url}, context
-        )
+        tool_id = "desktop.window_inspect"
+    elif command == "screenshot":
+        arguments = {"output_path": args.output, **_desktop_window_arguments(args)}
+        tool_id = "desktop.screenshot"
+    elif command in {"focus", "click", "type", "keys"}:
+        arguments = _desktop_window_arguments(args)
+        include_element = command in {"click", "type"}
+        selector_hint = _desktop_selector_hint(args, include_element=include_element)
+        if command == "focus":
+            tool_id = "desktop.window_focus"
+            summary = f"Focus the desktop window selected by: {selector_hint or '(no selector)'}"
+            retry_hint = f"pc-agent desktop focus {selector_hint} --yes".strip()
+        elif command == "click":
+            arguments.update(_desktop_element_arguments(args))
+            tool_id = "desktop.window_click"
+            summary = f"Click the desktop UIA element selected by: {selector_hint or '(no selector)'}"
+            retry_hint = f"pc-agent desktop click {selector_hint} --yes".strip()
+        elif command == "type":
+            arguments.update(_desktop_element_arguments(args))
+            arguments["text"] = args.text
+            tool_id = "desktop.window_type"
+            summary = (
+                f"Replace the selected desktop element value with exact text "
+                f"{args.text!r}; selectors: {selector_hint or '(no selector)'}"
+            )
+            retry_hint = (
+                f"pc-agent desktop type {selector_hint} --text {_hint_quote(args.text)} --yes"
+            ).strip()
+        else:
+            arguments.update({"keys": args.keys, "repeat": args.repeat})
+            tool_id = "desktop.send_keys"
+            summary = (
+                f"Send exact key chord {args.keys!r} x{args.repeat} to the desktop "
+                f"window selected by: {selector_hint or '(no selector)'}"
+            )
+            retry_hint = (
+                f"pc-agent desktop keys {selector_hint} {_hint_quote(args.keys)} "
+                f"--repeat {args.repeat} --yes"
+            ).strip()
+        if not _confirm_direct_write(
+            summary,
+            preapproved=bool(args.yes),
+            retry_hint=retry_hint,
+            heading="Approval required for this exact desktop action:",
+        ):
+            print("Nothing was executed.")
+            return 4
+        result = registry.invoke(tool_id, arguments, context)
+        if args.json:
+            print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+        elif result.success and result.output is not None:
+            _print_desktop_automation_output(command, dict(result.output))
+        if not result.success:
+            print(f"Error: {result.error}", file=sys.stderr)
+            return 1
+        return 0
     else:
         return 2
-    if not result.success or result.output is None:
-        return _report_tool_failure(result)
-    _print_direct_tool_output(result.output)
+
+    result = registry.invoke(tool_id, arguments, context)
+    if args.json:
+        print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+    elif result.success and result.output is not None:
+        _print_desktop_automation_output(command, dict(result.output))
+    if not result.success:
+        print(f"Error: {result.error}", file=sys.stderr)
+        return 1
     return 0
 
 
 def _planner_options(args: argparse.Namespace) -> PlannerOptions:
+    raw_command = getattr(args, "run_command_text", None)
+    try:
+        command_parts = shlex.split(raw_command) if raw_command else []
+    except ValueError as exc:
+        raise PcAgentError(f"--command could not be parsed: {exc}") from exc
     return PlannerOptions(
         input_folders=tuple(getattr(args, "input_folder", []) or ()),
         input_files=tuple(getattr(args, "input_file", []) or ()),
@@ -2366,33 +3767,116 @@ def _planner_options(args: argparse.Namespace) -> PlannerOptions:
         replace_text=getattr(args, "replace", None),
         cell_reference=getattr(args, "cell", None),
         cell_value=getattr(args, "value", None),
+        command_executable=command_parts[0] if command_parts else None,
+        command_arguments=tuple(command_parts[1:]),
+        command_timeout=getattr(args, "command_timeout", None),
+        browser_url=getattr(args, "browser_open", None),
+        browser_click_selector=getattr(args, "browser_click_selector", None),
+        browser_click_text=getattr(args, "browser_click_text", None),
+        browser_type_selector=getattr(args, "browser_type_selector", None),
+        browser_type_text=getattr(args, "browser_type_text", None),
+        desktop_window_title_contains=getattr(
+            args, "desktop_window_title_contains", None
+        ),
+        desktop_window_handle=getattr(args, "desktop_window_handle", None),
+        desktop_click_name=getattr(args, "desktop_click_name", None),
+        desktop_click_automation_id=getattr(
+            args, "desktop_click_automation_id", None
+        ),
+        desktop_type_name=getattr(args, "desktop_type_name", None),
+        desktop_type_automation_id=getattr(
+            args, "desktop_type_automation_id", None
+        ),
+        desktop_type_text=getattr(args, "desktop_type_text", None),
+        desktop_keys=getattr(args, "desktop_keys", None),
+        image_width=getattr(args, "image_width", None),
+        image_height=getattr(args, "image_height", None),
+        image_max_dimension=getattr(args, "image_max_dimension", None),
+        image_crop_left=getattr(args, "image_crop_left", None),
+        image_crop_top=getattr(args, "image_crop_top", None),
+        image_crop_right=getattr(args, "image_crop_right", None),
+        image_crop_bottom=getattr(args, "image_crop_bottom", None),
+        image_rotate_degrees=getattr(args, "image_rotate_degrees", None),
+        image_flip=getattr(args, "image_flip", None),
+        image_grayscale=bool(getattr(args, "image_grayscale", False)),
+        image_quality=getattr(args, "image_quality", None),
+        image_question=getattr(args, "image_question", None),
+        image_compare_path=getattr(args, "image_compare_path", None),
     )
 
 
 def _approval_callback(*, preapproved: bool):
     def decide(request: ApprovalRequest) -> bool:
-        print("Approval required for this exact, read-only external scope:")
-        print(f"Task: {request.task_id}")
-        print(f"Plan: {request.plan.summary}")
-        print("Allowed only for this run (list/read; no write or delete):")
-        for root in request.read_roots:
-            print(f"  {root}")
-        output_path = request.plan.arguments.get("output_path")
-        if output_path:
-            print(f"Output stays inside the workspace: {output_path}")
+        if request.action in {
+            "run_command",
+            "browser_action",
+            "desktop_automation_action",
+            "vision_analysis",
+        }:
+            headings = {
+                "run_command": "Approval required to run this exact command (no shell):",
+                "browser_action": "Approval required for this exact action in your debug browser:",
+                "desktop_automation_action": "Approval required for this exact action in a Windows application:",
+                "vision_analysis": "Approval required to send this exact image to a vision provider:",
+            }
+            print(headings[request.action])
+            print(f"Task: {request.task_id}")
+            print(f"Plan: {request.plan.summary}")
+            print(f"Tool: {request.plan.tool_id}")
+            print("Arguments:")
+            print(
+                json.dumps(
+                    dict(request.plan.arguments),
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+            details = {
+                "run_command": (
+                    "The working directory stays inside the workspace; "
+                    "time and output are bounded."
+                ),
+                "browser_action": (
+                    "This acts only in the browser session you started "
+                    "with a debugging port."
+                ),
+                "desktop_automation_action": (
+                    "This acts only on the exact selected application window "
+                    "through Windows UI Automation."
+                ),
+                "vision_analysis": (
+                    "Only this exact image/question is sent to the configured "
+                    "provider route; external providers receive the image bytes."
+                ),
+            }
+            print(details[request.action])
+        else:
+            print("Approval required for this exact, read-only external scope:")
+            print(f"Task: {request.task_id}")
+            print(f"Plan: {request.plan.summary}")
+            print("Allowed only for this run (list/read; no write or delete):")
+            for root in request.read_roots:
+                print(f"  {root}")
+            output_path = request.plan.arguments.get("output_path")
+            if output_path:
+                print(f"Output stays inside the workspace: {output_path}")
         if preapproved:
             print("Decision: APPROVED by --yes for the scope above.")
             return True
-        try:
-            answer = input("Type APPROVE to continue, anything else to cancel: ")
-        except EOFError as exc:
+        outcome = _ask_confirmation("APPROVE", prompt=_APPROVE_PROMPT)
+        if outcome is None:
             raise ApprovalUnavailableError(
                 "No interactive approval input is available. The task remains "
                 "waiting_for_approval; run it again in an interactive terminal or with --yes."
-            ) from exc
-        approved = answer.strip().upper() == "APPROVE"
-        print(f"Decision: {'APPROVED' if approved else 'DENIED'}")
-        return approved
+            )
+        print(f"Decision: {'APPROVED' if outcome else 'DENIED'}")
+        if not outcome:
+            print(
+                "Tip: only the word APPROVE (typed after the prompt) "
+                "approves; or re-run the same command with --yes."
+            )
+        return outcome
 
     return decide
 
@@ -2513,6 +3997,22 @@ def _report_to_dict(report: ExecutionReport) -> dict[str, Any]:
         "workflow_key": report.workflow_key,
         "workflow_success_count": report.workflow_success_count,
         "workflow_reused": report.workflow_reused,
+        "plan_summary": report.plan_summary,
+        "steps_total": report.steps_total,
+        "steps": [
+            {
+                "step": step.index + 1,
+                "tool_id": step.tool_id,
+                "summary": step.summary,
+                "status": step.status,
+                "verification_valid": step.verification_valid,
+                "verification_message": step.verification_message,
+                "error": step.error,
+                "tool_result": _tool_result_to_dict(step.tool_result),
+                "resumed_from_checkpoint": step.resumed_from_checkpoint,
+            }
+            for step in report.step_reports
+        ],
     }
 
 
@@ -2535,7 +4035,16 @@ def _print_execution_report(report: ExecutionReport, *, as_json: bool) -> int:
     else:
         print(f"Task: {report.task.id}")
         print(f"Status: {report.task.status.value}")
-        if report.plan:
+        if report.step_reports:
+            print(f"Plan: {report.plan_summary}")
+            if report.plan:
+                print(f"Planner: {report.plan.planner}")
+            for step in report.step_reports:
+                print(
+                    f"Step {step.index + 1}/{report.steps_total} "
+                    f"[{step.status}] {step.tool_id} - {step.summary}"
+                )
+        elif report.plan:
             print(f"Plan: {report.plan.summary}")
             print(f"Planner: {report.plan.planner}")
             print(f"Tool: {report.plan.tool_id}")
@@ -2777,6 +4286,177 @@ def _print_tool_output(report: ExecutionReport) -> None:
         print(f"Pages: {output['pages']}")
 
 
+def _credential_store(settings: Settings):
+    return build_credential_store(settings.credential_store)
+
+
+def _settings_api_key(settings: Settings, provider: str) -> str | None:
+    canonical = canonical_credential_provider(provider)
+    return {
+        "gemini": settings.gemini_api_key,
+        "openrouter": settings.openrouter_api_key,
+        "openai": settings.openai_api_key,
+        "openai-compatible": settings.openai_compatible_api_key,
+        "ollama": settings.ollama_api_key,
+        "anthropic": settings.anthropic_api_key,
+    }[canonical]
+
+
+def _credential_status_text(settings: Settings) -> str:
+    try:
+        return _credential_store(settings).status().summary()
+    except PcAgentError as exc:
+        return (
+            f"mode={settings.credential_store}; "
+            f"backend={settings.credential_store_backend}; "
+            f"available=no; stored=unknown; {exc}"
+        )
+
+
+def _run_credentials_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = args.credentials_command
+    if command is None:
+        print(
+            "Usage: pc-agent credentials status|list|set|delete|migrate ...",
+            file=sys.stderr,
+        )
+        return 2
+
+    store = _credential_store(settings)
+    sources = dict(settings.credential_sources)
+
+    if command in {"status", "list"}:
+        status = store.status()
+        effective_sources = {
+            provider: sources.get(provider, "missing")
+            for provider in SUPPORTED_CREDENTIAL_PROVIDERS
+        }
+        payload = {
+            "mode": status.mode,
+            "backend": status.backend,
+            "available": status.available,
+            "detail": status.detail,
+            "stored_providers": list(status.stored_providers),
+            "effective_sources": effective_sources,
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+            return 0
+        print(f"Credential store: {status.summary()}")
+        if command == "status":
+            print(
+                "Effective credential sources: "
+                + ", ".join(
+                    f"{provider}={source}"
+                    for provider, source in effective_sources.items()
+                    if source != "missing"
+                )
+                if any(source != "missing" for source in effective_sources.values())
+                else "Effective credential sources: none"
+            )
+        else:
+            for provider in SUPPORTED_CREDENTIAL_PROVIDERS:
+                print(
+                    f"{provider}: stored="
+                    f"{'yes' if provider in status.stored_providers else 'no'}; "
+                    f"effective={effective_sources[provider]}"
+                )
+        print(
+            "Environment/.env values take precedence; credential values "
+            "were not printed."
+        )
+        return 0
+
+    if command == "set":
+        provider = canonical_credential_provider(args.provider)
+        if store.contains(provider):
+            print(f"A stored {provider} API key already exists and will be replaced.")
+        try:
+            first = getpass.getpass(f"Enter new {provider} API key (hidden): ")
+            second = getpass.getpass(f"Re-enter {provider} API key (hidden): ")
+        except (EOFError, KeyboardInterrupt):
+            print("Credential entry cancelled; nothing was stored.")
+            return 4
+        if first != second:
+            print("The two API key entries do not match; nothing was stored.", file=sys.stderr)
+            return 1
+        store.set_api_key(provider, first)
+        print(f"Stored {provider} API key in {store.backend_name}.")
+        if sources.get(provider) == "environment":
+            print(
+                "Note: an environment/.env key for this provider still "
+                "takes precedence until you remove it."
+            )
+        print("The credential value was not printed.")
+        return 0
+
+    if command == "delete":
+        provider = canonical_credential_provider(args.provider)
+        if not store.contains(provider):
+            print(f"No stored {provider} API key was found; nothing was deleted.")
+            return 0
+        if not _confirm_direct_write(
+            f"Delete the stored {provider} API key from {store.backend_name}",
+            preapproved=bool(args.yes),
+            retry_hint=f"pc-agent credentials delete {provider} --yes",
+            heading="Approval required to delete this stored API key:",
+        ):
+            print("Nothing was deleted.")
+            return 4
+        deleted = store.delete_api_key(provider)
+        print(
+            f"Deleted stored {provider} API key."
+            if deleted
+            else f"No stored {provider} API key was found; nothing was deleted."
+        )
+        return 0
+
+    if command == "migrate":
+        selected = (
+            (canonical_credential_provider(args.provider),)
+            if args.provider
+            else SUPPORTED_CREDENTIAL_PROVIDERS
+        )
+        candidates = tuple(
+            provider
+            for provider in selected
+            if sources.get(provider) == "environment"
+            and _settings_api_key(settings, provider)
+        )
+        if not candidates:
+            print(
+                "No environment/.env provider API keys are available to migrate."
+            )
+            return 0
+        retry_hint = "pc-agent credentials migrate"
+        if args.provider:
+            retry_hint += f" {selected[0]}"
+        retry_hint += " --yes"
+        if not _confirm_direct_write(
+            "Copy environment/.env API keys for "
+            + ", ".join(candidates)
+            + f" into {store.backend_name}",
+            preapproved=bool(args.yes),
+            retry_hint=retry_hint,
+            heading="Approval required to copy these API keys into secure OS storage:",
+        ):
+            print("Nothing was migrated.")
+            return 4
+        for provider in candidates:
+            secret = _settings_api_key(settings, provider)
+            assert secret is not None  # checked when building candidates
+            store.set_api_key(provider, secret)
+            print(f"Migrated {provider} API key.")
+        print(
+            "Your .env was not changed. After verifying the provider route, "
+            "remove the migrated *_API_KEY lines from .env yourself."
+        )
+        print("Credential values were not printed.")
+        return 0
+
+    return 2
+
+
 def _run_providers_command(settings: Settings, args: argparse.Namespace) -> int:
     if args.providers_command != "list":
         print("Usage: pc-agent providers list", file=sys.stderr)
@@ -2785,9 +4465,12 @@ def _run_providers_command(settings: Settings, args: argparse.Namespace) -> int:
         route = "in-route" if status.in_route else "not-in-route"
         configured = "configured" if status.configured else "not-configured"
         implemented = "adapter" if status.implemented else "reserved"
+        source = dict(settings.credential_sources).get(status.name, "missing")
+        if status.name == "mock":
+            source = "not-applicable"
         print(
             f"{status.name} [{route}; {configured}; {implemented}] "
-            f"model={status.model} - {status.detail}"
+            f"model={status.model} source={source} - {status.detail}"
         )
     route = build_model_router(settings).provider_names
     print(f"Fallback route: {' -> '.join(route)}")

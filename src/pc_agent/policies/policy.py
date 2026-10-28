@@ -26,6 +26,8 @@ class Action(str, enum.Enum):
     INSTALL_SOFTWARE = "install_software"
     NETWORK_ACCESS = "network_access"
     DESKTOP_OPEN = "desktop_open"
+    DESKTOP_AUTOMATION = "desktop_automation"
+    VISION_ANALYSIS = "vision_analysis"
     EXTERNAL_SEND = "external_send"
     PRIVILEGED_CHANGE = "privileged_change"
     ACCESS_CREDENTIALS = "access_credentials"
@@ -89,6 +91,9 @@ class PolicyEngine:
         network_access_allowed: bool = False,
         allow_private_network: bool = False,
         desktop_open_allowed: bool = False,
+        desktop_automation_allowed: bool = False,
+        vision_allowed: bool = False,
+        subprocess_allowed: bool = False,
     ) -> None:
         self._workspace_dir = workspace_dir.expanduser().resolve()
         resolved_roots = {
@@ -99,6 +104,9 @@ class PolicyEngine:
         self._network_access_allowed = network_access_allowed
         self._allow_private_network = allow_private_network
         self._desktop_open_allowed = desktop_open_allowed
+        self._desktop_automation_allowed = desktop_automation_allowed
+        self._vision_allowed = vision_allowed
+        self._subprocess_allowed = subprocess_allowed
 
     @property
     def workspace_dir(self) -> Path:
@@ -119,6 +127,18 @@ class PolicyEngine:
     @property
     def desktop_open_allowed(self) -> bool:
         return self._desktop_open_allowed
+
+    @property
+    def desktop_automation_allowed(self) -> bool:
+        return self._desktop_automation_allowed
+
+    @property
+    def vision_allowed(self) -> bool:
+        return self._vision_allowed
+
+    @property
+    def subprocess_allowed(self) -> bool:
+        return self._subprocess_allowed
 
     def evaluate(self, request: ActionRequest) -> PolicyDecision:
         action = request.action
@@ -167,7 +187,56 @@ class PolicyEngine:
                 "Use the dedicated desktop command so the exact target can be approved.",
             )
 
-        if action in {Action.RUN_SHELL, Action.INSTALL_SOFTWARE}:
+        if action is Action.DESKTOP_AUTOMATION:
+            if self._desktop_automation_allowed:
+                return PolicyDecision(
+                    PolicyOutcome.ALLOW,
+                    RiskLevel.HIGH,
+                    "Windows desktop automation was explicitly enabled for "
+                    "reviewed built-in tools; exact desktop actions still "
+                    "require their orchestrator/direct approval.",
+                )
+            return _approval(
+                RiskLevel.HIGH,
+                "Set PC_AGENT_ALLOW_DESKTOP_AUTOMATION=1 in .env to enable "
+                "reviewed Windows UI Automation tools.",
+            )
+
+        if action is Action.VISION_ANALYSIS:
+            if self._vision_allowed:
+                return PolicyDecision(
+                    PolicyOutcome.ALLOW,
+                    RiskLevel.HIGH,
+                    "Provider vision was explicitly enabled for reviewed "
+                    "built-in tools; sending one exact image still requires "
+                    "its orchestrator/direct approval.",
+                )
+            return _approval(
+                RiskLevel.HIGH,
+                "Set PC_AGENT_ALLOW_VISION=1 in .env to enable sending one "
+                "selected workspace image to a vision-capable provider.",
+            )
+
+        if action is Action.RUN_SHELL:
+            if not self._subprocess_allowed:
+                return _approval(
+                    RiskLevel.HIGH,
+                    "Running commands or installing software needs approval.",
+                )
+            if request.target_path is None or not is_within(
+                self._workspace_dir, request.target_path
+            ):
+                return _deny(
+                    RiskLevel.CRITICAL,
+                    "Commands may only run inside the workspace.",
+                )
+            return PolicyDecision(
+                PolicyOutcome.ALLOW,
+                RiskLevel.HIGH,
+                "Approved command execution is enabled and the working "
+                "directory is inside the workspace.",
+            )
+        if action is Action.INSTALL_SOFTWARE:
             return _approval(
                 RiskLevel.HIGH, "Running commands or installing software needs approval."
             )

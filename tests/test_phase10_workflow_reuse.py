@@ -255,7 +255,7 @@ def test_cli_workflow_list_show_run_delete(
     assert "none" in capsys.readouterr().out
 
     assert main([*root, "doctor"]) == 0
-    assert "PHASE 10 Workflow Reuse" in capsys.readouterr().out
+    assert "PHASE 16.1 Credential Manager Hotfix" in capsys.readouterr().out
 
 
 def test_gui_controller_workflow_reuse(tmp_path: Path) -> None:

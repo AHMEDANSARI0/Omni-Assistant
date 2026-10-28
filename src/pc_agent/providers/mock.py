@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from ..errors import ProviderError
 from .base import CompletionRequest, CompletionResponse
 
 
@@ -11,12 +12,18 @@ class MockProvider:
     name = "mock"
     model = "offline-mock"
     implemented = True
+    supports_vision = False
 
     @property
     def configured(self) -> bool:
         return True
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
+        if request.has_images:
+            raise ProviderError(
+                "The offline mock cannot inspect images. Configure a "
+                "vision-capable provider in the configured route."
+            )
         prompt = request.last_user_message.strip()
         if request.json_mode:
             content = json.dumps(

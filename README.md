@@ -5,7 +5,7 @@ secure, lightweight, extensible agent that plans and executes user tasks with
 explicit permissions, verifies results deterministically, and reports honestly
 what it did.
 
-## Current status: PHASE 10 - Verified workflow reuse (this build)
+## Current status: PHASE 16.1 - Windows Credential Manager hotfix (this build)
 
 | Status | Capability |
 |---|---|
@@ -22,15 +22,27 @@ what it did.
 | Implemented + tested (Phase 8) | General workspace file operations — `files.copy/move/rename/organize/search` (23 built-ins) with a dedicated `MOVE_FILE` policy action, no-overwrite semantics, hash-verified transfers, conflict-skipping folder organization, bounded name/content search that never reads credential-like contents, deterministic planner intents, direct `pc-agent files` CLI, and a GUI Documents > Files panel; copy collisions heal to a fresh `-recovered` output |
 | Implemented + tested (Phase 9) | Deeper Office — `pdf.extract_pages`/`pdf.split`, run-safe `office.docx_replace_text`, `office.docx_append_paragraphs`, `office.xlsx_set_cells` with deterministic formula calculation (arithmetic + SUM/AVERAGE/MIN/MAX/COUNT/PRODUCT/ABS/ROUND) and `office.xlsx_verify_formulas` (29 built-ins); deterministic planner intents with `--pages/--find/--replace/--cell/--value`, direct `pdf extract|split` + `office docx-*/xlsx-*` CLI, and GUI Documents panel controls |
 | Implemented + tested (Phase 10) | Verified workflow reuse — workflow records now store the exact validated arguments; `pc-agent workflow list|show|run|delete` re-runs a verified plan as a new task after live revalidation (approvals never inherited), the planner falls back to a verified workflow when it cannot plan an instruction, legacy Phase 7 records resolve through their last task's stored plan, and the GUI Tasks tab can run a workflow |
-| Planned next phases | Multi-step planning, approved subprocess/Git workflows, browser automation, Windows app/UI automation, images, secure OS credential storage |
-| Later | Full core self-repair with isolated staging/rollback, secure OS credential storage, production hardening, macOS/Linux |
+| Implemented + tested (Phase 11) | Multi-step plans (up to 5 chained tools via 'then', deterministic or AI `steps` arrays) with run-time output bindings, per-step approvals/criteria/checkpoints/bounded recovery, resume-from-first-unfinished-step, and multi-step workflow recording + replay |
+| Implemented + tested (Phase 12) | Approved subprocess & Git — `git.status/log/diff_summary/init/add/commit` + `commands.run` (36 built-ins) behind the default-off `PC_AGENT_ALLOW_SUBPROCESS` gate; allow-listed bare program names only, argv-array execution (never a shell; Windows npm-style shims go through a validated `cmd` bridge), scrubbed environment, hard timeout with process kill, capped output; commands and Git writes always need a fresh per-argument approval and are never auto-retried; deterministic planner intents, AI limited to read-only Git, direct `pc-agent git` CLI, GUI Git Status button |
+| Hotfix (Phase 12.1-12.3) | CLI confirmations on interactive terminals now take a single `Y` keypress (no Enter): text typed/pasted before the prompt is discarded, pasted bursts (even `--yes`) can never answer, Enter presses just show a hint, Ctrl+C cancels cleanly; pipes keep the typed-word prompt with re-asking; a denied Git write prints the exact command to re-run with `--yes` |
+| Implemented + tested (Phase 13) | Browser automation over CDP — `browser.status/open/snapshot/click/type/screenshot` (42 built-ins) against a user-started Edge/Chrome debug session behind the default-off `PC_AGENT_ALLOW_BROWSER` gate; standard-library WebSocket/CDP client; fixed JS templates (values only via JSON encoding); actions need fresh per-argument approvals and are never auto-retried; typing refuses password/file fields and is verified by read-back; screenshots are hash-verified workspace PNGs; AI limited to read-only browser tools; direct `pc-agent browser` CLI, GUI Web-tab read buttons, live-verified against Chromium 131 |
+| Hotfix (Phase 13.1) | Gemini provider could never route (config lowercases provider names but the router factory compared `"Gemini"`), so it showed as an unknown/reserved slot; fixed to the canonical lowercase name end-to-end. Three CLI tests that relied on the working directory are now rooted at a temp dir, so a developer's real `.env` (with provider keys) can no longer leak into offline tests |
+| Implemented + tested (Phase 14) | Windows desktop UI Automation - `desktop.windows/window_inspect/window_focus/window_click/window_type/send_keys/screenshot` (49 built-ins) through Win32 + Microsoft UI Automation; default-off `PC_AGENT_ALLOW_DESKTOP_AUTOMATION` gate; exact window/element selectors, fresh focus/click/type/key approvals, password refusal, typed read-back, bounded chords, verified workspace PNGs, no automatic retries; AI limited to read-only desktop tools; direct `pc-agent desktop` CLI and GUI Desktop-tab controls. Live-confirmed on the target Windows PC for window listing and Notepad UIA inspection |
+| Implemented + tested (Phase 15) | Local image tools + provider vision - `image.inspect/convert/transform/compare/analyze` (54 built-ins). Pillow inspection/conversion/cropping/resizing/thumbnails/rotation/flips/grayscale/comparison stay on-PC, are size/pixel bounded and never overwrite. `image.analyze` sends one exact workspace image/question to a vision-capable Gemini/OpenRouter/OpenAI-compatible/Ollama route only when `PC_AGENT_ALLOW_VISION=1` and that exact send is approved; the offline mock refuses images; AI is limited to local inspect/compare; vision is never auto-retried. Direct `pc-agent image` CLI and a GUI Images tab are included |
+| Implemented + tested (Phase 16) | Windows Credential Manager storage for provider API keys. Settings resolve environment/`.env` first, then one generic Windows credential per provider through the native `CredReadW`/`CredWriteW`/`CredDeleteW` APIs; `pc-agent credentials status|list|set|delete|migrate` never prints values, `set` uses a hidden prompt and no key argument, and there is no credential tool or AI/task access. Doctor and GUI show only backend/stored-provider/source status. Existing `.env` installs keep working unchanged; test runs are isolated from the real OS vault |
+| Hotfix (Phase 16.1) | Real-Windows test fixes: an injected/simulated Win32 credential backend's `ERROR_NOT_FOUND` is no longer masked by `ctypes.get_last_error()` returning 0, and the live GUI construction test now expects the Phase 15 Images tab (8 notebook tabs). Production Credential Manager calls through the real `advapi32` handle are unchanged |
+| Planned next phases | Core self-repair with isolated staging/rollback, token/task budgets |
+| Later | Production hardening/installer, macOS/Linux |
 
 This build **does not** claim arbitrary computer control, arbitrary generated
-programs, full browser automation, external-app GUI clicking/typing, or
-autonomous repair of the core runtime. Phase 5's GUI is this application's
-own window; it does not automate other applications. Phase 4 web fetching reads one exact page as text without
-executing scripts, and desktop support is system information plus opening one
-exact workspace item or URL. Self-healing remains limited to known safe
+programs, full browser automation, password/coordinate UI control, AI
+image generation/editing, or autonomous repair of the core runtime. Phase 5's GUI is this application's
+own window. Phase 14 desktop automation is narrower than general computer
+control: only opt-in, exact UIA window/element selectors on already-open,
+same-session Windows apps, with fresh approvals for driving actions. Phase 4
+web fetching reads one exact page as text without executing scripts, and the
+older desktop tools still only report system information or open one exact
+workspace item/URL. Self-healing remains limited to known safe
 failure patterns in the orchestrated local allow-list. Dynamic tools are
 invoked explicitly and remain JSON-in/JSON-out pure computation with no file,
 network, shell or desktop permission. Phase 6 licensing is offline and local:
@@ -41,12 +53,13 @@ server, or cloud account yet.
 
 New installs apply the patchers in order: 1A, 1B, 1C, Phase 2, Phase 3,
 Phase 4, the Phase 4.1 hotfix, Phase 5, Phase 6, Phase 7, Phase 8, Phase 9,
-then Phase 10. An existing Phase 9 (0.11.0) install only needs the Phase 10
-patcher:
+Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15, Phase 16,
+then the Phase 16.1 hotfix. The Phase 16.1 patcher is cumulative: it
+upgrades an existing Phase 9 (0.11.0) through Phase 16 (0.18.0) install:
 
 ```powershell
 cd D:\omni-assistant   # your project folder
-node PHASE_10_WORKFLOW_REUSE.mjs
+node PHASE_16_1_CREDENTIAL_MANAGER_HOTFIX.mjs
 
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -55,18 +68,21 @@ python -m ruff check
 pc-agent --version
 pc-agent doctor
 pc-agent demo pdf
-pc-agent run "Merge PDFs from Folder A and Folder B"
-pc-agent run "Extract pages 1-2 from merged.pdf"
+pc-agent run "Merge PDFs from Folder A and Folder B then extract pages 1-2"
 pc-agent workflow list
-pc-agent workflow run latest
 pc-agent gui --check
 ```
 
-Phase 10 adds no runtime dependency and no database migration (schema
-stays **v6**). Reinstalling refreshes the editable package metadata to
-0.12.0.
-License enforcement still defaults to `off`. See `docs/phase10.md` for
-verified workflow reuse and `docs/phase9.md` for the deeper-Office tools.
+Phase 16.1 adds no database migration (schema stays **v6**) and no new
+runtime dependency. Reinstalling refreshes the editable package metadata
+to 0.18.1. Your current `.env` keys keep taking precedence. Run
+`pc-agent credentials migrate` only when you want to copy them into
+Windows Credential Manager; the command does not edit `.env`, so remove
+migrated `*_API_KEY` lines yourself only after verifying the route. See
+`docs/phase16.md` for the migration and security model, `docs/phase15.md`
+for images/vision, `docs/phase14.md` for desktop safety, and
+`docs/phase13.md` for browser safety. License enforcement still defaults
+to `off`.
 
 ## Desktop GUI (Phase 5)
 
@@ -76,11 +92,11 @@ Open the local window from the project folder:
 pc-agent gui
 ```
 
-The GUI provides Dashboard, Tasks, Documents, Web, Desktop, Tools and
-Providers tabs over the same policy-bound services as the CLI. Run
+The GUI provides Dashboard, Tasks, Documents, Images, Web, Desktop, Tools
+and Providers tabs over the same policy-bound services as the CLI. Run
 `pc-agent gui --check` for a no-window readiness test. Dynamic Tool Builder
-generation/approval and API-key editing remain outside the GUI in this
-release. See `docs/phase5.md` for the tab guide, smoke test and
+generation/approval and API-key entry/deletion remain outside the GUI;
+the GUI shows only credential-store and source status. See `docs/phase5.md` for the tab guide, smoke test and
 troubleshooting.
 
 ## Licensing (Phase 6)
@@ -343,6 +359,19 @@ pc-agent workflow delete latest --yes
 
 See `docs/phase10.md`.
 
+## Multi-step tasks (Phase 11)
+
+Chain tools in one instruction with **then** (up to 5 steps). Every step
+runs the full approval/verification/checkpoint/recovery pipeline, and a
+step automatically consumes the previous step's actual output:
+
+```powershell
+pc-agent run "Merge PDFs from Folder A and Folder B then extract pages 1-2"
+pc-agent run "Convert sales.csv to xlsx then set cell D5 to \"=SUM(C2:C4)\" then verify formulas"
+```
+
+See `docs/phase11.md`.
+
 ## Natural-language PDF task (safe demo)
 
 ```powershell
@@ -409,7 +438,9 @@ Copy `.env.example` to `.env` locally when needed. The patcher updates
 `data\` and artifacts in `workspace\`; both are git-ignored.
 
 See `docs/phase4.md`, `docs/phase5.md`, `docs/phase6.md`, `docs/phase7.md`,
-`docs/phase8.md`, `docs/phase9.md`, `docs/phase10.md`,
-`docs/providers.md`, `docs/tools.md`, `docs/tool_builder.md`,
+`docs/phase8.md`, `docs/phase9.md`, `docs/phase10.md`, `docs/phase11.md`,
+`docs/phase12.md`, `docs/phase13.md`, `docs/phase14.md`,
+`docs/phase15.md`,
+`docs/phase16.md`, `docs/providers.md`, `docs/tools.md`, `docs/tool_builder.md`,
 `docs/recovery.md`, `docs/architecture.md`, and `CHANGELOG.md` for detailed
 contracts and honest limitations.

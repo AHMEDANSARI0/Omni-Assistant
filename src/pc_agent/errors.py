@@ -62,3 +62,7 @@ class RecoveryError(PcAgentError):
 
 class LicenseError(PcAgentError):
     """A license is missing/invalid/expired, or a feature is not licensed."""
+
+
+class CredentialError(StorageError):
+    """A provider credential could not be stored, read or deleted safely."""

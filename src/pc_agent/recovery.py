@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from .config import Settings
 from .domain.task import Task, TaskStatus, utc_now
 from .errors import PcAgentError, PlanningError, RecoveryError
-from .planning import PlannerOptions, TaskPlan
+from .planning import MultiStepPlan, PlannerOptions, TaskPlan, parse_stored_plan
 from .storage.repositories import (
     ExecutionRepository,
     RecoveryAttemptRecord,
@@ -79,6 +79,8 @@ _INVALID_MARKERS = (
     "json file could not be parsed",
     "json-to-csv needs",
     "not valid utf-8",
+    "could not decode image",
+    "unsupported image format",
     "unknown field",
     "must be an object",
     "is missing required field",
@@ -103,6 +105,37 @@ _OUTPUT_TOOLS = frozenset(
         "office.docx_replace_text",
         "office.docx_append_paragraphs",
         "office.xlsx_set_cells",
+        # Phase 15 image writers create a new file from a surviving source.
+        "image.convert",
+        "image.transform",
+    }
+)
+# Phase 12/13/14/15: re-running a command, browser/desktop action or a
+# provider vision send can duplicate side effects/cost, so these steps are
+# never auto-retried - not even after a verification failure.
+_SUBPROCESS_TOOLS = frozenset(
+    {
+        "git.status",
+        "git.log",
+        "git.diff_summary",
+        "git.init",
+        "git.add",
+        "git.commit",
+        "commands.run",
+        "browser.status",
+        "browser.open",
+        "browser.snapshot",
+        "browser.click",
+        "browser.type",
+        "browser.screenshot",
+        "desktop.windows",
+        "desktop.window_inspect",
+        "desktop.window_focus",
+        "desktop.window_click",
+        "desktop.window_type",
+        "desktop.send_keys",
+        "desktop.screenshot",
+        "image.analyze",
     }
 )
 _TRANSIENT_MARKERS = (
@@ -288,6 +321,15 @@ def diagnose_tool_failure(
     plan: TaskPlan, error: str, *, workspace_dir: Path
 ) -> FailureDiagnosis:
     workspace = workspace_dir.expanduser().resolve()
+    if plan.tool_id in _SUBPROCESS_TOOLS:
+        return FailureDiagnosis(
+            FailureCategory.UNKNOWN,
+            RecoveryAction.NONE,
+            False,
+            "Subprocess steps are never auto-retried: re-running a command "
+            "can duplicate side effects. Fix the cause and run the task again.",
+            error,
+        )
     lowered = error.lower()
 
     if any(marker in lowered for marker in _POLICY_MARKERS):
@@ -380,6 +422,15 @@ def diagnose_verification_failure(
     plan: TaskPlan, error: str, *, workspace_dir: Path
 ) -> FailureDiagnosis:
     workspace = workspace_dir.expanduser().resolve()
+    if plan.tool_id in _SUBPROCESS_TOOLS:
+        return FailureDiagnosis(
+            FailureCategory.VERIFICATION_FAILED,
+            RecoveryAction.NONE,
+            False,
+            "Subprocess steps are never auto-retried after a verification "
+            "failure: re-running a command can duplicate side effects.",
+            error,
+        )
     if plan.tool_id in _OUTPUT_TOOLS:
         revised = _arguments_with_fresh_output(plan, workspace)
         if revised is not None:
@@ -430,7 +481,10 @@ def diagnose_verification_failure(
 def _output_collision_diagnosis(
     plan: TaskPlan, error: str, workspace: Path
 ) -> FailureDiagnosis | None:
-    raw_output = plan.arguments.get("output_path")
+    output_key = _output_argument_key(plan)
+    if output_key is None:
+        return None
+    raw_output = plan.arguments.get(output_key)
     if not isinstance(raw_output, str) or not raw_output:
         return None
     target = _workspace_target(workspace, raw_output)
@@ -458,7 +512,10 @@ def _output_collision_diagnosis(
 def _arguments_with_fresh_output(
     plan: TaskPlan, workspace: Path
 ) -> dict[str, Any] | None:
-    raw_output = plan.arguments.get("output_path")
+    output_key = _output_argument_key(plan)
+    if output_key is None:
+        return None
+    raw_output = plan.arguments.get(output_key)
     if not isinstance(raw_output, str) or not raw_output:
         return None
     target = _workspace_target(workspace, raw_output)
@@ -468,8 +525,16 @@ def _arguments_with_fresh_output(
     if fresh == raw_output:
         return None
     revised = copy.deepcopy(dict(plan.arguments))
-    revised["output_path"] = fresh
+    revised[output_key] = fresh
     return revised
+
+
+def _output_argument_key(plan: TaskPlan) -> str | None:
+    for key in ("output_path", "output"):
+        value = plan.arguments.get(key)
+        if isinstance(value, str) and value:
+            return key
+    return None
 
 
 def unique_workspace_output(workspace_dir: Path, raw_output: str) -> str:
@@ -654,18 +719,19 @@ class RecoveryService:
 
     def _stored_plan(
         self, task_id: str
-    ) -> tuple[dict[str, Any] | None, TaskPlan | None, str | None]:
+    ) -> tuple[dict[str, Any] | None, TaskPlan | MultiStepPlan | None, str | None]:
         try:
             stored = self._execution.get_plan(task_id)
             if stored is None:
                 return None, None, None
-            return stored, TaskPlan.from_dict(stored), None
+            return stored, parse_stored_plan(stored), None
         except (PcAgentError, PlanningError, TypeError, ValueError) as exc:
             return None, None, str(exc)
 
     def diagnose(self, task_id: str) -> TaskDiagnosis:
         task = self._require_task(task_id)
-        _stored, plan, plan_error = self._stored_plan(task.id)
+        _stored, parsed, plan_error = self._stored_plan(task.id)
+        plan = parsed if isinstance(parsed, TaskPlan) else None
         invocations = self._execution.list_tool_invocations(task.id)
         latest = invocations[-1] if invocations else None
         stale = is_stale_task(
@@ -683,7 +749,20 @@ class RecoveryService:
             )
         elif task.status is TaskStatus.FAILED:
             error = (latest.error if latest and latest.error else task.error) or "Task failed."
-            if plan is None:
+            if isinstance(parsed, MultiStepPlan):
+                diagnosis = FailureDiagnosis(
+                    FailureCategory.UNKNOWN,
+                    RecoveryAction.CLONE_TASK,
+                    True,
+                    (
+                        "This multi-step task failed at one of its steps; a "
+                        "recovery clone re-runs the stored multi-step plan "
+                        "from the first step (writers choose fresh outputs "
+                        "on collision)."
+                    ),
+                    error,
+                )
+            elif plan is None:
                 diagnosis = FailureDiagnosis(
                     FailureCategory.UNSUPPORTED,
                     RecoveryAction.CLONE_TASK,

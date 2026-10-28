@@ -12,7 +12,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,15 @@ _ALLOWED_AI_TOOLS = {
     "office.json_to_csv": "office.json_to_csv",
     "office.csv_to_xlsx": "office.csv_to_xlsx",
     "desktop.system_info": "desktop.system_info",
+    "desktop.windows": "desktop.windows",
+    "desktop.window_inspect": "desktop.window_inspect",
+    "git.status": "git.status",
+    "git.log": "git.log",
+    "git.diff_summary": "git.diff_summary",
+    "browser.status": "browser.status",
+    "browser.snapshot": "browser.snapshot",
+    "image.inspect": "image.inspect",
+    "image.compare": "image.compare",
 }
 _INTENT_TO_TOOL = {
     "pdf.merge_folders": "pdf.merge_folders",
@@ -46,6 +56,13 @@ _INTENT_TO_TOOL = {
     "office.json_to_csv": "office.json_to_csv",
     "office.csv_to_xlsx": "office.csv_to_xlsx",
     "desktop.system_info": "desktop.system_info",
+    "desktop.windows": "desktop.windows",
+    "desktop.window_inspect": "desktop.window_inspect",
+    "desktop.window_focus": "desktop.window_focus",
+    "desktop.window_click": "desktop.window_click",
+    "desktop.window_type": "desktop.window_type",
+    "desktop.send_keys": "desktop.send_keys",
+    "desktop.screenshot": "desktop.screenshot",
     "files.copy": "files.copy",
     "files.move": "files.move",
     "files.rename": "files.rename",
@@ -57,6 +74,24 @@ _INTENT_TO_TOOL = {
     "office.docx_append_paragraphs": "office.docx_append_paragraphs",
     "office.xlsx_set_cells": "office.xlsx_set_cells",
     "office.xlsx_verify_formulas": "office.xlsx_verify_formulas",
+    "git.status": "git.status",
+    "git.log": "git.log",
+    "git.diff_summary": "git.diff_summary",
+    "git.init": "git.init",
+    "git.add": "git.add",
+    "git.commit": "git.commit",
+    "commands.run": "commands.run",
+    "browser.status": "browser.status",
+    "browser.open": "browser.open",
+    "browser.snapshot": "browser.snapshot",
+    "browser.click": "browser.click",
+    "browser.type": "browser.type",
+    "browser.screenshot": "browser.screenshot",
+    "image.inspect": "image.inspect",
+    "image.convert": "image.convert",
+    "image.transform": "image.transform",
+    "image.compare": "image.compare",
+    "image.analyze": "image.analyze",
 }
 
 
@@ -75,6 +110,45 @@ class PlannerOptions:
     replace_text: str | None = None
     cell_reference: str | None = None
     cell_value: str | None = None
+    # Phase 12 approved command (options-driven only; never parsed from
+    # free text).
+    command_executable: str | None = None
+    command_arguments: tuple[str, ...] = ()
+    command_timeout: int | None = None
+    # Phase 13 browser actions. Click/type stay options-driven so free
+    # text never has to be parsed into selectors.
+    browser_url: str | None = None
+    browser_click_selector: str | None = None
+    browser_click_text: str | None = None
+    browser_type_selector: str | None = None
+    browser_type_text: str | None = None
+    # Phase 14 desktop UI Automation. Mutating desktop actions remain
+    # options-driven so titles/elements/text are never guessed from prose.
+    desktop_window_title_contains: str | None = None
+    desktop_window_handle: str | None = None
+    desktop_click_name: str | None = None
+    desktop_click_automation_id: str | None = None
+    desktop_type_name: str | None = None
+    desktop_type_automation_id: str | None = None
+    desktop_type_text: str | None = None
+    desktop_keys: str | None = None
+    desktop_keys_repeat: int | None = None
+    desktop_element_index: int | None = None
+    # Phase 15 images. Exact transform/vision details stay option-driven;
+    # natural language only selects the operation and image file.
+    image_width: int | None = None
+    image_height: int | None = None
+    image_max_dimension: int | None = None
+    image_crop_left: int | None = None
+    image_crop_top: int | None = None
+    image_crop_right: int | None = None
+    image_crop_bottom: int | None = None
+    image_rotate_degrees: float | None = None
+    image_flip: str | None = None
+    image_grayscale: bool = False
+    image_quality: int | None = None
+    image_question: str | None = None
+    image_compare_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,9 +193,145 @@ class TaskPlan:
         )
 
 
+# Phase 11: multi-step plans chain several single-tool steps in one task.
+# The bound is deliberate: every step runs the full approval / verification /
+# criteria / bounded-recovery pipeline, so a task stays reviewable.
+MAX_PLAN_STEPS = 5
+
+
+@dataclass(frozen=True, slots=True)
+class StepBinding:
+    """Fill one argument of this step from an earlier step's actual output.
+
+    The value is resolved at execution time from the verified tool result of
+    ``from_step`` - never trusted from the planner - so a recovery rename of
+    the earlier output is followed automatically.
+    """
+
+    argument: str
+    from_step: int  # 0-based index of an earlier step
+    output_field: str = "output_path"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "argument": self.argument,
+            "from_step": self.from_step,
+            "output_field": self.output_field,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any, *, step_index: int) -> StepBinding:
+        if not isinstance(data, Mapping):
+            raise PlanningError("Stored plan step binding is not an object.")
+        argument = data.get("argument")
+        from_step = data.get("from_step")
+        output_field = data.get("output_field", "output_path")
+        if not isinstance(argument, str) or not argument:
+            raise PlanningError("Stored plan step binding has no argument name.")
+        if (
+            not isinstance(from_step, int)
+            or isinstance(from_step, bool)
+            or not 0 <= from_step < step_index
+        ):
+            raise PlanningError(
+                "Stored plan step binding must reference an earlier step."
+            )
+        if output_field != "output_path":
+            raise PlanningError("Stored plan step binding uses an unsupported field.")
+        return cls(argument=argument, from_step=from_step, output_field=output_field)
+
+
+@dataclass(frozen=True, slots=True)
+class MultiStepPlan:
+    """An ordered chain of single-tool steps (Phase 11).
+
+    Each step is an ordinary :class:`TaskPlan`, so verification, acceptance
+    criteria and recovery diagnosis keep working per step unchanged.
+    ``bindings[i]`` lists the arguments of step ``i`` that must be filled
+    from earlier steps' actual outputs at run time.
+    """
+
+    steps: tuple[TaskPlan, ...]
+    bindings: tuple[tuple[StepBinding, ...], ...]
+    summary: str
+    planner: str
+
+    def __post_init__(self) -> None:
+        if not 2 <= len(self.steps) <= MAX_PLAN_STEPS:
+            raise PlanningError(
+                f"A multi-step plan needs 2 to {MAX_PLAN_STEPS} steps; "
+                f"got {len(self.steps)}."
+            )
+        if len(self.bindings) != len(self.steps):
+            raise PlanningError("Multi-step plan bindings do not match its steps.")
+        for index, step_bindings in enumerate(self.bindings):
+            for binding in step_bindings:
+                if not 0 <= binding.from_step < index:
+                    raise PlanningError(
+                        "Multi-step plan binding must reference an earlier step."
+                    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "steps": [step.to_dict() for step in self.steps],
+            "bindings": [
+                [binding.to_dict() for binding in step_bindings]
+                for step_bindings in self.bindings
+            ],
+            "summary": self.summary,
+            "planner": self.planner,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> MultiStepPlan:
+        steps_raw = data.get("steps")
+        if not isinstance(steps_raw, list) or not (
+            2 <= len(steps_raw) <= MAX_PLAN_STEPS
+        ):
+            raise PlanningError("Stored multi-step plan has an invalid step count.")
+        steps: list[TaskPlan] = []
+        for item in steps_raw:
+            if not isinstance(item, Mapping):
+                raise PlanningError("Stored multi-step plan step is not an object.")
+            steps.append(TaskPlan.from_dict(item))
+        bindings_raw = data.get("bindings")
+        bindings: list[tuple[StepBinding, ...]] = []
+        if bindings_raw is None:
+            bindings = [() for _ in steps]
+        elif not isinstance(bindings_raw, list) or len(bindings_raw) != len(steps):
+            raise PlanningError("Stored multi-step plan bindings are invalid.")
+        else:
+            for index, step_bindings in enumerate(bindings_raw):
+                if not isinstance(step_bindings, list):
+                    raise PlanningError("Stored multi-step plan bindings are invalid.")
+                bindings.append(
+                    tuple(
+                        StepBinding.from_dict(item, step_index=index)
+                        for item in step_bindings
+                    )
+                )
+        return cls(
+            steps=tuple(steps),
+            bindings=tuple(bindings),
+            summary=str(
+                data.get("summary") or f"Multi-step plan ({len(steps)} steps)"
+            ),
+            planner=str(data.get("planner") or "stored"),
+        )
+
+
+def parse_stored_plan(data: Mapping[str, Any]) -> TaskPlan | MultiStepPlan:
+    """Parse a persisted plan dict (single-step or Phase 11 multi-step)."""
+
+    if isinstance(data.get("steps"), list):
+        return MultiStepPlan.from_dict(data)
+    return TaskPlan.from_dict(data)
+
+
 @dataclass(frozen=True, slots=True)
 class PlanningOutcome:
     plan: TaskPlan | None = None
+    multi_plan: MultiStepPlan | None = None
     missing_information: tuple[str, ...] = ()
     planner: str = "deterministic"
     provider_attempts: tuple[ProviderAttempt, ...] = field(default_factory=tuple)
@@ -132,6 +342,18 @@ class _ResolvedInput:
     argument: str
     resolved: Path
     external_root: Path | None = None
+
+
+# Resolved workspace paths that earlier steps of the *same* multi-step plan
+# will create. Plan-time input checks treat them as existing so a chain like
+# "convert data.csv to xlsx then set cell C9" can be planned before the XLSX
+# exists. This never grants access: promised paths are workspace-relative
+# outputs of already-planned steps, and tool execution still confines and
+# verifies everything for real. A ContextVar keeps concurrent planning calls
+# isolated.
+_PROMISED_OUTPUTS: ContextVar[frozenset[Path]] = ContextVar(
+    "pc_agent_promised_outputs", default=frozenset()
+)
 
 
 class DeterministicPlanner:
@@ -150,8 +372,34 @@ class DeterministicPlanner:
         self, instruction: str, options: PlannerOptions | None = None
     ) -> PlanningOutcome | None:
         options = options or PlannerOptions()
+        clauses = _split_then_clauses(instruction)
+        if len(clauses) >= 2:
+            outcome = self._plan_clauses(clauses, options)
+            if outcome is not None:
+                return outcome
+            # No clause planned at all: fall through and try the whole
+            # instruction as a single step, exactly as before Phase 11.
+        return self._plan_single(instruction, options)
+
+    def _plan_single(
+        self, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome | None:
         lowered = instruction.lower()
 
+        if options.command_executable:
+            return self._plan_command(options)
+        git_outcome = self._plan_git(instruction, options)
+        if git_outcome is not None:
+            return git_outcome
+        browser_outcome = self._plan_browser(instruction, options)
+        if browser_outcome is not None:
+            return browser_outcome
+        desktop_outcome = self._plan_desktop_automation(instruction, options)
+        if desktop_outcome is not None:
+            return desktop_outcome
+        image_outcome = self._plan_images(instruction, options)
+        if image_outcome is not None:
+            return image_outcome
         if _looks_like_pdf_merge(lowered):
             return self._plan_pdf_merge(instruction, options)
         if _looks_like_verify(lowered):
@@ -181,6 +429,961 @@ class DeterministicPlanner:
             return self._plan_list_files(instruction, options)
         return None
 
+    def _plan_clauses(
+        self, clauses: list[str], options: PlannerOptions
+    ) -> PlanningOutcome | None:
+        """Plan a 'then'-chained instruction as one bounded multi-step plan.
+
+        Path options (--input-*, --target, --output) belong to the first
+        step. A later clause that names no file inherits the previous step's
+        planned output as its target when that plans cleanly, and argument
+        values equal to an earlier step's planned output become run-time
+        bindings, so recovery renames are followed automatically.
+        """
+
+        if len(clauses) > MAX_PLAN_STEPS:
+            return PlanningOutcome(
+                missing_information=(
+                    (
+                        f"Multi-step instructions support at most {MAX_PLAN_STEPS} "
+                        f"steps; this one has {len(clauses)}. Split it into "
+                        "smaller tasks."
+                    ),
+                )
+            )
+        steps: list[TaskPlan | None] = []
+        problems: list[str] = []
+        promised: set[Path] = set()
+        for index, clause in enumerate(clauses):
+            clause_options = (
+                options
+                if index == 0
+                else replace(
+                    options,
+                    input_folders=(),
+                    input_files=(),
+                    output_path=None,
+                    target_path=None,
+                    command_executable=None,
+                    command_arguments=(),
+                    command_timeout=None,
+                    browser_url=None,
+                    browser_click_selector=None,
+                    browser_click_text=None,
+                    browser_type_selector=None,
+                    browser_type_text=None,
+                    desktop_window_title_contains=None,
+                    desktop_window_handle=None,
+                    desktop_click_name=None,
+                    desktop_click_automation_id=None,
+                    desktop_type_name=None,
+                    desktop_type_automation_id=None,
+                    desktop_type_text=None,
+                    desktop_keys=None,
+                    desktop_keys_repeat=None,
+                    desktop_element_index=None,
+                    image_width=None,
+                    image_height=None,
+                    image_max_dimension=None,
+                    image_crop_left=None,
+                    image_crop_top=None,
+                    image_crop_right=None,
+                    image_crop_bottom=None,
+                    image_rotate_degrees=None,
+                    image_flip=None,
+                    image_grayscale=False,
+                    image_quality=None,
+                    image_question=None,
+                    image_compare_path=None,
+                )
+            )
+            token = _PROMISED_OUTPUTS.set(frozenset(promised))
+            try:
+                outcome = self._plan_single(clause, clause_options)
+                if (outcome is None or outcome.plan is None) and steps:
+                    previous = steps[-1]
+                    previous_output = (
+                        _step_output_value(previous) if previous is not None else None
+                    )
+                    if previous_output and not _clause_names_file(clause):
+                        retry = self._plan_single(
+                            clause,
+                            replace(clause_options, target_path=previous_output),
+                        )
+                        if (
+                            retry is not None
+                            and retry.plan is not None
+                            and _target_suffix_matches(retry.plan, previous_output)
+                        ):
+                            outcome = retry
+            finally:
+                _PROMISED_OUTPUTS.reset(token)
+            if outcome is None:
+                problems.append(
+                    f"Step {index + 1} is not a supported deterministic "
+                    f"capability yet: {clause!r}"
+                )
+                steps.append(None)
+            elif outcome.plan is None:
+                problems.extend(
+                    f"Step {index + 1}: {message}"
+                    for message in outcome.missing_information
+                )
+                steps.append(None)
+            else:
+                steps.append(outcome.plan)
+                promised |= self._promised_paths_for(outcome.plan)
+        if all(step is None for step in steps):
+            return None
+        if any(step is None for step in steps):
+            return PlanningOutcome(missing_information=tuple(problems))
+        planned_steps = tuple(step for step in steps if step is not None)
+        bindings: list[tuple[StepBinding, ...]] = []
+        for index, step in enumerate(planned_steps):
+            step_bindings: list[StepBinding] = []
+            for argument in ("input_path", "path", "source", "first", "second"):
+                value = step.arguments.get(argument)
+                if not isinstance(value, str):
+                    continue
+                for earlier in range(index - 1, -1, -1):
+                    earlier_output = planned_steps[earlier].arguments.get(
+                        "output_path"
+                    ) or planned_steps[earlier].arguments.get("output")
+                    if earlier_output == value:
+                        step_bindings.append(
+                            StepBinding(argument=argument, from_step=earlier)
+                        )
+                        break
+            bindings.append(tuple(step_bindings))
+        summary = f"Multi-step plan ({len(planned_steps)} steps): " + "; ".join(
+            f"{index + 1}) {step.summary.rstrip('.')}"
+            for index, step in enumerate(planned_steps)
+        )
+        return PlanningOutcome(
+            multi_plan=MultiStepPlan(
+                steps=planned_steps,
+                bindings=tuple(bindings),
+                summary=summary[:1000],
+                planner="deterministic",
+            )
+        )
+
+    def _promised_paths_for(self, plan: TaskPlan) -> set[Path]:
+        promised: set[Path] = set()
+        for key in ("output_path", "output_folder", "output"):
+            value = plan.arguments.get(key)
+            if isinstance(value, str) and value:
+                candidate = Path(value).expanduser()
+                promised.add(
+                    candidate.resolve()
+                    if candidate.is_absolute()
+                    else (self._workspace / candidate).resolve()
+                )
+        new_name = plan.arguments.get("new_name")
+        source = plan.arguments.get("path")
+        if isinstance(new_name, str) and new_name and isinstance(source, str):
+            renamed = (self._workspace / source).resolve().with_name(new_name)
+            promised.add(renamed)
+        return promised
+
+    @staticmethod
+    def _file_ready(resolved: _ResolvedInput | None) -> bool:
+        return resolved is not None and (
+            resolved.resolved.is_file()
+            or resolved.resolved in _PROMISED_OUTPUTS.get()
+        )
+
+    @staticmethod
+    def _dir_ready(resolved: _ResolvedInput | None) -> bool:
+        return resolved is not None and (
+            resolved.resolved.is_dir()
+            or resolved.resolved in _PROMISED_OUTPUTS.get()
+        )
+
+    def _plan_images(
+        self, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome | None:
+        lowered = instruction.lower()
+        tokens = _extract_image_tokens(instruction)
+        has_image_word = any(
+            word in lowered
+            for word in (
+                "image",
+                "photo",
+                "picture",
+                "png",
+                "jpeg",
+                "jpg",
+                "webp",
+                "bmp",
+                "tiff",
+                "gif",
+            )
+        )
+        has_image_options = any(
+            value not in (None, False)
+            for value in (
+                options.image_width,
+                options.image_height,
+                options.image_max_dimension,
+                options.image_crop_left,
+                options.image_crop_top,
+                options.image_crop_right,
+                options.image_crop_bottom,
+                options.image_rotate_degrees,
+                options.image_flip,
+                options.image_grayscale,
+                options.image_question,
+                options.image_compare_path,
+            )
+        )
+        if not tokens and not has_image_word and not has_image_options:
+            return None
+        if any(word in lowered for word in ("list", "show")) and "files" in lowered:
+            return None
+
+        def missing(message: str) -> PlanningOutcome:
+            return PlanningOutcome(missing_information=(message,))
+
+        def plan(tool_id: str, arguments: dict[str, Any], summary: str, resolved=None):
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent=tool_id,
+                    tool_id=tool_id,
+                    arguments=arguments,
+                    summary=summary,
+                    planner="deterministic",
+                    external_read_roots=(
+                        (resolved.external_root,)
+                        if resolved is not None and resolved.external_root is not None
+                        else ()
+                    ),
+                )
+            )
+
+        def resolve_image(raw: str | None):
+            if not raw:
+                return None
+            if Path(raw).suffix.lower() not in _IMAGE_SUFFIXES:
+                return missing(
+                    "Image tasks need a PNG, JPEG, GIF, BMP, WebP or TIFF file. "
+                    "Pass --target with the exact image path."
+                )
+            resolved = self._resolve_input(str(raw))
+            if not self._file_ready(resolved):
+                return missing(f"Image was not found: {raw}")
+            return resolved
+
+        source_raw = (
+            options.target_path
+            or (options.input_files[0] if options.input_files else None)
+            or (tokens[0] if tokens else None)
+        )
+        compare_requested = bool(options.image_compare_path) or "compare" in lowered
+        analyze_requested = bool(options.image_question) or any(
+            word in lowered
+            for word in (
+                "analyze",
+                "analyse",
+                "describe",
+                "recognize",
+                "recognise",
+                "ocr",
+                "read text",
+                "what is in",
+                "what's in",
+            )
+        )
+        convert_requested = "convert" in lowered
+        transform_words = any(
+            word in lowered
+            for word in (
+                "resize",
+                "thumbnail",
+                "crop",
+                "rotate",
+                "flip",
+                "grayscale",
+                "greyscale",
+                "shrink",
+            )
+        )
+        transform_options = any(
+            value not in (None, False)
+            for value in (
+                options.image_width,
+                options.image_height,
+                options.image_max_dimension,
+                options.image_crop_left,
+                options.image_crop_top,
+                options.image_crop_right,
+                options.image_crop_bottom,
+                options.image_rotate_degrees,
+                options.image_flip,
+                options.image_grayscale,
+            )
+        )
+        inspect_requested = any(
+            word in lowered
+            for word in ("inspect", "metadata", "dimensions", "image info", "check")
+        )
+        if not (
+            compare_requested
+            or analyze_requested
+            or convert_requested
+            or transform_words
+            or transform_options
+            or inspect_requested
+        ):
+            if has_image_options or tokens:
+                return missing(
+                    "Tell me whether to inspect, convert, transform, compare or "
+                    "analyze the image. Transform and vision details use exact "
+                    "--image-* options."
+                )
+            return None
+        if not source_raw:
+            return missing("Which image should be used? Pass --target <image-path>.")
+        source = resolve_image(str(source_raw))
+        if isinstance(source, PlanningOutcome):
+            return source
+        assert source is not None
+
+        if compare_requested:
+            second_raw = (
+                options.image_compare_path
+                or (options.input_files[1] if len(options.input_files) > 1 else None)
+                or (tokens[1] if len(tokens) > 1 else None)
+            )
+            if not second_raw:
+                return missing(
+                    "Image comparison needs a second image. Pass --image-compare <path>."
+                )
+            second = resolve_image(str(second_raw))
+            if isinstance(second, PlanningOutcome):
+                return second
+            assert second is not None
+            roots = tuple(
+                root
+                for root in (source.external_root, second.external_root)
+                if root is not None
+            )
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="image.compare",
+                    tool_id="image.compare",
+                    arguments={"first": source.argument, "second": second.argument},
+                    summary=f"Compare {source.argument} with {second.argument}.",
+                    planner="deterministic",
+                    external_read_roots=roots,
+                )
+            )
+
+        if analyze_requested:
+            question = options.image_question
+            if not question:
+                quoted_questions = [
+                    value
+                    for value in _extract_quoted(instruction)
+                    if Path(value).suffix.lower() not in _IMAGE_SUFFIXES
+                ]
+                if quoted_questions:
+                    question = quoted_questions[0]
+                elif "ocr" in lowered or "read text" in lowered:
+                    question = (
+                        "Transcribe all visible text exactly. If there is no "
+                        "readable text, say so."
+                    )
+                else:
+                    question = "Describe this image in detail."
+            return plan(
+                "image.analyze",
+                {"path": source.argument, "question": question},
+                f"Analyze image {source.argument} with the configured vision provider.",
+                source,
+            )
+
+        if convert_requested:
+            default_suffix = _image_target_suffix(lowered) or Path(source.argument).suffix
+            default_name = f"{Path(source.argument).stem}-converted{default_suffix}"
+            output = self._image_output(options.output_path, default_name=default_name)
+            if isinstance(output, PlanningOutcome):
+                return output
+            arguments: dict[str, Any] = {"source": source.argument, "output": output}
+            if options.image_quality is not None:
+                arguments["quality"] = options.image_quality
+            return plan(
+                "image.convert",
+                arguments,
+                f"Convert image {source.argument} to {output}.",
+                source,
+            )
+
+        if transform_words or transform_options:
+            arguments = {"source": source.argument}
+            if options.image_width is not None:
+                arguments["width"] = options.image_width
+            if options.image_height is not None:
+                arguments["height"] = options.image_height
+            if options.image_max_dimension is not None:
+                arguments["max_dimension"] = options.image_max_dimension
+            crop = {
+                "crop_left": options.image_crop_left,
+                "crop_top": options.image_crop_top,
+                "crop_right": options.image_crop_right,
+                "crop_bottom": options.image_crop_bottom,
+            }
+            if any(value is not None for value in crop.values()):
+                if any(value is None for value in crop.values()):
+                    return missing(
+                        "Image crop needs --image-crop-left, --image-crop-top, "
+                        "--image-crop-right and --image-crop-bottom together."
+                    )
+                arguments.update(crop)
+            if options.image_rotate_degrees is not None:
+                arguments["rotate_degrees"] = options.image_rotate_degrees
+            if options.image_flip:
+                arguments["flip"] = options.image_flip
+            if options.image_grayscale:
+                arguments["grayscale"] = True
+            if options.image_quality is not None:
+                arguments["quality"] = options.image_quality
+            # A few unambiguous numeric forms are safe to read from prose.
+            dimension_match = re.search(r"\b(\d{1,5})\s*x\s*(\d{1,5})\b", lowered)
+            if dimension_match and "width" not in arguments and "height" not in arguments:
+                arguments["width"] = int(dimension_match.group(1))
+                arguments["height"] = int(dimension_match.group(2))
+            rotate_match = re.search(r"rotate\s+(-?\d+(?:\.\d+)?)\s*(?:degrees?|°)?", lowered)
+            if rotate_match and "rotate_degrees" not in arguments:
+                arguments["rotate_degrees"] = float(rotate_match.group(1))
+            if "flip horizontal" in lowered and "flip" not in arguments:
+                arguments["flip"] = "horizontal"
+            if "flip vertical" in lowered and "flip" not in arguments:
+                arguments["flip"] = "vertical"
+            if ("grayscale" in lowered or "greyscale" in lowered) and "grayscale" not in arguments:
+                arguments["grayscale"] = True
+            operation_keys = {
+                "width",
+                "height",
+                "max_dimension",
+                "crop_left",
+                "rotate_degrees",
+                "flip",
+                "grayscale",
+            }
+            if not operation_keys.intersection(arguments):
+                return missing(
+                    "Image transformation needs exact options such as "
+                    "--image-width, --image-max-dimension, --image-rotate, "
+                    "--image-flip or --image-grayscale."
+                )
+            suffix = Path(options.output_path or source.argument).suffix
+            output = self._image_output(
+                options.output_path,
+                default_name=f"{Path(source.argument).stem}-transformed{suffix}",
+            )
+            if isinstance(output, PlanningOutcome):
+                return output
+            arguments["output"] = output
+            return plan(
+                "image.transform",
+                arguments,
+                f"Transform image {source.argument} to {output}.",
+                source,
+            )
+
+        return plan(
+            "image.inspect",
+            {"path": source.argument, "include_color_stats": True},
+            f"Inspect image {source.argument}.",
+            source,
+        )
+
+    def _image_output(
+        self, raw_output: str | None, *, default_name: str
+    ) -> str | PlanningOutcome:
+        if raw_output:
+            candidate = Path(raw_output).expanduser()
+            resolved = (
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (self._workspace / candidate).resolve()
+            )
+            if not resolved.is_relative_to(self._workspace):
+                return PlanningOutcome(
+                    missing_information=(
+                        "The image output must be inside the workspace.",
+                    )
+                )
+            if resolved.suffix.lower() not in _IMAGE_OUTPUT_SUFFIXES:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "The image output filename must end with .png, .jpg, "
+                            ".jpeg, .webp, .bmp, .tif or .tiff."
+                        ),
+                    )
+                )
+            return resolved.relative_to(self._workspace).as_posix()
+        candidate = self._workspace / default_name
+        if not self._output_name_taken(candidate):
+            return Path(default_name).as_posix()
+        stamp = self._now().strftime("%Y%m%d-%H%M%S")
+        default_path = Path(default_name)
+        candidate_name = (
+            default_path.parent / f"{default_path.stem}-{stamp}{default_path.suffix}"
+        ).as_posix()
+        counter = 2
+        while self._output_name_taken(self._workspace / candidate_name):
+            candidate_name = (
+                default_path.parent
+                / f"{default_path.stem}-{stamp}-{counter}{default_path.suffix}"
+            ).as_posix()
+            counter += 1
+        return candidate_name
+
+    def _plan_desktop_automation(
+        self, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome | None:
+        lowered = instruction.lower()
+
+        def plan(tool_id: str, arguments: dict[str, Any], summary: str) -> PlanningOutcome:
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent=tool_id,
+                    tool_id=tool_id,
+                    arguments=arguments,
+                    summary=summary,
+                    planner="deterministic",
+                )
+            )
+
+        def window_args() -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            if options.desktop_window_handle:
+                result["window_handle"] = options.desktop_window_handle
+            if options.desktop_window_title_contains:
+                result["window_title_contains"] = options.desktop_window_title_contains
+            return result
+
+        def missing(message: str) -> PlanningOutcome:
+            return PlanningOutcome(missing_information=(message,))
+
+        if options.desktop_click_name or options.desktop_click_automation_id:
+            arguments = window_args()
+            if not arguments:
+                return missing(
+                    "A desktop click needs --desktop-window or "
+                    "--desktop-window-handle to choose the exact window."
+                )
+            shown: list[str] = []
+            if options.desktop_click_name:
+                arguments["element_name"] = options.desktop_click_name
+                shown.append(f"name {options.desktop_click_name!r}")
+            if options.desktop_click_automation_id:
+                arguments["element_automation_id"] = options.desktop_click_automation_id
+                shown.append(f"AutomationId {options.desktop_click_automation_id!r}")
+            if options.desktop_element_index is not None:
+                arguments["element_index"] = options.desktop_element_index
+            return plan(
+                "desktop.window_click",
+                arguments,
+                f"Click desktop element {' and '.join(shown)}.",
+            )
+        if options.desktop_type_name or options.desktop_type_automation_id:
+            arguments = window_args()
+            if not arguments:
+                return missing(
+                    "Desktop typing needs --desktop-window or "
+                    "--desktop-window-handle to choose the exact window."
+                )
+            if options.desktop_type_text is None:
+                return missing(
+                    "--desktop-type-text is required with a desktop type selector."
+                )
+            shown = []
+            if options.desktop_type_name:
+                arguments["element_name"] = options.desktop_type_name
+                shown.append(f"name {options.desktop_type_name!r}")
+            if options.desktop_type_automation_id:
+                arguments["element_automation_id"] = options.desktop_type_automation_id
+                shown.append(f"AutomationId {options.desktop_type_automation_id!r}")
+            if options.desktop_element_index is not None:
+                arguments["element_index"] = options.desktop_element_index
+            arguments["text"] = options.desktop_type_text
+            return plan(
+                "desktop.window_type",
+                arguments,
+                f"Type into desktop element {' and '.join(shown)}.",
+            )
+        if options.desktop_keys:
+            arguments = window_args()
+            if not arguments:
+                return missing(
+                    "Desktop keys need --desktop-window or "
+                    "--desktop-window-handle to choose the exact window."
+                )
+            arguments["keys"] = options.desktop_keys
+            if options.desktop_keys_repeat is not None:
+                arguments["repeat"] = options.desktop_keys_repeat
+            return plan(
+                "desktop.send_keys",
+                arguments,
+                f"Send keys {options.desktop_keys!r} to the selected desktop window.",
+            )
+
+        has_window = "window" in lowered or "windows" in lowered
+        has_desktop = "desktop" in lowered or has_window
+        if not has_desktop:
+            return None
+        if "screenshot" in lowered:
+            output_path = options.output_path or "desktop-screenshot.png"
+            arguments = {"output_path": output_path, **window_args()}
+            return plan(
+                "desktop.screenshot",
+                arguments,
+                f"Save a desktop screenshot to {output_path}.",
+            )
+        if "system info" in lowered or "system information" in lowered:
+            return None
+        if has_window and any(
+            word in lowered for word in ("list", "show", "open windows", "which windows")
+        ):
+            return plan("desktop.windows", {}, "List visible desktop windows.")
+        quoted = _extract_quoted(instruction)
+        if "inspect" in lowered and has_window:
+            arguments = window_args()
+            if not arguments and quoted:
+                arguments = {"window_title_contains": quoted[0]}
+            if not arguments:
+                return missing(
+                    "Tell me which window to inspect, for example inspect the Notepad window."
+                )
+            return plan(
+                "desktop.window_inspect", arguments, "Inspect the selected desktop window."
+            )
+        if ("focus" in lowered or "bring" in lowered) and has_window:
+            arguments = window_args()
+            if not arguments and quoted:
+                arguments = {"window_title_contains": quoted[0]}
+            if not arguments:
+                return missing(
+                    "Tell me which window to focus, for example focus the Notepad window."
+                )
+            return plan(
+                "desktop.window_focus", arguments, "Focus the selected desktop window."
+            )
+        if "click" in lowered and has_desktop:
+            return missing(
+                "A desktop click needs exact window and element selectors. Use "
+                "--desktop-window plus --desktop-click-name or --desktop-click-automation-id."
+            )
+        if any(word in lowered for word in ("type", "typing", "write")) and has_desktop:
+            return missing(
+                "Desktop typing needs exact window and element selectors plus text. Use "
+                "--desktop-window, --desktop-type-name/--desktop-type-automation-id "
+                "and --desktop-type-text."
+            )
+        if any(word in lowered for word in ("press", "send keys", "key chord")) and has_desktop:
+            return missing(
+                "Desktop keys need an exact window and chord. Use --desktop-window "
+                "plus --desktop-keys (for example Ctrl+S)."
+            )
+        if has_window:
+            return missing(
+                "Desktop window requests I can plan: list windows, inspect or focus a "
+                "quoted/selected window, screenshot the desktop, or use the exact "
+                "--desktop-* action options."
+            )
+        return None
+
+    def _plan_browser(
+        self, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome | None:
+        lowered = instruction.lower()
+
+        def plan(tool_id: str, arguments: dict[str, Any], summary: str) -> PlanningOutcome:
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent=tool_id,
+                    tool_id=tool_id,
+                    arguments=arguments,
+                    summary=summary,
+                    planner="deterministic",
+                )
+            )
+
+        if options.browser_click_selector or options.browser_click_text:
+            if options.browser_click_selector and options.browser_click_text:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "Use only one of --browser-click-selector or "
+                            "--browser-click-text."
+                        ),
+                    )
+                )
+            arguments: dict[str, Any] = {}
+            if options.browser_click_selector:
+                arguments["selector"] = options.browser_click_selector
+                shown = f"selector {options.browser_click_selector!r}"
+            else:
+                arguments["text"] = options.browser_click_text
+                shown = f"text {options.browser_click_text!r}"
+            return plan(
+                "browser.click", arguments, f"Click {shown} in the browser."
+            )
+        if options.browser_type_selector:
+            if options.browser_type_text is None:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "--browser-type-text is required with "
+                            "--browser-type-selector."
+                        ),
+                    )
+                )
+            return plan(
+                "browser.type",
+                {
+                    "selector": options.browser_type_selector,
+                    "text": options.browser_type_text,
+                },
+                f"Type into {options.browser_type_selector!r} in the browser.",
+            )
+        if options.browser_url:
+            return plan(
+                "browser.open",
+                {"url": options.browser_url},
+                f"Open {options.browser_url} in the browser.",
+            )
+
+        if re.search(r"\bbrowser\b", lowered) is None:
+            return None
+        if "screenshot" in lowered:
+            output_path = options.output_path or "browser-screenshot.png"
+            return plan(
+                "browser.screenshot",
+                {"output_path": output_path},
+                f"Save a browser screenshot to {output_path}.",
+            )
+        if "status" in lowered or "connected" in lowered:
+            return plan(
+                "browser.status", {}, "Report the debug browser status."
+            )
+        url = _extract_url(instruction)
+        if url is not None and any(
+            word in lowered for word in ("open", "visit", "navigate", "load", "go to")
+        ):
+            return plan(
+                "browser.open", {"url": url}, f"Open {url} in the browser."
+            )
+        if "click" in lowered:
+            quoted = _extract_quoted(instruction)
+            if quoted:
+                return plan(
+                    "browser.click",
+                    {"text": quoted[0]},
+                    f"Click {quoted[0]!r} in the browser.",
+                )
+            return PlanningOutcome(
+                missing_information=(
+                    (
+                        'Tell me exactly what to click, e.g. click "Sign in" '
+                        "in the browser, or pass --browser-click-selector."
+                    ),
+                )
+            )
+        if any(
+            word in lowered
+            for word in ("read", "show", "snapshot", "page", "tab", "what")
+        ):
+            return plan(
+                "browser.snapshot", {}, "Read the current browser page."
+            )
+        return PlanningOutcome(
+            missing_information=(
+                (
+                    "Browser requests I can plan: browser status, open a URL "
+                    "in the browser, read the browser page, screenshot the "
+                    "browser page, or click quoted text in the browser."
+                ),
+            )
+        )
+
+    def _plan_command(self, options: PlannerOptions) -> PlanningOutcome:
+        executable = (options.command_executable or "").strip()
+        if (
+            not executable
+            or "/" in executable
+            or "\\" in executable
+            or executable in {".", ".."}
+            or len(executable) > 100
+        ):
+            return PlanningOutcome(
+                missing_information=(
+                    (
+                        "--command must start with a bare program name like "
+                        "git or python, not a path."
+                    ),
+                )
+            )
+        cwd = "."
+        if options.target_path:
+            resolved = self._resolve_folder_candidate(
+                str(options.target_path), ""
+            )
+            if not self._dir_ready(resolved) or (
+                resolved is not None and resolved.external_root is not None
+            ):
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "The command working directory (--target) must be an "
+                            "existing workspace folder."
+                        ),
+                    )
+                )
+            cwd = resolved.argument
+        arguments: dict[str, Any] = {
+            "executable": executable,
+            "argv": list(options.command_arguments),
+            "cwd": cwd,
+        }
+        if options.command_timeout is not None:
+            arguments["timeout_seconds"] = options.command_timeout
+        shown = " ".join([executable, *options.command_arguments])[:300]
+        return PlanningOutcome(
+            plan=TaskPlan(
+                intent="commands.run",
+                tool_id="commands.run",
+                arguments=arguments,
+                summary=f"Run approved command: {shown}",
+                planner="deterministic",
+            )
+        )
+
+    def _plan_git(
+        self, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome | None:
+        lowered = instruction.lower()
+        if re.search(r"\bgit\b", lowered) is None:
+            return None
+        is_init = (
+            re.search(r"\b(init|initialize|initialise)\b", lowered) is not None
+        )
+        repo_raw = (
+            options.target_path
+            or (options.input_folders[0] if options.input_folders else None)
+            or "."
+        )
+        resolved = self._resolve_input(str(repo_raw))
+        if resolved.external_root is not None:
+            return PlanningOutcome(
+                missing_information=(
+                    "Git repositories must be inside the workspace in this phase.",
+                )
+            )
+        if not is_init and not self._dir_ready(resolved):
+            return PlanningOutcome(
+                missing_information=(
+                    f"Repository folder was not found: {repo_raw}",
+                )
+            )
+        repository = resolved.argument
+
+        if is_init:
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="git.init",
+                    tool_id="git.init",
+                    arguments={"directory": repository},
+                    summary=f"Initialize a Git repository in {repository}.",
+                    planner="deterministic",
+                )
+            )
+        if "status" in lowered:
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="git.status",
+                    tool_id="git.status",
+                    arguments={"repository": repository},
+                    summary=f"Git status of {repository}.",
+                    planner="deterministic",
+                )
+            )
+        if "diff" in lowered:
+            staged = "staged" in lowered or "cached" in lowered
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="git.diff_summary",
+                    tool_id="git.diff_summary",
+                    arguments={"repository": repository, "staged": staged},
+                    summary=(
+                        f"Summarize {'staged' if staged else 'unstaged'} "
+                        f"changes in {repository}."
+                    ),
+                    planner="deterministic",
+                )
+            )
+        if "log" in lowered or "commits" in lowered:
+            count_match = re.search(r"(\d{1,2})\s+commits?", lowered)
+            count = min(50, int(count_match.group(1))) if count_match else 10
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="git.log",
+                    tool_id="git.log",
+                    arguments={"repository": repository, "max_count": count},
+                    summary=f"Show the last {count} commits of {repository}.",
+                    planner="deterministic",
+                )
+            )
+        if re.search(r"\b(add|stage)\b", lowered):
+            paths = list(options.input_files) or _extract_quoted(instruction)
+            if not paths:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "Which files should be staged? Pass --input-file "
+                            "for each repository-relative path, or quote the paths."
+                        ),
+                    )
+                )
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="git.add",
+                    tool_id="git.add",
+                    arguments={"repository": repository, "paths": paths},
+                    summary=f"Stage {len(paths)} path(s) in {repository}.",
+                    planner="deterministic",
+                )
+            )
+        if re.search(r"\bcommit\b", lowered):
+            quoted = _extract_quoted(instruction)
+            if not quoted:
+                return PlanningOutcome(
+                    missing_information=(
+                        'Quote the commit message, e.g. git commit "Initial import".',
+                    )
+                )
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="git.commit",
+                    tool_id="git.commit",
+                    arguments={"repository": repository, "message": quoted[0]},
+                    summary=f"Commit staged changes in {repository}: {quoted[0]}",
+                    planner="deterministic",
+                )
+            )
+        return PlanningOutcome(
+            missing_information=(
+                (
+                    "Supported Git tasks: status, log, diff, init, add "
+                    "(stage) and commit - all local; no clone/pull/push."
+                ),
+            )
+        )
+
     def _plan_pdf_merge(
         self, instruction: str, options: PlannerOptions
     ) -> PlanningOutcome:
@@ -203,7 +1406,7 @@ class DeterministicPlanner:
             missing: list[str] = []
             for raw_file in raw_files:
                 resolved = self._resolve_input(raw_file)
-                if resolved is None or not resolved.resolved.is_file():
+                if not self._file_ready(resolved):
                     missing.append(f"Input PDF was not found: {raw_file}")
                 else:
                     resolved_files.append(resolved)
@@ -245,7 +1448,7 @@ class DeterministicPlanner:
                     f"Folder '{raw_folder}' was not found in the workspace or Desktop. "
                     "Pass its exact path with --input-folder."
                 )
-            elif not resolved.resolved.is_dir():
+            elif not self._dir_ready(resolved):
                 missing.append(f"Input folder was not found: {raw_folder}")
             else:
                 resolved_folders.append(resolved)
@@ -484,7 +1687,7 @@ class DeterministicPlanner:
                 )
             )
         resolved = self._resolve_input(raw_target)
-        if resolved is None or not resolved.resolved.is_file():
+        if not self._file_ready(resolved):
             return PlanningOutcome(
                 missing_information=(f"Office file was not found: {raw_target}",)
             )
@@ -744,7 +1947,7 @@ class DeterministicPlanner:
                 )
             )
         resolved = self._resolve_input(str(raw_target))
-        if resolved is None or not resolved.resolved.is_file():
+        if not self._file_ready(resolved):
             return PlanningOutcome(
                 missing_information=(f"File was not found: {raw_target}",)
             )
@@ -793,12 +1996,13 @@ class DeterministicPlanner:
                 or "."
             )
             resolved = self._resolve_input(str(raw_folder))
-            if resolved is None or not resolved.resolved.is_dir():
+            if not self._dir_ready(resolved):
                 return PlanningOutcome(
                     missing_information=(
                         f"Folder '{raw_folder}' was not found. Pass --target or --input-folder.",
                     )
                 )
+            assert resolved is not None  # narrowed by _dir_ready
             if resolved.external_root is not None:
                 return PlanningOutcome(
                     missing_information=(
@@ -831,8 +2035,7 @@ class DeterministicPlanner:
             if options.input_folders:
                 resolved_folder = self._resolve_input(options.input_folders[0])
                 if (
-                    resolved_folder is None
-                    or not resolved_folder.resolved.is_dir()
+                    not self._dir_ready(resolved_folder)
                     or resolved_folder.external_root is not None
                 ):
                     return PlanningOutcome(
@@ -869,7 +2072,7 @@ class DeterministicPlanner:
                 )
             )
         resolved = self._resolve_input(str(raw_source))
-        if resolved is None or not resolved.resolved.is_file():
+        if not self._file_ready(resolved):
             return PlanningOutcome(
                 missing_information=(f"File was not found: {raw_source}",)
             )
@@ -948,7 +2151,7 @@ class DeterministicPlanner:
             or next(iter(_extract_folder_candidates(instruction)), ".")
         )
         resolved = self._resolve_folder_candidate(str(raw_folder), instruction)
-        if resolved is None or not resolved.resolved.is_dir():
+        if not self._dir_ready(resolved):
             return PlanningOutcome(
                 missing_information=(
                     f"Folder '{raw_folder}' was not found. Pass --target or --input-folder.",
@@ -986,7 +2189,7 @@ class DeterministicPlanner:
                 missing_information=("Which PDF should be used? Pass --target <path>.",)
             )
         resolved = self._resolve_input(str(raw_target))
-        if resolved is None or not resolved.resolved.is_file():
+        if not self._file_ready(resolved):
             return PlanningOutcome(
                 missing_information=(f"PDF was not found: {raw_target}",)
             )
@@ -1063,7 +2266,7 @@ class DeterministicPlanner:
             return resolved.relative_to(self._workspace).as_posix()
 
         candidate = self._workspace / default_name
-        if not candidate.exists():
+        if not self._output_name_taken(candidate):
             return Path(default_name).as_posix()
         stamp = self._now().strftime("%Y%m%d-%H%M%S")
         default_path = Path(default_name)
@@ -1072,10 +2275,16 @@ class DeterministicPlanner:
         parent = default_path.parent
         candidate_name = (parent / f"{stem}-{stamp}{suffix}").as_posix()
         counter = 2
-        while (self._workspace / candidate_name).exists():
+        while self._output_name_taken(self._workspace / candidate_name):
             candidate_name = (parent / f"{stem}-{stamp}-{counter}{suffix}").as_posix()
             counter += 1
         return candidate_name
+
+    @staticmethod
+    def _output_name_taken(candidate: Path) -> bool:
+        # A name promised to an earlier step of the same multi-step plan is
+        # just as taken as an existing file.
+        return candidate.exists() or candidate.resolve() in _PROMISED_OUTPUTS.get()
 
 
 def plan_with_provider(
@@ -1118,6 +2327,8 @@ def plan_with_provider(
             "Only use an intent/tool_id pair from available_tools, or intent unsupported.",
             "All paths must be workspace-relative; never invent absolute paths.",
             "If a required path is unclear, set intent unsupported and list missing_information.",
+            "For several sequential tools, return a top-level steps array (2 to 5 steps) instead of a single intent/tool_id.",
+            "In a later step, the exact string $step<N>.output_path (1-based earlier step) as an argument value consumes that step's output file.",
         ],
         "required_json_shape": {
             "intent": "string",
@@ -1126,6 +2337,7 @@ def plan_with_provider(
             "expected_pages": "integer or null",
             "summary": "string",
             "missing_information": ["string"],
+            "steps": "optional array of 2 to 5 objects, each {intent, tool_id, arguments, expected_pages, summary}",
         },
     }
     routed = router.complete(
@@ -1146,6 +2358,12 @@ def plan_with_provider(
             planner=f"ai:{routed.response.provider}:{routed.response.model}",
             provider_attempts=routed.attempts,
         )
+    if isinstance(plan, MultiStepPlan):
+        return PlanningOutcome(
+            multi_plan=plan,
+            planner=plan.planner,
+            provider_attempts=routed.attempts,
+        )
     return PlanningOutcome(
         plan=plan,
         planner=plan.planner,
@@ -1153,7 +2371,9 @@ def plan_with_provider(
     )
 
 
-def _validate_ai_plan(content: str, response: Any) -> TaskPlan | PlanningOutcome:
+def _validate_ai_plan(
+    content: str, response: Any
+) -> TaskPlan | MultiStepPlan | PlanningOutcome:
     data = _parse_json_object(content)
     allowed_keys = {
         "intent",
@@ -1162,6 +2382,7 @@ def _validate_ai_plan(content: str, response: Any) -> TaskPlan | PlanningOutcome
         "expected_pages",
         "summary",
         "missing_information",
+        "steps",
     }
     if set(data) - allowed_keys:
         raise PlanningError("AI plan contained unknown top-level fields.")
@@ -1175,6 +2396,8 @@ def _validate_ai_plan(content: str, response: Any) -> TaskPlan | PlanningOutcome
 
     if intent == "unsupported" or missing:
         return PlanningOutcome(missing_information=missing or (summary,))
+    if data.get("steps") is not None:
+        return _validate_ai_steps(data["steps"], summary, response)
     if intent not in _INTENT_TO_TOOL:
         raise PlanningError(f"AI proposed an unsupported intent: {intent}")
     tool_id = data.get("tool_id")
@@ -1201,6 +2424,100 @@ def _validate_ai_plan(content: str, response: Any) -> TaskPlan | PlanningOutcome
     )
 
 
+_AI_STEP_REFERENCE = re.compile(r"^\$step(\d+)\.output_path$")
+
+
+def _validate_ai_steps(raw_steps: Any, summary: str, response: Any) -> MultiStepPlan:
+    """Validate an AI-proposed ``steps`` array with the single-step rules.
+
+    Every step must pass the same per-intent argument validation as a
+    single-step AI plan. The sentinel value ``$step<N>.output_path`` is the
+    only cross-step reference allowed; it is substituted with that step's
+    planned output for validation and recorded as a run-time binding so the
+    actual (possibly recovery-renamed) output is used when executing.
+    """
+
+    if not isinstance(raw_steps, list) or not (2 <= len(raw_steps) <= MAX_PLAN_STEPS):
+        raise PlanningError(
+            f"AI multi-step plan must contain 2 to {MAX_PLAN_STEPS} steps."
+        )
+    planner_name = f"ai:{response.provider}:{response.model}"
+    steps: list[TaskPlan] = []
+    all_bindings: list[tuple[StepBinding, ...]] = []
+    allowed_step_keys = {"intent", "tool_id", "arguments", "expected_pages", "summary"}
+    for index, item in enumerate(raw_steps):
+        if not isinstance(item, Mapping):
+            raise PlanningError("AI plan step must be an object.")
+        if set(item) - allowed_step_keys:
+            raise PlanningError("AI plan step contained unknown fields.")
+        step_intent = str(item.get("intent") or "")
+        if step_intent not in _INTENT_TO_TOOL:
+            raise PlanningError(f"AI proposed an unsupported intent: {step_intent}")
+        step_tool = item.get("tool_id")
+        if step_tool != _INTENT_TO_TOOL[step_intent] or step_tool not in _ALLOWED_AI_TOOLS:
+            raise PlanningError("AI plan step intent/tool_id pair is not allow-listed.")
+        raw_arguments = item.get("arguments")
+        if not isinstance(raw_arguments, Mapping):
+            raise PlanningError("AI plan step arguments must be an object.")
+        substituted: dict[str, Any] = dict(raw_arguments)
+        bindings: dict[str, StepBinding] = {}
+        for key, value in raw_arguments.items():
+            if not isinstance(value, str):
+                continue
+            match = _AI_STEP_REFERENCE.match(value.strip())
+            if match is not None:
+                reference = int(match.group(1)) - 1
+                if not 0 <= reference < index:
+                    raise PlanningError(
+                        "AI plan step reference must point to an earlier step."
+                    )
+                previous_output = steps[reference].arguments.get("output_path")
+                if not isinstance(previous_output, str) or not previous_output:
+                    raise PlanningError(
+                        "AI plan step reference points to a step without an "
+                        "output_path."
+                    )
+                substituted[key] = previous_output
+                bindings[key] = StepBinding(argument=key, from_step=reference)
+            elif value.strip().startswith("$step"):
+                raise PlanningError("AI plan contains a malformed step reference.")
+        arguments = _validate_ai_arguments(step_intent, substituted)
+        for key in bindings:
+            if key not in arguments:
+                raise PlanningError(
+                    "AI plan step reference targets an unsupported argument."
+                )
+        expected = item.get("expected_pages")
+        if expected is not None and (
+            not isinstance(expected, int) or isinstance(expected, bool) or expected < 1
+        ):
+            raise PlanningError(
+                "AI plan step expected_pages must be a positive integer or null."
+            )
+        if step_intent == "pdf.verify" and expected is not None:
+            arguments["expected_pages"] = expected
+        steps.append(
+            TaskPlan(
+                intent=step_intent,
+                tool_id=str(step_tool),
+                arguments=arguments,
+                summary=(
+                    _short_string(item.get("summary"), 300)
+                    or f"AI step {index + 1}: {step_tool}"
+                ),
+                planner=planner_name,
+                expected_pages=expected,
+            )
+        )
+        all_bindings.append(tuple(bindings.values()))
+    return MultiStepPlan(
+        steps=tuple(steps),
+        bindings=tuple(all_bindings),
+        summary=summary,
+        planner=planner_name,
+    )
+
+
 def _validate_ai_arguments(intent: str, raw: Mapping[str, Any]) -> dict[str, Any]:
     allowed_by_intent = {
         "pdf.merge_folders": {"input_folders", "output_path", "recursive"},
@@ -1214,6 +2531,23 @@ def _validate_ai_arguments(intent: str, raw: Mapping[str, Any]) -> dict[str, Any
         "office.json_to_csv": {"input_path", "output_path"},
         "office.csv_to_xlsx": {"input_path", "output_path", "sheet_name"},
         "desktop.system_info": set(),
+        "desktop.windows": {"max_windows", "include_untitled"},
+        "desktop.window_inspect": {
+            "window_handle",
+            "window_title",
+            "window_title_contains",
+            "window_class_name",
+            "window_process_id",
+            "max_elements",
+            "include_offscreen",
+        },
+        "git.status": {"repository"},
+        "git.log": {"repository", "max_count"},
+        "git.diff_summary": {"repository", "staged"},
+        "browser.status": set(),
+        "browser.snapshot": {"max_chars", "max_links"},
+        "image.inspect": {"path", "include_color_stats"},
+        "image.compare": {"first", "second"},
     }
     if set(raw) - allowed_by_intent[intent]:
         raise PlanningError("AI plan contained unknown tool arguments.")
@@ -1271,6 +2605,113 @@ def _validate_ai_arguments(intent: str, raw: Mapping[str, Any]) -> dict[str, Any
             if not isinstance(sheet_name, str) or not 1 <= len(sheet_name.strip()) <= 31:
                 raise PlanningError("AI plan sheet_name is invalid.")
             result["sheet_name"] = sheet_name.strip()
+    elif intent in {"git.status", "git.log", "git.diff_summary"}:
+        result["repository"] = _ai_relative_path(
+            raw.get("repository", "."), "repository"
+        )
+        if intent == "git.log" and raw.get("max_count") is not None:
+            count = raw["max_count"]
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or not 1 <= count <= 50
+            ):
+                raise PlanningError("AI plan max_count is invalid.")
+            result["max_count"] = count
+        if intent == "git.diff_summary" and raw.get("staged") is not None:
+            result["staged"] = _ai_bool(raw["staged"], "staged")
+    elif intent == "browser.status":
+        if raw:
+            raise PlanningError("AI browser.status plan takes no arguments.")
+    elif intent == "browser.snapshot":
+        for field_name, low, high in (
+            ("max_chars", 500, 100000),
+            ("max_links", 0, 200),
+        ):
+            if raw.get(field_name) is not None:
+                number = raw[field_name]
+                if (
+                    not isinstance(number, int)
+                    or isinstance(number, bool)
+                    or not low <= number <= high
+                ):
+                    raise PlanningError(f"AI plan {field_name} is invalid.")
+                result[field_name] = number
+    elif intent == "desktop.windows":
+        if raw.get("max_windows") is not None:
+            maximum = raw["max_windows"]
+            if (
+                not isinstance(maximum, int)
+                or isinstance(maximum, bool)
+                or not 1 <= maximum <= 200
+            ):
+                raise PlanningError("AI plan max_windows is invalid.")
+            result["max_windows"] = maximum
+        if raw.get("include_untitled") is not None:
+            result["include_untitled"] = _ai_bool(
+                raw["include_untitled"], "include_untitled"
+            )
+    elif intent == "desktop.window_inspect":
+        for field_name, max_length in (
+            ("window_title", 1000),
+            ("window_title_contains", 1000),
+            ("window_class_name", 256),
+        ):
+            if raw.get(field_name) is not None:
+                result[field_name] = _ai_short_string(
+                    raw[field_name], field_name, max_length=max_length
+                )
+        if raw.get("window_handle") is not None:
+            handle = _ai_short_string(raw["window_handle"], "window_handle", max_length=32)
+            if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", handle) is None:
+                raise PlanningError("AI plan window_handle is invalid.")
+            result["window_handle"] = handle
+        if raw.get("window_process_id") is not None:
+            pid = raw["window_process_id"]
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
+                raise PlanningError("AI plan window_process_id is invalid.")
+            result["window_process_id"] = pid
+        if not any(
+            key in result
+            for key in (
+                "window_handle",
+                "window_title",
+                "window_title_contains",
+                "window_class_name",
+                "window_process_id",
+            )
+        ):
+            raise PlanningError("AI desktop.window_inspect plan needs a window selector.")
+        if raw.get("max_elements") is not None:
+            maximum = raw["max_elements"]
+            if (
+                not isinstance(maximum, int)
+                or isinstance(maximum, bool)
+                or not 1 <= maximum <= 1000
+            ):
+                raise PlanningError("AI plan max_elements is invalid.")
+            result["max_elements"] = maximum
+        if raw.get("include_offscreen") is not None:
+            result["include_offscreen"] = _ai_bool(
+                raw["include_offscreen"], "include_offscreen"
+            )
+    elif intent == "image.inspect":
+        path = _ai_relative_path(raw.get("path"), "path")
+        if Path(path).suffix.lower() not in _IMAGE_SUFFIXES:
+            raise PlanningError("AI image.inspect path must be a supported image file.")
+        result["path"] = path
+        if raw.get("include_color_stats") is not None:
+            result["include_color_stats"] = _ai_bool(
+                raw["include_color_stats"], "include_color_stats"
+            )
+    elif intent == "image.compare":
+        for field_name in ("first", "second"):
+            path = _ai_relative_path(raw.get(field_name), field_name)
+            if Path(path).suffix.lower() not in _IMAGE_SUFFIXES:
+                raise PlanningError(
+                    f"AI image.compare {field_name} must be a supported image file."
+                )
+            result[field_name] = path
     elif intent == "desktop.system_info":
         if raw:
             raise PlanningError("AI desktop.system_info plan takes no arguments.")
@@ -1287,6 +2728,17 @@ def _validate_ai_arguments(intent: str, raw: Mapping[str, Any]) -> dict[str, Any
                 raise PlanningError("AI plan max_results is invalid.")
             result["max_results"] = maximum
     return result
+
+
+def _ai_short_string(value: Any, field: str, *, max_length: int) -> str:
+    if not isinstance(value, str):
+        raise PlanningError(f"AI plan {field} must be a string.")
+    cleaned = value.strip()
+    if not cleaned or len(cleaned) > max_length:
+        raise PlanningError(f"AI plan {field} has an invalid length.")
+    if any(ord(ch) < 32 and ch not in "\t" for ch in cleaned):
+        raise PlanningError(f"AI plan {field} contains control characters.")
+    return cleaned
 
 
 def _ai_path_list(value: Any, field: str, *, min_items: int = 1) -> list[str]:
@@ -1341,6 +2793,117 @@ def _short_string(value: Any, max_length: int) -> str:
     if not isinstance(value, str):
         return ""
     return value.strip()[:max_length]
+
+
+_URL_RE = re.compile(
+    r"https?://[^\s\"'<>]+|www\.[^\s\"'<>]+|"
+    r"[a-z0-9-]+(?:\.[a-z0-9-]+)+\.(?:com|org|net|io|dev|app|pk|edu|gov|info|co)"
+    r"(?:/[^\s\"'<>]*)?",
+    re.IGNORECASE,
+)
+
+
+def _extract_url(instruction: str) -> str | None:
+    match = _URL_RE.search(instruction)
+    if match is None:
+        return None
+    candidate = match.group(0).rstrip(".,;:!?)]")
+    if candidate.lower().startswith(("http://", "https://")):
+        return candidate
+    return f"https://{candidate}"
+
+
+_THEN_RE = re.compile(r"\bthen\b", re.IGNORECASE)
+_FILE_TOKEN_RE = re.compile(
+    r"\.(pdf|docx|xlsx|pptx|csv|json|txt|md|png|jpe?g|gif|bmp|webp|tiff?)\b",
+    re.IGNORECASE,
+)
+_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"})
+_IMAGE_OUTPUT_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"})
+_IMAGE_TOKEN_RE = re.compile(
+    r"(?i)[^\s,;\"]+?\.(?:png|jpe?g|gif|bmp|webp|tiff?)"
+)
+
+
+def _split_then_clauses(instruction: str) -> list[str]:
+    """Split a compound instruction on the word 'then' outside quotes.
+
+    "Merge PDFs from A and B, then extract pages 1-2" becomes two clauses.
+    Quoted text (find/replace strings, paragraphs, search queries) is never
+    split. Anything that does not yield at least two non-empty clauses comes
+    back as a single-element list, preserving pre-Phase-11 behavior.
+    """
+
+    cuts: list[tuple[int, int]] = []
+    in_single = False
+    in_double = False
+    index = 0
+    while index < len(instruction):
+        char = instruction[index]
+        if char == "'" and not in_double:
+            in_single = not in_single
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            index += 1
+            continue
+        if not in_single and not in_double:
+            match = _THEN_RE.match(instruction, index)
+            if match is not None:
+                cuts.append((match.start(), match.end()))
+                index = match.end()
+                continue
+        index += 1
+    if not cuts:
+        stripped = instruction.strip()
+        return [stripped] if stripped else []
+    raw_clauses: list[str] = []
+    previous = 0
+    for start, end in cuts:
+        raw_clauses.append(instruction[previous:start])
+        previous = end
+    raw_clauses.append(instruction[previous:])
+    clauses: list[str] = []
+    for raw in raw_clauses:
+        text = raw.strip().strip(",;").strip()
+        text = re.sub(r"\band\s*$", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^and\b\s*", "", text, flags=re.IGNORECASE)
+        text = text.strip().strip(",;").strip()
+        if text:
+            clauses.append(text)
+    return clauses
+
+
+def _clause_names_file(clause: str) -> bool:
+    return _FILE_TOKEN_RE.search(clause) is not None
+
+
+def _step_output_value(plan: TaskPlan) -> str | None:
+    value = plan.arguments.get("output_path") or plan.arguments.get("output")
+    return value if isinstance(value, str) and value else None
+
+
+def _target_suffix_matches(plan: TaskPlan, target_path: str) -> bool:
+    """Sanity check for an implicitly inherited previous-step output."""
+
+    suffix = Path(target_path).suffix.lower()
+    tool = plan.tool_id
+    if tool.startswith("pdf."):
+        return suffix == ".pdf"
+    if tool.startswith("office.docx_"):
+        return suffix == ".docx"
+    if tool.startswith("office.xlsx_"):
+        return suffix == ".xlsx"
+    if tool in {"office.csv_to_json", "office.csv_to_xlsx", "office.csv_inspect"}:
+        return suffix == ".csv"
+    if tool == "office.json_to_csv":
+        return suffix == ".json"
+    if tool in {"office.inspect", "office.extract_text"}:
+        return suffix in {".docx", ".xlsx", ".pptx", ".csv"}
+    if tool.startswith("image."):
+        return suffix in _IMAGE_SUFFIXES
+    return True
 
 
 def _looks_like_pdf_merge(lowered: str) -> bool:
@@ -1546,6 +3109,32 @@ def _extract_file_tokens(instruction: str, suffix: str) -> list[str]:
         if value and value not in tokens:
             tokens.append(value)
     return tokens
+
+
+def _extract_image_tokens(instruction: str) -> list[str]:
+    tokens: list[str] = []
+    for value in _extract_quoted(instruction):
+        if Path(value).suffix.lower() in _IMAGE_SUFFIXES and value not in tokens:
+            tokens.append(value)
+    for match in _IMAGE_TOKEN_RE.finditer(instruction):
+        value = match.group(0).strip().strip("\"'`")
+        if value and value not in tokens:
+            tokens.append(value)
+    return tokens
+
+
+def _image_target_suffix(lowered: str) -> str | None:
+    match = re.search(r"\b(?:to|into)\s+(png|jpeg|jpg|webp|bmp|tiff)\b", lowered)
+    if not match:
+        return None
+    return {
+        "png": ".png",
+        "jpeg": ".jpg",
+        "jpg": ".jpg",
+        "webp": ".webp",
+        "bmp": ".bmp",
+        "tiff": ".tiff",
+    }[match.group(1)]
 
 
 def _extract_office_tokens(instruction: str) -> list[str]:

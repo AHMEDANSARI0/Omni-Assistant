@@ -6,6 +6,7 @@ from .base import (
     CompletionRequest,
     CompletionResponse,
     HttpJsonRequest,
+    ImageInput,
     MessageRole,
 )
 from .router import (
@@ -22,6 +23,7 @@ __all__ = [
     "CompletionRequest",
     "CompletionResponse",
     "HttpJsonRequest",
+    "ImageInput",
     "MessageRole",
     "ModelRouter",
     "ProviderAttempt",
