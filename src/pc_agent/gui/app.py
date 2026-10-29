@@ -33,16 +33,25 @@ from .controller import (
     WebFetchOutcome,
     format_approval_request,
     format_diagnosis,
+    format_downloaded_update,
     format_execution_report,
     format_license_status,
+    format_online_stage_result,
+    format_online_update_check,
     format_provider_statuses,
     format_recovery_outcome,
     format_recovery_scan,
+    format_release_audit,
+    format_self_repair_diagnosis,
+    format_staged_update,
     format_task_details,
     format_tool,
     format_tool_result,
+    format_update_check,
+    format_update_list,
     parse_json_object,
     parse_line_list,
+    parse_optional_float,
     parse_optional_int,
 )
 
@@ -275,7 +284,7 @@ class PcAgentGuiApp:
     def _build_dashboard_tab(self) -> None:
         tab = self.dashboard_tab
         tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(2, weight=1)
+        tab.rowconfigure(3, weight=1)
 
         actions = ttk.Frame(tab)
         actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -284,6 +293,14 @@ class PcAgentGuiApp:
         )
         ttk.Button(
             actions, text="Recovery Scan", command=self._run_recovery_scan
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            actions,
+            text="Self-Repair Diagnose",
+            command=self._run_self_repair_diagnosis,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            actions, text="Release Audit", command=self._run_release_audit
         ).pack(side="left", padx=(6, 0))
         ttk.Button(actions, text="Create PDF Demo", command=self._create_pdf_demo).pack(
             side="left", padx=(18, 0)
@@ -316,8 +333,110 @@ class PcAgentGuiApp:
             license_frame, text="Deactivate", command=self._deactivate_license
         ).grid(row=0, column=3, sticky="e", padx=(6, 0))
 
+        update_frame = ttk.LabelFrame(
+            tab,
+            text="Signed Updates (Offline + Explicit Online)",
+            style="Section.TLabelframe",
+            padding=6,
+        )
+        update_frame.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        update_frame.columnconfigure(1, weight=1)
+        self.update_bundle_var = tk.StringVar(value="")
+        self.update_signature_var = tk.StringVar(value="")
+        self.update_id_var = tk.StringVar(value="latest-staged")
+        self.update_feed_url_var = tk.StringVar(
+            value=self.settings.update_feed_url or ""
+        )
+        self.update_channel_var = tk.StringVar(value=self.settings.update_channel)
+        self.update_allow_unsigned_var = tk.BooleanVar(value=False)
+        self.update_allow_downgrade_var = tk.BooleanVar(value=False)
+        ttk.Label(update_frame, text="Bundle").grid(
+            row=0, column=0, sticky="w", padx=(0, 6), pady=2
+        )
+        ttk.Entry(update_frame, textvariable=self.update_bundle_var).grid(
+            row=0, column=1, sticky="ew", pady=2
+        )
+        ttk.Button(
+            update_frame, text="Browse...", command=self._browse_update_bundle
+        ).grid(row=0, column=2, sticky="e", padx=(6, 0), pady=2)
+        ttk.Label(update_frame, text="Signature").grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=2
+        )
+        ttk.Entry(update_frame, textvariable=self.update_signature_var).grid(
+            row=1, column=1, sticky="ew", pady=2
+        )
+        ttk.Button(
+            update_frame, text="Browse...", command=self._browse_update_signature
+        ).grid(row=1, column=2, sticky="e", padx=(6, 0), pady=2)
+        ttk.Label(update_frame, text="Update ID").grid(
+            row=2, column=0, sticky="w", padx=(0, 6), pady=2
+        )
+        ttk.Entry(update_frame, textvariable=self.update_id_var).grid(
+            row=2, column=1, sticky="ew", pady=2
+        )
+        ttk.Button(
+            update_frame, text="List Updates", command=self._list_offline_updates
+        ).grid(row=2, column=2, sticky="e", padx=(6, 0), pady=2)
+        ttk.Label(update_frame, text="Online feed").grid(
+            row=3, column=0, sticky="w", padx=(0, 6), pady=2
+        )
+        ttk.Entry(update_frame, textvariable=self.update_feed_url_var).grid(
+            row=3, column=1, sticky="ew", pady=2
+        )
+        ttk.Label(update_frame, text="Online only").grid(
+            row=3, column=2, sticky="e", padx=(6, 0), pady=2
+        )
+        ttk.Label(update_frame, text="Channel").grid(
+            row=4, column=0, sticky="w", padx=(0, 6), pady=2
+        )
+        ttk.Entry(update_frame, textvariable=self.update_channel_var).grid(
+            row=4, column=1, sticky="ew", pady=2
+        )
+        ttk.Label(update_frame, text="Explicit check/download; no auto-apply").grid(
+            row=4, column=2, sticky="e", padx=(6, 0), pady=2
+        )
+        update_actions = ttk.Frame(update_frame)
+        update_actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Checkbutton(
+            update_actions,
+            text="Allow unsigned",
+            variable=self.update_allow_unsigned_var,
+        ).pack(side="left")
+        ttk.Checkbutton(
+            update_actions,
+            text="Allow downgrade",
+            variable=self.update_allow_downgrade_var,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            update_actions, text="Check Update", command=self._check_offline_update
+        ).pack(side="left", padx=(16, 0))
+        ttk.Button(
+            update_actions, text="Stage Update", command=self._stage_offline_update
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            update_actions, text="Apply Staged", command=self._apply_offline_update
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            update_actions, text="Roll Back", command=self._rollback_offline_update
+        ).pack(side="left", padx=(6, 0))
+        online_actions = ttk.Frame(update_frame)
+        online_actions.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Button(
+            online_actions, text="Check Online", command=self._check_online_update
+        ).pack(side="left")
+        ttk.Button(
+            online_actions,
+            text="Download Online",
+            command=self._download_online_update,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            online_actions,
+            text="Download + Stage",
+            command=self._stage_online_update,
+        ).pack(side="left", padx=(6, 0))
+
         self.doctor_text = self._make_text(tab, height=24, width=96)
-        self.doctor_text.grid(row=2, column=0, sticky="nsew")
+        self.doctor_text.grid(row=3, column=0, sticky="nsew")
 
     def _build_tasks_tab(self) -> None:
         tab = self.tasks_tab
@@ -370,6 +489,11 @@ class PcAgentGuiApp:
         self.task_use_ai_var = tk.BooleanVar(value=False)
         self.task_force_var = tk.BooleanVar(value=False)
         self.task_max_recovery_var = tk.StringVar(value="Default")
+        self.task_token_budget_var = tk.StringVar()
+        self.task_provider_call_budget_var = tk.StringVar()
+        self.task_tool_budget_var = tk.StringVar()
+        self.task_step_budget_var = tk.StringVar()
+        self.task_time_budget_var = tk.StringVar()
 
         self._labeled_entry(controls, "Output (workspace)", self.task_output_var, 8)
         self._labeled_entry(controls, "Target file/folder", self.task_target_var, 10)
@@ -377,8 +501,37 @@ class PcAgentGuiApp:
             controls, "Expected pages", self.task_expected_pages_var, 12
         )
 
+        budgets = ttk.LabelFrame(
+            controls,
+            text="Task budgets (blank=config default; 0=unlimited)",
+            padding=6,
+        )
+        budgets.grid(row=14, column=0, sticky="ew", pady=(4, 4))
+        budgets.columnconfigure(1, weight=1)
+        budgets.columnconfigure(3, weight=1)
+        ttk.Label(budgets, text="Tokens").grid(row=0, column=0, sticky="w")
+        ttk.Entry(budgets, textvariable=self.task_token_budget_var, width=10).grid(
+            row=0, column=1, sticky="ew", padx=(4, 8), pady=2
+        )
+        ttk.Label(budgets, text="Provider calls").grid(row=0, column=2, sticky="w")
+        ttk.Entry(
+            budgets, textvariable=self.task_provider_call_budget_var, width=10
+        ).grid(row=0, column=3, sticky="ew", padx=(4, 0), pady=2)
+        ttk.Label(budgets, text="Tools").grid(row=1, column=0, sticky="w")
+        ttk.Entry(budgets, textvariable=self.task_tool_budget_var, width=10).grid(
+            row=1, column=1, sticky="ew", padx=(4, 8), pady=2
+        )
+        ttk.Label(budgets, text="Steps").grid(row=1, column=2, sticky="w")
+        ttk.Entry(budgets, textvariable=self.task_step_budget_var, width=10).grid(
+            row=1, column=3, sticky="ew", padx=(4, 0), pady=2
+        )
+        ttk.Label(budgets, text="Time seconds").grid(row=2, column=0, sticky="w")
+        ttk.Entry(budgets, textvariable=self.task_time_budget_var, width=10).grid(
+            row=2, column=1, sticky="ew", padx=(4, 8), pady=2
+        )
+
         options = ttk.Frame(controls)
-        options.grid(row=14, column=0, sticky="ew", pady=(4, 2))
+        options.grid(row=15, column=0, sticky="ew", pady=(4, 2))
         ttk.Checkbutton(options, text="Recursive", variable=self.task_recursive_var).pack(
             side="left"
         )
@@ -390,7 +543,7 @@ class PcAgentGuiApp:
         ).pack(side="left", padx=(10, 0))
 
         recovery = ttk.Frame(controls)
-        recovery.grid(row=15, column=0, sticky="ew", pady=(2, 8))
+        recovery.grid(row=16, column=0, sticky="ew", pady=(2, 8))
         ttk.Label(recovery, text="Self-healing retries:").pack(side="left")
         ttk.Combobox(
             recovery,
@@ -401,7 +554,7 @@ class PcAgentGuiApp:
         ).pack(side="left", padx=(6, 0))
 
         buttons = ttk.Frame(controls)
-        buttons.grid(row=16, column=0, sticky="ew")
+        buttons.grid(row=17, column=0, sticky="ew")
         ttk.Button(
             buttons,
             text="Run New Task",
@@ -505,7 +658,15 @@ class PcAgentGuiApp:
         self.doc_title_var = tk.StringVar(value="GUI Document")
         self.pdf_expected_pages_var = tk.StringVar()
         self.pdf_recursive_var = tk.BooleanVar(value=False)
-        self.pdf_pages_var = tk.StringVar(value="1-2")
+        self.pdf_pages_var = tk.StringVar()
+        self.pdf_search_var = tk.StringVar()
+        self.pdf_rotate_var = tk.StringVar(value="90")
+        self.pdf_case_sensitive_var = tk.BooleanVar(value=False)
+        self.pdf_ocr_dpi_var = tk.StringVar(value="200")
+        self.pdf_ocr_language_var = tk.StringVar()
+        self.pdf_ocr_skip_text_var = tk.BooleanVar(value=True)
+        self.pdf_table_min_rows_var = tk.StringVar(value="2")
+        self.pdf_table_min_columns_var = tk.StringVar(value="2")
         self.doc_find_var = tk.StringVar()
         self.doc_replace_var = tk.StringVar()
         self.doc_cell_ref_var = tk.StringVar(value="B2")
@@ -648,9 +809,31 @@ class PcAgentGuiApp:
         ttk.Button(
             pdf_buttons, text="Merge PDF Folders", command=self._pdf_merge_folders
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
-        self._labeled_entry(pdf_panel, "Pages to extract (e.g. 1-3,5)", self.pdf_pages_var, 6)
+        self._labeled_entry(
+            pdf_panel,
+            "PDF pages/order (required for Extract Pages/Reorder; blank = all elsewhere)",
+            self.pdf_pages_var,
+            6,
+        )
+        self._labeled_entry(
+            pdf_panel, "PDF embedded-text search", self.pdf_search_var, 8
+        )
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Case-sensitive PDF text search",
+            variable=self.pdf_case_sensitive_var,
+        ).grid(row=10, column=0, sticky="w", pady=(2, 4))
+        ttk.Label(pdf_panel, text="PDF rotation degrees").grid(
+            row=11, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            pdf_panel,
+            textvariable=self.pdf_rotate_var,
+            values=("-270", "-180", "-90", "90", "180", "270"),
+            state="readonly",
+        ).grid(row=12, column=0, sticky="ew", pady=(2, 4))
         pdf_edit_buttons = ttk.Frame(pdf_panel)
-        pdf_edit_buttons.grid(row=8, column=0, sticky="ew")
+        pdf_edit_buttons.grid(row=13, column=0, sticky="ew")
         pdf_edit_buttons.columnconfigure(0, weight=1)
         pdf_edit_buttons.columnconfigure(1, weight=1)
         ttk.Button(
@@ -659,11 +842,82 @@ class PcAgentGuiApp:
         ttk.Button(
             pdf_edit_buttons, text="Split PDF", command=self._pdf_split
         ).grid(row=0, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Extract Text", command=self._pdf_extract_text
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Search Text", command=self._pdf_search_text
+        ).grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Reorder Pages", command=self._pdf_reorder_pages
+        ).grid(row=2, column=0, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Rotate Pages", command=self._pdf_rotate_pages
+        ).grid(row=2, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="OCR Scanned PDF", command=self._pdf_ocr
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Extract Tables", command=self._pdf_extract_tables
+        ).grid(row=4, column=0, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Inspect Form", command=self._pdf_inspect_form
+        ).grid(row=4, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Fill Form", command=self._pdf_fill_form
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="PDF Security", command=self._pdf_security
+        ).grid(row=6, column=0, sticky="ew", padx=(0, 3), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Protect PDF", command=self._pdf_protect
+        ).grid(row=6, column=1, sticky="ew", padx=(3, 0), pady=2)
+        ttk.Button(
+            pdf_edit_buttons, text="Unprotect PDF", command=self._pdf_unprotect
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            pdf_edit_buttons,
+            text="Inspect Signatures",
+            command=self._pdf_inspect_signatures,
+        ).grid(row=8, column=0, columnspan=2, sticky="ew", pady=2)
+        self._labeled_entry(pdf_panel, "PDF OCR DPI (72-300)", self.pdf_ocr_dpi_var, 14)
+        self._labeled_entry(
+            pdf_panel, "PDF OCR language (optional)", self.pdf_ocr_language_var, 16
+        )
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Reuse embedded-text pages during OCR",
+            variable=self.pdf_ocr_skip_text_var,
+        ).grid(row=18, column=0, sticky="w", pady=(2, 4))
         ttk.Label(
             pdf_panel,
-            text="Extract writes the Output file; Split treats Output as a folder name.",
+            text=(
+                "Extract/Search/Tables read embedded text only. Inspect/Fill Form "
+                "use interactive AcroForm fields already in the PDF. PDF "
+                "Security/Protect/Unprotect are direct-only and collect passwords "
+                "only through hidden dialogs; protect writes a new AES-256 PDF "
+                "with print/extract/fill_forms permissions. Inspect Signatures "
+                "checks CMS/ByteRange cryptography but does not evaluate "
+                "certificate trust or revocation. OCR renders "
+                "at most 10 selected pages and may send scanned page images to the "
+                "configured vision route after approval. Split treats Output "
+                "as a folder; other writers use it as a new file."
+            ),
             wraplength=380,
-        ).grid(row=9, column=0, sticky="w")
+        ).grid(row=19, column=0, sticky="w")
+        self._labeled_entry(
+            pdf_panel, "PDF table min rows", self.pdf_table_min_rows_var, 20
+        )
+        self._labeled_entry(
+            pdf_panel, "PDF table min columns", self.pdf_table_min_columns_var, 22
+        )
+        ttk.Label(
+            pdf_panel,
+            text="PDF form values (one Name=Value per line; checkbox true/false; multi-select uses |)",
+            wraplength=380,
+        ).grid(row=24, column=0, sticky="w")
+        self.pdf_form_values_text = self._make_text(pdf_panel, height=4, width=44)
+        self.pdf_form_values_text.grid(row=25, column=0, sticky="ew", pady=(2, 4))
 
         ttk.Label(
             files_panel,
@@ -1293,6 +1547,206 @@ class PcAgentGuiApp:
 
         self._run_async("Recovery scan", self.controller.recovery_scan, done)
 
+    def _run_self_repair_diagnosis(self) -> None:
+        def done(diagnosis: Any) -> None:
+            self._set_text(
+                self.doctor_text, format_self_repair_diagnosis(diagnosis)
+            )
+
+        self._run_async(
+            "Self-repair diagnosis", self.controller.self_repair_diagnosis, done
+        )
+
+    def _run_release_audit(self) -> None:
+        def done(audit: Any) -> None:
+            self._set_text(self.doctor_text, format_release_audit(audit))
+
+        self._run_async("Release audit", self.controller.release_audit, done)
+
+    def _browse_update_bundle(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            initialdir=str(self.settings.workspace_dir),
+            filetypes=[("Portable release ZIP", "*.zip"), ("All files", "*.*")],
+        )
+        if selected:
+            self.update_bundle_var.set(str(Path(selected)))
+
+    def _browse_update_signature(self) -> None:
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            initialdir=str(self.settings.workspace_dir),
+            filetypes=[("Release signature", "*.sig.json"), ("JSON", "*.json")],
+        )
+        if selected:
+            self.update_signature_var.set(str(Path(selected)))
+
+    def _check_offline_update(self) -> None:
+        bundle = self.update_bundle_var.get()
+        signature = self.update_signature_var.get()
+
+        def done(check: Any) -> None:
+            self._set_text(self.doctor_text, format_update_check(check))
+
+        self._run_async(
+            "Check offline update",
+            lambda: self.controller.check_offline_update(bundle, signature),
+            done,
+        )
+
+    def _stage_offline_update(self) -> None:
+        bundle = self.update_bundle_var.get()
+        signature = self.update_signature_var.get()
+        allow_unsigned = bool(self.update_allow_unsigned_var.get())
+        allow_downgrade = bool(self.update_allow_downgrade_var.get())
+        if allow_unsigned and not messagebox.askokcancel(
+            "Stage unsigned update",
+            "This bundle may be staged without a verified signature. "
+            "Continue only if you already trust its source and SHA-256.",
+            parent=self.root,
+        ):
+            return
+
+        def done(update: Any) -> None:
+            self.update_id_var.set(update.update_id)
+            self._set_text(self.doctor_text, format_staged_update(update))
+
+        self._run_async(
+            "Stage offline update",
+            lambda: self.controller.stage_offline_update(
+                bundle,
+                signature,
+                allow_unsigned=allow_unsigned,
+                allow_downgrade=allow_downgrade,
+            ),
+            done,
+        )
+
+    def _check_online_update(self) -> None:
+        feed_url = self.update_feed_url_var.get()
+        channel = self.update_channel_var.get()
+
+        def done(check: Any) -> None:
+            self._set_text(self.doctor_text, format_online_update_check(check))
+
+        self._run_async(
+            "Check online update",
+            lambda: self.controller.check_online_update(feed_url, channel),
+            done,
+        )
+
+    def _download_online_update(self) -> None:
+        feed_url = self.update_feed_url_var.get()
+        channel = self.update_channel_var.get()
+        allow_downgrade = bool(self.update_allow_downgrade_var.get())
+
+        def done(downloaded: Any) -> None:
+            self.update_bundle_var.set(str(downloaded.bundle_path))
+            self.update_signature_var.set(
+                str(downloaded.signature_path) if downloaded.signature_path else ""
+            )
+            self._set_text(self.doctor_text, format_downloaded_update(downloaded))
+
+        self._run_async(
+            "Download online update",
+            lambda: self.controller.download_online_update(
+                feed_url,
+                channel,
+                allow_downgrade=allow_downgrade,
+            ),
+            done,
+        )
+
+    def _stage_online_update(self) -> None:
+        feed_url = self.update_feed_url_var.get()
+        channel = self.update_channel_var.get()
+        allow_unsigned = bool(self.update_allow_unsigned_var.get())
+        allow_downgrade = bool(self.update_allow_downgrade_var.get())
+        if allow_unsigned and not messagebox.askokcancel(
+            "Stage unsigned online update",
+            "This downloaded bundle may be staged without a verified signature. "
+            "Continue only if you already trust the feed origin and SHA-256.",
+            parent=self.root,
+        ):
+            return
+
+        def done(result: Any) -> None:
+            self.update_bundle_var.set(str(result.downloaded.bundle_path))
+            self.update_signature_var.set(
+                str(result.downloaded.signature_path)
+                if result.downloaded.signature_path
+                else ""
+            )
+            self.update_id_var.set(result.staged.update_id)
+            self._set_text(self.doctor_text, format_online_stage_result(result))
+
+        self._run_async(
+            "Download and stage online update",
+            lambda: self.controller.stage_online_update(
+                feed_url,
+                channel,
+                allow_unsigned=allow_unsigned,
+                allow_downgrade=allow_downgrade,
+            ),
+            done,
+        )
+
+    def _apply_offline_update(self) -> None:
+        update_id = self.update_id_var.get().strip() or "latest-staged"
+        if not messagebox.askokcancel(
+            "Apply offline update",
+            "Apply this staged update to the application root?\n\n"
+            f"Update: {update_id}\nRoot: {self.settings.root_dir}\n\n"
+            "Replaced files are backed up and every applied file is hash-verified. "
+            "You must reinstall editable metadata and restart afterwards.",
+            parent=self.root,
+        ):
+            return
+
+        def done(update: Any) -> None:
+            self.update_id_var.set(update.update_id)
+            self._set_text(self.doctor_text, format_staged_update(update))
+
+        self._run_async(
+            "Apply offline update",
+            lambda: self.controller.apply_offline_update(update_id),
+            done,
+        )
+
+    def _rollback_offline_update(self) -> None:
+        requested = self.update_id_var.get().strip()
+        update_id = (
+            "latest-applied"
+            if requested in {"", "latest-staged"}
+            else requested
+        )
+        if not messagebox.askokcancel(
+            "Roll back offline update",
+            "Roll back this applied update from its receipt backup?\n\n"
+            f"Update: {update_id}\nRoot: {self.settings.root_dir}\n\n"
+            "Rollback refuses to overwrite files changed after the update was applied.",
+            parent=self.root,
+        ):
+            return
+
+        def done(update: Any) -> None:
+            self.update_id_var.set(update.update_id)
+            self._set_text(self.doctor_text, format_staged_update(update))
+
+        self._run_async(
+            "Roll back offline update",
+            lambda: self.controller.rollback_offline_update(update_id),
+            done,
+        )
+
+    def _list_offline_updates(self) -> None:
+        def done(updates: Any) -> None:
+            self._set_text(self.doctor_text, format_update_list(updates))
+
+        self._run_async(
+            "List offline updates", self.controller.list_offline_updates, done
+        )
+
     def _create_pdf_demo(self) -> None:
         def done(demo: Any) -> None:
             lines = ["Demo PDF data is ready in the workspace:"]
@@ -1412,6 +1866,22 @@ class PcAgentGuiApp:
             use_ai=bool(self.task_use_ai_var.get()),
             max_recovery_attempts=(
                 None if max_recovery_raw == "Default" else int(max_recovery_raw)
+            ),
+            token_budget=parse_optional_int(
+                self.task_token_budget_var.get(), label="Token budget"
+            ),
+            provider_call_budget=parse_optional_int(
+                self.task_provider_call_budget_var.get(),
+                label="Provider-call budget",
+            ),
+            tool_budget=parse_optional_int(
+                self.task_tool_budget_var.get(), label="Tool budget"
+            ),
+            step_budget=parse_optional_int(
+                self.task_step_budget_var.get(), label="Step budget"
+            ),
+            task_time_budget_seconds=parse_optional_float(
+                self.task_time_budget_var.get(), label="Task time budget"
             ),
         )
 
@@ -1812,6 +2282,304 @@ class PcAgentGuiApp:
         output_folder = self.doc_output_var.get()
         self._doc_tool(
             "Split PDF", lambda: self.controller.pdf_split(path, output_folder)
+        )
+
+    def _pdf_extract_text(self) -> None:
+        path = self.doc_input_var.get()
+        pages = self.pdf_pages_var.get()
+        output_path = self.doc_output_var.get()
+        self._doc_tool(
+            "Extract PDF text",
+            lambda: self.controller.pdf_extract_text(
+                path, output_path, pages=pages
+            ),
+        )
+
+
+
+    def _pdf_extract_tables(self) -> None:
+        path = self.doc_input_var.get()
+        pages = self.pdf_pages_var.get()
+        output_path = self.doc_output_var.get()
+        try:
+            min_rows = int(self.pdf_table_min_rows_var.get())
+            min_columns = int(self.pdf_table_min_columns_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid table minimum",
+                "PDF table minimum rows and columns must be whole numbers.",
+                parent=self.root,
+            )
+            return
+        if not 1 <= min_rows <= 1000 or not 1 <= min_columns <= 50:
+            messagebox.showerror(
+                "Invalid table minimum",
+                "Use 1-1000 minimum rows and 1-50 minimum columns.",
+                parent=self.root,
+            )
+            return
+        self._doc_tool(
+            "Extract PDF tables",
+            lambda: self.controller.pdf_extract_tables(
+                path,
+                output_path,
+                pages=pages,
+                min_rows=min_rows,
+                min_columns=min_columns,
+            ),
+        )
+
+    def _pdf_inspect_form(self) -> None:
+        path = self.doc_input_var.get()
+        self._doc_tool(
+            "Inspect PDF form",
+            lambda: self.controller.pdf_inspect_form(path),
+        )
+
+    def _pdf_fill_form(self) -> None:
+        path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        lines = parse_line_list(self._get_text(self.pdf_form_values_text))
+        values: dict[str, str] = {}
+        for line in lines:
+            if "=" not in line:
+                messagebox.showerror(
+                    "Invalid PDF form value",
+                    "Use one Name=Value entry per line.",
+                    parent=self.root,
+                )
+                return
+            name, value = line.split("=", 1)
+            name = name.strip()
+            if not name or name in values:
+                messagebox.showerror(
+                    "Invalid PDF form value",
+                    "Field names must be non-empty and unique.",
+                    parent=self.root,
+                )
+                return
+            values[name] = value
+        if not values:
+            messagebox.showerror(
+                "Missing PDF form values",
+                "Enter at least one Name=Value line before filling the form.",
+                parent=self.root,
+            )
+            return
+        self._doc_tool(
+            "Fill PDF form",
+            lambda: self.controller.pdf_fill_form(path, output_path, values),
+        )
+
+    def _ask_pdf_password(
+        self, title: str, prompt: str, *, confirm: bool = False
+    ) -> str | None:
+        password = simpledialog.askstring(
+            title, prompt, show="*", parent=self.root
+        )
+        if password is None:
+            return None
+        if confirm:
+            repeated = simpledialog.askstring(
+                title,
+                "Repeat the password:",
+                show="*",
+                parent=self.root,
+            )
+            if repeated is None:
+                return None
+            if repeated != password:
+                messagebox.showerror(
+                    title,
+                    "The two PDF passwords do not match.",
+                    parent=self.root,
+                )
+                return None
+        return password
+
+    def _pdf_security(self) -> None:
+        path = self.doc_input_var.get()
+        choice = messagebox.askyesnocancel(
+            "Inspect PDF security",
+            (
+                "Test a current password in a hidden dialog?\n\n"
+                "Yes: enter and test the password\n"
+                "No: inspect encryption metadata only\n"
+                "Cancel: do nothing"
+            ),
+            parent=self.root,
+        )
+        if choice is None:
+            return
+        password: str | None = None
+        if choice:
+            password = self._ask_pdf_password(
+                "Inspect PDF security", "Current PDF password:"
+            )
+            if password is None:
+                return
+        self._doc_tool(
+            "Inspect PDF security",
+            lambda: self.controller.pdf_security(path, password=password),
+        )
+
+    def _pdf_protect(self) -> None:
+        path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        try:
+            initial = self.controller.pdf_security(path)
+        except PcAgentError as exc:
+            messagebox.showerror("Protect PDF", str(exc), parent=self.root)
+            return
+        if not initial.success or initial.output is None:
+            self._show_tool_result(self.doc_output_text, initial)
+            return
+        current_password: str | None = None
+        if initial.output.get("encrypted"):
+            current_password = self._ask_pdf_password(
+                "Protect PDF", "Current PDF password:"
+            )
+            if current_password is None:
+                return
+        user_password = self._ask_pdf_password(
+            "Protect PDF",
+            "New PDF user password (minimum 8 characters):",
+            confirm=True,
+        )
+        if user_password is None:
+            return
+        owner_password = self._ask_pdf_password(
+            "Protect PDF",
+            "New PDF owner password (different from the user password):",
+            confirm=True,
+        )
+        if owner_password is None:
+            return
+        self._doc_tool(
+            "Protect PDF",
+            lambda: self.controller.pdf_protect(
+                path,
+                output_path,
+                user_password=user_password,
+                owner_password=owner_password,
+                current_password=current_password,
+            ),
+        )
+
+    def _pdf_unprotect(self) -> None:
+        path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        password = self._ask_pdf_password(
+            "Unprotect PDF", "Current PDF password:"
+        )
+        if password is None:
+            return
+        self._doc_tool(
+            "Unprotect PDF",
+            lambda: self.controller.pdf_unprotect(
+                path, output_path, password=password
+            ),
+        )
+
+    def _pdf_inspect_signatures(self) -> None:
+        path = self.doc_input_var.get()
+        self._doc_tool(
+            "Inspect PDF signatures",
+            lambda: self.controller.pdf_inspect_signatures(path),
+        )
+
+    def _pdf_ocr(self) -> None:
+        path = self.doc_input_var.get()
+        pages = self.pdf_pages_var.get()
+        output_path = self.doc_output_var.get()
+        language = self.pdf_ocr_language_var.get()
+        skip_text_pages = bool(self.pdf_ocr_skip_text_var.get())
+        try:
+            dpi = int(self.pdf_ocr_dpi_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid OCR DPI",
+                "PDF OCR DPI must be a whole number between 72 and 300.",
+                parent=self.root,
+            )
+            return
+        if not 72 <= dpi <= 300:
+            messagebox.showerror(
+                "Invalid OCR DPI",
+                "PDF OCR DPI must be between 72 and 300.",
+                parent=self.root,
+            )
+            return
+        if not messagebox.askokcancel(
+            "Send rendered PDF pages for OCR",
+            (
+                "Render the selected scanned PDF pages and send pages needing OCR "
+                "to the configured vision-provider route? External providers will "
+                "receive those page-image bytes.\n\n"
+                f"PDF: {path}\n"
+                f"Pages: {pages or 'all (maximum 10)'}\n"
+                f"Output: {output_path}\n"
+                f"DPI: {dpi}\n"
+                f"Language: {language or 'auto'}\n"
+                f"Reuse embedded-text pages: {skip_text_pages}"
+            ),
+            parent=self.root,
+        ):
+            return
+        self._doc_tool(
+            "OCR scanned PDF",
+            lambda: self.controller.pdf_ocr(
+                path,
+                output_path,
+                pages=pages,
+                dpi=dpi,
+                language=language,
+                skip_text_pages=skip_text_pages,
+            ),
+        )
+
+    def _pdf_search_text(self) -> None:
+        path = self.doc_input_var.get()
+        query = self.pdf_search_var.get()
+        pages = self.pdf_pages_var.get()
+        case_sensitive = bool(self.pdf_case_sensitive_var.get())
+        self._doc_tool(
+            "Search PDF text",
+            lambda: self.controller.pdf_search_text(
+                path,
+                query,
+                pages=pages,
+                case_sensitive=case_sensitive,
+            ),
+        )
+
+    def _pdf_reorder_pages(self) -> None:
+        path = self.doc_input_var.get()
+        pages = self.pdf_pages_var.get()
+        output_path = self.doc_output_var.get()
+        self._doc_tool(
+            "Reorder PDF pages",
+            lambda: self.controller.pdf_reorder_pages(path, pages, output_path),
+        )
+
+    def _pdf_rotate_pages(self) -> None:
+        path = self.doc_input_var.get()
+        pages = self.pdf_pages_var.get()
+        output_path = self.doc_output_var.get()
+        try:
+            degrees = int(self.pdf_rotate_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid rotation",
+                "Choose -270, -180, -90, 90, 180 or 270 degrees.",
+                parent=self.root,
+            )
+            return
+        self._doc_tool(
+            "Rotate PDF pages",
+            lambda: self.controller.pdf_rotate_pages(
+                path, degrees, output_path, pages=pages
+            ),
         )
 
     def _doc_docx_replace(self) -> None:

@@ -1,5 +1,258 @@
 # Changelog
 
+## 0.29.0 - PHASE 27 PDF Signature Inspection
+
+- **Direct-only signature inspection**: `pc-agent pdf inspect-signatures`
+  and a GUI Documents control report signature fields, ByteRange coverage,
+  DocMDP permission, CMS contents and embedded certificates. No registered
+  tool is added (62 built-ins).
+- **Local CMS verification**: a bounded DER parser checks the exact
+  ByteRange digest against `messageDigest`, verifies CMS signatures with
+  embedded RSA/RSA-PSS/ECDSA/DSA/Ed25519/Ed448 signer certificates, and
+  reports signing time/certificate validity details.
+- **Honest trust boundary**: locally consistent signatures are labelled
+  `cryptographically_valid_untrusted`. Trusted roots, revocation, RFC 3161
+  timestamps, PAdES/LTV and legal policy are not evaluated; no signature is
+  created and no network call is made.
+- **Safety**: read-only, encrypted PDFs refused, bounded file/pages/fields/
+  CMS/certificates/signers, and raw CMS/certificate bytes are not printed.
+  Schema stays v6. Automated suite: 448 passed, 1 skipped; Ruff clean.
+
+## 0.28.0 - PHASE 26 PDF Password Security
+
+- **Direct-only password workflows**: `pc-agent pdf security|protect|unprotect`
+  and masked GUI dialogs inspect PDF encryption, create AES-256 protected
+  copies, change user/owner passwords, and create unencrypted copies after
+  the current password verifies.
+- **Secrets stay off recorded surfaces**: passwords come only from hidden
+  prompts, never from CLI/task/tool arguments, configuration, database
+  records or text/JSON results. No registered tool is added (62 built-ins).
+- **Verified no-overwrite output**: temporary PDFs are tested locked,
+  unlocked with user/owner passwords, rejected with a wrong password, and
+  checked for pages/permissions before publication; sources never change.
+- **Boundaries**: digitally signed PDFs are refused, forgotten-password
+  recovery/cracking is not included, and existing PDF tools still require an
+  unencrypted copy. `pypdf[crypto]` supplies AES; schema stays v6.
+  Automated suite: 443 passed, 1 skipped; Ruff clean.
+
+## 0.27.0 - PHASE 25 PDF Form Workflows
+
+- **Two new PDF tools (62 built-ins)**: `pdf.inspect_form` reports field
+  names/types/values/options/states/flags/widgets in an existing AcroForm,
+  and `pdf.fill_form` writes validated text, choice, checkbox and
+  radio/button values into a new PDF.
+- **No-overwrite verified fill**: source hashes are checked, filling happens
+  in a temporary file, and the result is reopened to compare every changed
+  and untouched field before publication. Read-only, signature, pushbutton,
+  unknown fields and invalid choices/states are refused.
+- **CLI, tasks and GUI**: `pc-agent pdf inspect-form|fill-form`, repeatable
+  task `--form-field Name=Value`, and Documents-panel Inspect/Fill controls.
+  AI planning cannot propose either form tool; orchestrated verification and
+  output-collision recovery independently re-inspect source and output.
+- **Boundaries**: no form creation/design, XFA conversion, password flow,
+  OCR, flattening or digital signing. No runtime dependency or database
+  migration (schema stays v6). Automated suite: 437 passed, 1 skipped; Ruff
+  clean.
+
+## 0.26.0 - PHASE 24 Online Signed Update Download
+
+- **Explicit online downloads, still default-off**: new
+  `PC_AGENT_ONLINE_UPDATES`, `PC_AGENT_UPDATE_FEED_URL`,
+  `PC_AGENT_UPDATE_CHANNEL`, timeout and maximum-bundle settings gate
+  direct CLI/GUI update-feed access. Nothing polls or downloads in the
+  background.
+- **Strict same-origin feed**: format-1 JSON rejects duplicate/unknown
+  fields, wrong applications/channels, credential/query/fragment URLs,
+  cross-origin bundle or signature links, public HTTP, unsafe resolved
+  addresses, cross-origin redirects and oversized responses.
+- **Verified download receipts**: downloaded bundles must match the feed
+  size and SHA-256, then pass the existing portable-bundle and detached
+  Ed25519 checks. Feed, bundle, signature and receipt are retained under
+  `data/updates/downloads` for inspection.
+- **CLI and GUI**: `pc-agent update online-check|online-download|online-stage`
+  and matching Doctor-tab controls. Check-only mode does not claim bundle
+  authentication, download mode does not stage, and online staging never
+  auto-applies; Phase 21 apply/rollback remain separate explicit steps.
+- **Trust reporting**: Doctor and release audit report online-update state,
+  only the feed host/channel and whether the strongest signed policy is
+  configured. Invalid/key-mismatched downloads cannot be staged.
+- No new tool (60 built-ins), runtime dependency or database migration
+  (schema stays v6). Automated suite: 431 passed, 1 skipped; Ruff clean.
+
+## 0.25.0 - PHASE 23 PDF Table Extraction
+
+- **One new PDF tool (60 built-ins)**: `pdf.extract_tables` reconstructs
+  bounded tables from embedded PDF character geometry into a new verified
+  JSON file, or CSV when exactly one table is detected.
+- **Embedded text only, never OCR**: scanned/image-only PDFs honestly
+  produce zero tables in JSON instead of inventing rows. Sources are never
+  modified and outputs are never overwritten.
+- **Deterministic geometry pipeline**: PDFium character boxes are grouped
+  into words, lines, candidate cells and recurring x-range columns with
+  configurable minimum rows/columns.
+- **Bounds**: 100 selected pages, 200 tables, 1,000 rows per table, 50
+  columns, 100,000 cells and 2,000,000 examined embedded characters.
+- **CLI, tasks and GUI**: direct `pc-agent pdf extract-tables`,
+  deterministic planner support with `--pdf-table-min-*` options, and
+  Documents-tab controls. AI planning cannot propose the writer.
+- **Verification and recovery**: orchestrated runs independently rerun the
+  local extraction and compare rendered bytes/counts/hash; output
+  collisions can recover to a fresh file while preserving the original.
+- No new runtime dependency or database migration (schema stays v6);
+  Phase 22's `pypdfium2` is reused. Automated suite: 423 passed, 1 skipped;
+  Ruff clean.
+
+## 0.24.0 - PHASE 22 Scanned PDF OCR
+
+- **One new PDF tool (59 built-ins)**: `pdf.ocr` renders up to 10 selected
+  pages locally with PDFium and transcribes scanned pages through the
+  configured vision-provider route into a new verified .txt/.md/.json file.
+- **Embedded pages stay local by default**: pages with embedded text reuse
+  that text without a provider send; `--include-text-pages` /
+  `--pdf-ocr-all-pages` can deliberately OCR them too. Sources are never
+  modified and outputs are never overwritten.
+- **Bounded, gated sends**: 72-300 DPI, rendered/sent pixel and byte bounds,
+  per-page output-token bounds, a 200,000-character result cap, the
+  default-off `PC_AGENT_ALLOW_VISION` gate, exact approvals and task budgets.
+- **Honest verification**: output hash/size, selected/source pages,
+  independently re-extracted embedded text, counts, provider/model and
+  sent-image metadata are checked. Provider OCR wording is not resent or
+  claimed to be deterministically word-verified, and OCR is never
+  auto-retried.
+- **CLI, tasks and GUI**: direct `pc-agent pdf ocr`, deterministic planner
+  support with `--pdf-ocr-*` options, and Documents-tab OCR controls. AI
+  planning cannot propose the OCR writer.
+- New runtime dependency `pypdfium2>=5,<6`; no database migration (schema
+  stays v6). Automated suite: 416 passed, 1 skipped; Ruff clean.
+
+## 0.23.0 - PHASE 21 Signed Offline Updates
+
+- **Detached Ed25519 release signatures**: portable bundle version and
+  SHA-256 can be signed with a vendor-only release key and verified against
+  `PC_AGENT_RELEASE_PUBLIC_KEY`. Optional key-ID pinning and
+  `PC_AGENT_REQUIRE_SIGNED_UPDATES=1` fail closed; unsigned bundles need an
+  explicit `--allow-unsigned` staging decision.
+- **Safe staging, apply and rollback**: `pc-agent update
+  check|stage|apply|rollback|list|show` verifies bundle and staged hashes,
+  applies an approved overlay only after complete backups, auto-restores on
+  apply failure, preserves stale/created files, and refuses rollback over
+  later user edits.
+- **Vendor signing tool**: `pc-agent-release-admin keygen|sign` creates a
+  release Ed25519 keypair and signs verified bundles. Private-key files and
+  key containers are now hard-excluded from release bundles.
+- **GUI and audit integration**: the Dashboard gains check/stage/apply/
+  rollback/list controls with confirmations, Doctor shows only public-key
+  configuration status, and the release audit reports signed-update trust.
+- No network updater, planner tool, database migration or runtime
+  dependency (schema stays v6; built-ins stay at 58). Automated suite:
+  408 passed, 1 skipped; Ruff clean.
+
+## 0.22.0 - PHASE 20 PDF Text + Page Transforms
+
+- **Four new PDF tools (58 built-ins)**: `pdf.extract_text`,
+  `pdf.search_text`, `pdf.reorder_pages` and `pdf.rotate_pages` complete
+  the PDF text/reordering/rotation work Phase 9 left for later.
+- **Embedded text, never OCR**: bounded extraction to text/Markdown/JSON
+  and exact-phrase search with page snippets. Image-only/scanned PDFs
+  honestly report `has_embedded_text=false`; limits are 500 selected pages
+  and 5,000,000 extracted characters.
+- **Verified page transforms**: full/reverse reordering and selected
+  quarter-turn rotations write only new PDFs. Core and orchestrator
+  verification compare page count, SHA-256, per-page content fingerprints,
+  exact output order and final rotations; sources are never modified.
+- **CLI, tasks and GUI**: direct `pc-agent pdf extract-text|search|reorder|
+  rotate`, deterministic planner/task support and Documents-tab controls.
+  AI planning may propose only read-only `pdf.search_text`; the writers
+  remain deterministic/direct.
+- **Recovery and strict schemas**: new writers participate in fresh-output
+  collision recovery, and the tool schema validator now enforces declared
+  enums such as text format and quarter-turn degrees.
+- No database migration or runtime dependency (schema stays v6).
+  Automated suite: 395 passed, 1 skipped; Ruff clean.
+
+## 0.21.0 - PHASE 19 Direct Anthropic Provider
+
+- **Direct Anthropic Messages API**: `anthropic` is now a real provider
+  rather than a reserved route slot. It uses HTTPS Bearer authentication,
+  `anthropic-version: 2026-10-21`, top-level system blocks, bounded
+  `max_tokens`, text-block extraction and the shared bounded HTTP transport.
+- **Vision and budgets**: the adapter supports inline base64 PNG, JPEG,
+  WebP and GIF blocks for the existing approved vision path and forwards
+  Anthropic `input_tokens` / `output_tokens` usage into Phase 17 task
+  budgets.
+- **Current API semantics**: never sends `temperature`, `top_p` or `top_k`
+  because API version `2026-10-21` removed them; Anthropic refusals,
+  errors and empty responses fail as provider errors instead of fake
+  successes.
+- **Credentials and routing**: uses the existing `ANTHROPIC_API_KEY` / Windows
+  Credential Manager resolution and is skipped when no key is configured.
+  CLI, GUI, Doctor and diagnostics show status/model/source only, never a
+  key. The default model is `claude-sonnet-5-5`.
+- **Production-audit wording**: when a stored provider key still has an
+  environment/`.env` copy, the existing warning now says to remove that
+  `.env` line if Credential Manager should become the effective source.
+- No new registered tool, runtime dependency or database migration (schema
+  stays v6; built-ins stay at 54). Automated suite: 387 passed, 1 skipped;
+  Ruff clean.
+
+## 0.20.0 - PHASE 18 Production Hardening + Portable Windows Release
+
+- **Production audit**: `pc-agent release audit` performs read-only,
+  secret-free checks for versions, database integrity/schema, folders, TLS,
+  provider route, credential sources, optional gates, finite budgets,
+  self-repair baseline, licensing posture and release contents. Doctor and
+  the GUI Dashboard expose the same audit summary.
+- **Deterministic portable bundles**: `release build|verify|info` creates
+  and verifies fixed-timestamp ZIPs from a strict allow-list with a sorted
+  SHA-256 manifest. Real `.env` files, databases, data, workspace contents,
+  virtual environments, patchers and caches are excluded; verification
+  rejects traversal, duplicates, symlinks, forbidden paths and mismatches
+  without extracting the archive.
+- **Database maintenance**: `maintenance backup|list|verify|restore` uses
+  SQLite's backup API with strict hash/schema manifests. Restore is
+  approval-gated and creates a verified pre-restore backup before replacing
+  the live database.
+- **Redacted diagnostics**: `diagnostics export` and `doctor --json`
+  include versions, paths, provider/tool names and counts/statuses while
+  excluding API/license keys, task instructions, memory values, prompts,
+  tool arguments/outputs and document contents.
+- **Portable Windows helpers**: plain-text PowerShell install, conservative
+  exact-path uninstall and release-build scripts, plus GUI/CLI `.cmd`
+  launchers. Installation remains editable source in `.venv`; there is no
+  signed executable or auto-updater.
+- No new registered tool, runtime dependency or database migration (schema
+  stays v6; built-ins stay at 54). Automated suite: 376 passed, 1 skipped;
+  Ruff clean.
+
+## 0.19.0 - PHASE 17 Core Self-Repair + Token/Task Budgets
+
+- **Deterministic core self-repair**: a default-off
+  `PC_AGENT_ALLOW_SELF_REPAIR` gate enables `pc-agent self-repair
+  baseline|diagnose|stage|apply|rollback|list|show`. Only `src/`, `tests/`
+  and `pyproject.toml` are baseline-eligible; only baseline restoration and
+  generated Python-cache deletion can be staged. Extra files are reported,
+  never deleted, and no AI tool/planner path can invoke repair.
+- **Isolated, reversible repairs**: staging excludes `.env`, runs fixed
+  static/import/full argv checks with a scrubbed environment, and blocks
+  corrupt, invalid, stale or version-mismatched plans. Apply backs up live
+  targets, post-checks, automatically rolls back on failure, and supports a
+  later manual rollback.
+- **Per-task budgets**: orchestrated execute/resume/workflow replay now
+  enforce provider token, logical provider-call, planned-tool, planned-step
+  and wall-time limits. Reported provider usage is preferred; otherwise a
+  transparent estimate is used. A pre-call token reserve prevents sending a
+  request that cannot fit. Vision calls use the same tracker, reports/events
+  expose a secret-free snapshot, and budget failures are non-retryable.
+- **Bootstrap repair entry point**: `pc-agent-self-repair` exposes the same
+  gated repair commands without importing the full CLI/orchestrator, so a
+  syntax-damaged core module can still be staged and restored.
+- **CLI/GUI/Doctor visibility**: execution commands accept five budget
+  override flags; Doctor reports budget defaults plus baseline/latest repair
+  status; the GUI Tasks tab has budget fields and the Dashboard has a
+  read-only Self-Repair Diagnose action. Repair mutations remain CLI-only.
+- No new runtime dependency or database migration (schema stays v6).
+  Automated suite: 362 passed, 1 skipped; Ruff clean.
+
 ## 0.18.1 - PHASE 16.1 Credential Manager Hotfix
 
 - **Simulated Win32 `ERROR_NOT_FOUND` on real Windows**: the credential

@@ -2,7 +2,7 @@
 
 Tool schemas use a JSON-Schema-like shape, but this validator only implements
 the checks Phase 1B needs: object shape, required/unknown fields, primitive
-types, arrays, string length, numeric bounds and array size. Unknown fields
+types, enums, arrays, string length, numeric bounds and array size. Unknown fields
 are rejected so a caller can never smuggle an undeclared option into a tool.
 """
 
@@ -44,6 +44,16 @@ def _validate_value(schema: Any, value: Any, path: str) -> None:
         if not any(_matches_type(kind, value) for kind in expected_types):
             readable = " or ".join(str(kind) for kind in expected_types)
             raise ToolValidationError(f"{path} must be {readable}.")
+
+    allowed_values = schema.get("enum")
+    if allowed_values is not None and (
+        not isinstance(allowed_values, list)
+        or not any(
+            value == allowed and type(value) is type(allowed)
+            for allowed in allowed_values
+        )
+    ):
+        raise ToolValidationError(f"{path} is not an allowed value.")
 
     if isinstance(value, str):
         min_length = schema.get("minLength")

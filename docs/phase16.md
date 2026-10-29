@@ -14,7 +14,7 @@ One Windows **generic credential** is used per provider slot:
 - `openai`
 - `openai-compatible` (the CLI also accepts `openai_compatible`)
 - `ollama`
-- `anthropic` (reserved slot; storing a key does not add a direct adapter)
+- `anthropic` (reserved in Phase 16; direct adapter added in Phase 19)
 
 The target names begin with `Self-Healing PC Agent/provider-api-key/`.
 Credentials use `CRED_PERSIST_LOCAL_MACHINE`: they persist for later logon
@@ -150,3 +150,8 @@ library's own `last_error` is now checked first; production calls through
 the real `advapi32.dll` handle still use ctypes' `use_last_error` capture.
 The live GUI test also now expects eight notebook tabs, including the
 Phase 15 Images tab.
+## Phase 19 note
+
+The stored `anthropic` credential is now consumed by the direct Anthropic
+Messages API adapter. The Phase 16 resolution order and non-secret output
+rules are unchanged. See `docs/phase19.md`.

@@ -19,13 +19,23 @@ import copy
 import hashlib
 import json
 import logging
+import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .budgets import (
+    BudgetedModelRouter,
+    BudgetExceededError,
+    BudgetSnapshot,
+    TaskBudgetLimits,
+    TaskBudgetTracker,
+)
 from .config import Settings
 from .desktop_automation import normalize_key_chord
 from .documents.office import (
@@ -35,6 +45,17 @@ from .documents.office import (
     inspect_office,
     read_csv,
     read_xlsx_cells,
+)
+from .documents.pdf import (
+    inspect_pdf_page_snapshots,
+    parse_page_selection,
+    read_pdf_text,
+    render_pdf_text_output,
+)
+from .documents.pdf_forms import expected_pdf_form_values, inspect_pdf_form
+from .documents.pdf_tables import (
+    extract_pdf_tables_document,
+    render_pdf_tables_output,
 )
 from .domain.task import Task, TaskStatus
 from .errors import (
@@ -77,6 +98,9 @@ logger = logging.getLogger(__name__)
 CancellationCallback = Callable[[], bool]
 
 _CANCELLED_MESSAGE = "Cancelled by user; no further steps were executed."
+_ACTIVE_TASK_BUDGET: ContextVar[TaskBudgetTracker | None] = ContextVar(
+    "pc_agent_active_task_budget", default=None
+)
 
 
 def _normalize_instruction(instruction: str) -> str:
@@ -163,6 +187,14 @@ _ALLOWED_ORCHESTRATED_TOOLS = frozenset(
         "files.search",
         "pdf.extract_pages",
         "pdf.split",
+        "pdf.extract_text",
+        "pdf.extract_tables",
+        "pdf.ocr",
+        "pdf.search_text",
+        "pdf.reorder_pages",
+        "pdf.rotate_pages",
+        "pdf.inspect_form",
+        "pdf.fill_form",
         "office.docx_replace_text",
         "office.docx_append_paragraphs",
         "office.xlsx_set_cells",
@@ -212,6 +244,7 @@ _TOOLS_REQUIRING_APPROVAL = frozenset(
         "desktop.window_type",
         "desktop.send_keys",
         "image.analyze",
+        "pdf.ocr",
     }
 )
 
@@ -221,7 +254,7 @@ _BROWSER_ACTION_TOOLS = frozenset(
 )
 
 # Phase 15: sending one exact image to a configured provider.
-_VISION_ACTION_TOOLS = frozenset({"image.analyze"})
+_VISION_ACTION_TOOLS = frozenset({"image.analyze", "pdf.ocr"})
 
 # Phase 14: actions that focus or send input to the user's real desktop.
 _DESKTOP_AUTOMATION_ACTION_TOOLS = frozenset(
@@ -284,6 +317,7 @@ class ExecutionReport:
     step_reports: tuple[StepReport, ...] = ()
     steps_total: int = 0
     plan_summary: str = ""
+    budget: BudgetSnapshot | None = None
 
     @property
     def success(self) -> bool:
@@ -365,7 +399,141 @@ class TaskOrchestrator:
             raise ValueError("max_recovery_attempts must be between 0 and 3.")
         return value
 
+    def _budget_limits(
+        self, options: PlannerOptions | None
+    ) -> TaskBudgetLimits:
+        opts = options or PlannerOptions()
+        try:
+            return TaskBudgetLimits(
+                token_budget=(
+                    self._settings.task_token_budget
+                    if opts.token_budget is None
+                    else opts.token_budget
+                ),
+                provider_call_budget=(
+                    self._settings.task_provider_call_budget
+                    if opts.provider_call_budget is None
+                    else opts.provider_call_budget
+                ),
+                tool_budget=(
+                    self._settings.task_tool_budget
+                    if opts.tool_budget is None
+                    else opts.tool_budget
+                ),
+                step_budget=(
+                    self._settings.task_step_budget
+                    if opts.step_budget is None
+                    else opts.step_budget
+                ),
+                time_budget_seconds=(
+                    self._settings.task_time_budget_seconds
+                    if opts.task_time_budget_seconds is None
+                    else opts.task_time_budget_seconds
+                ),
+            )
+        except ValueError as exc:
+            raise PcAgentError(f"Invalid task budget: {exc}") from exc
+
+    @staticmethod
+    def _active_budget() -> TaskBudgetTracker | None:
+        return _ACTIVE_TASK_BUDGET.get()
+
+    @contextmanager
+    def _budget_scope(
+        self, options: PlannerOptions | None
+    ) -> Iterator[TaskBudgetTracker]:
+        existing = _ACTIVE_TASK_BUDGET.get()
+        if existing is not None:
+            yield existing
+            return
+        tracker = TaskBudgetTracker(self._budget_limits(options))
+        token = _ACTIVE_TASK_BUDGET.set(tracker)
+        try:
+            yield tracker
+        finally:
+            _ACTIVE_TASK_BUDGET.reset(token)
+
+    def _budgeted_router(self) -> Any:
+        router = self._router or build_model_router(self._settings)
+        tracker = self._active_budget()
+        return BudgetedModelRouter(router, tracker) if tracker else router
+
+    def _attach_budget(
+        self, report: ExecutionReport, tracker: TaskBudgetTracker
+    ) -> ExecutionReport:
+        snapshot = tracker.snapshot()
+        if report.budget is None:
+            try:
+                self._tasks.record_event(
+                    report.task.id,
+                    "budget_exceeded" if snapshot.exceeded else "budget",
+                    snapshot.summary(),
+                )
+            except PcAgentError:
+                pass
+        return replace(report, budget=snapshot)
+
+    def _step_budget_failure(
+        self,
+        task: Task,
+        plan: TaskPlan | MultiStepPlan,
+        provider_attempts: tuple[ProviderAttempt, ...] = (),
+        *,
+        source_task_id: str | None = None,
+    ) -> ExecutionReport | None:
+        tracker = self._active_budget()
+        if tracker is None:
+            return None
+        steps = len(plan.steps) if isinstance(plan, MultiStepPlan) else 1
+        try:
+            tracker.check_steps(steps)
+        except BudgetExceededError as exc:
+            failed = self._tasks.update_status(
+                task.id,
+                TaskStatus.FAILED,
+                message="Task step budget exceeded",
+                error=str(exc),
+            )
+            self._tasks.record_event(task.id, "budget_exceeded", str(exc))
+            return ExecutionReport(
+                task=failed,
+                plan=plan.steps[0] if isinstance(plan, MultiStepPlan) else plan,
+                provider_attempts=provider_attempts,
+                source_task_id=source_task_id,
+                error=str(exc),
+                steps_total=steps if isinstance(plan, MultiStepPlan) else 0,
+                plan_summary=(
+                    plan.summary if isinstance(plan, MultiStepPlan) else ""
+                ),
+            )
+        return None
+
     def execute(
+        self,
+        task_id: str,
+        *,
+        options: PlannerOptions | None = None,
+        approval_callback: ApprovalCallback | None = None,
+        use_ai: bool = False,
+        max_recovery_attempts: int | None = None,
+        resume_stored_plan: bool = False,
+        source_task_id: str | None = None,
+        cancellation_requested: CancellationCallback | None = None,
+    ) -> ExecutionReport:
+        with self._budget_scope(options) as tracker:
+            report = self._execute(
+                task_id,
+                options=options,
+                approval_callback=approval_callback,
+                use_ai=use_ai,
+                max_recovery_attempts=max_recovery_attempts,
+                resume_stored_plan=resume_stored_plan,
+                source_task_id=source_task_id,
+                cancellation_requested=cancellation_requested,
+            )
+            return self._attach_budget(report, tracker)
+
+    def _execute(
         self,
         task_id: str,
         *,
@@ -460,7 +628,9 @@ class TaskOrchestrator:
                 )
             else:
                 try:
-                    outcome = plan_with_provider(self._router, task.instruction, options)
+                    outcome = plan_with_provider(
+                        self._budgeted_router(), task.instruction, options
+                    )
                 except (ProviderError, PcAgentError) as exc:
                     failed = self._tasks.update_status(
                         task.id,
@@ -570,6 +740,14 @@ class TaskOrchestrator:
                 )
             self._execution.save_plan(task.id, multi.to_dict(), multi.planner)
             self._tasks.record_event(task.id, "plan_created", multi.summary)
+            budget_failure = self._step_budget_failure(
+                task,
+                multi,
+                outcome.provider_attempts,
+                source_task_id=source_task_id,
+            )
+            if budget_failure is not None:
+                return budget_failure
             return self._run_multistep(
                 task,
                 multi,
@@ -606,6 +784,14 @@ class TaskOrchestrator:
             )
         self._execution.save_plan(task.id, plan.to_dict(), plan.planner)
         self._tasks.record_event(task.id, "plan_created", plan.summary)
+        budget_failure = self._step_budget_failure(
+            task,
+            plan,
+            outcome.provider_attempts,
+            source_task_id=source_task_id,
+        )
+        if budget_failure is not None:
+            return budget_failure
         return self._approve_and_run(
             task,
             plan,
@@ -618,6 +804,29 @@ class TaskOrchestrator:
         )
 
     def resume(
+        self,
+        task_id: str,
+        *,
+        options: PlannerOptions | None = None,
+        approval_callback: ApprovalCallback | None = None,
+        use_ai: bool = False,
+        max_recovery_attempts: int | None = None,
+        force: bool = False,
+        cancellation_requested: CancellationCallback | None = None,
+    ) -> ExecutionReport:
+        with self._budget_scope(options) as tracker:
+            report = self._resume(
+                task_id,
+                options=options,
+                approval_callback=approval_callback,
+                use_ai=use_ai,
+                max_recovery_attempts=max_recovery_attempts,
+                force=force,
+                cancellation_requested=cancellation_requested,
+            )
+            return self._attach_budget(report, tracker)
+
+    def _resume(
         self,
         task_id: str,
         *,
@@ -688,6 +897,9 @@ class TaskOrchestrator:
                 TaskStatus.PLANNING,
                 message="Resuming interrupted task with stored plan/checkpoints",
             )
+        budget_failure = self._step_budget_failure(task, plan)
+        if budget_failure is not None:
+            return budget_failure
         if isinstance(plan, MultiStepPlan):
             return self._run_multistep(
                 task,
@@ -1140,6 +1352,26 @@ class TaskOrchestrator:
         approval_callback: ApprovalCallback | None = None,
         max_recovery_attempts: int | None = None,
         cancellation_requested: CancellationCallback | None = None,
+        budget_options: PlannerOptions | None = None,
+    ) -> ExecutionReport:
+        with self._budget_scope(budget_options) as tracker:
+            report = self._run_workflow(
+                task_id,
+                workflow_key,
+                approval_callback=approval_callback,
+                max_recovery_attempts=max_recovery_attempts,
+                cancellation_requested=cancellation_requested,
+            )
+            return self._attach_budget(report, tracker)
+
+    def _run_workflow(
+        self,
+        task_id: str,
+        workflow_key: str,
+        *,
+        approval_callback: ApprovalCallback | None = None,
+        max_recovery_attempts: int | None = None,
+        cancellation_requested: CancellationCallback | None = None,
     ) -> ExecutionReport:
         recovery_limit = self._validate_recovery_limit(
             self._max_recovery_attempts
@@ -1322,7 +1554,11 @@ class TaskOrchestrator:
             return task, True
         if is_vision:
             action = "vision_analysis"
-            approval_label = "Approval required to send one exact image to a vision provider"
+            approval_label = (
+                "Approval required to send rendered PDF pages to a vision provider"
+                if plan.tool_id == "pdf.ocr"
+                else "Approval required to send one exact image to a vision provider"
+            )
         elif is_desktop_automation:
             action = "desktop_automation_action"
             approval_label = "Approval required for a desktop UI Automation action"
@@ -1436,6 +1672,32 @@ class TaskOrchestrator:
                     resumed_from_checkpoint=resumed_used,
                     attempts_used=attempt_number - 1,
                 )
+            tracker = self._active_budget()
+            if tracker is not None:
+                will_invoke = not (
+                    resumed_result is not None and attempt_number == 1
+                )
+                try:
+                    tracker.check_time()
+                    if will_invoke:
+                        tracker.check_tool()
+                except BudgetExceededError as exc:
+                    failed = self._tasks.update_status(
+                        task.id,
+                        TaskStatus.FAILED,
+                        message="Task budget exceeded",
+                        error=str(exc),
+                    )
+                    self._tasks.record_event(task.id, "budget_exceeded", str(exc))
+                    return _StepOutcome(
+                        kind="failed",
+                        task=failed,
+                        plan=plan,
+                        recovery_attempts=tuple(summaries),
+                        error=str(exc),
+                        resumed_from_checkpoint=resumed_used,
+                        attempts_used=attempt_number - 1,
+                    )
             criteria = build_criteria(plan)
             run_message = (
                 plan.summary
@@ -1460,9 +1722,7 @@ class TaskOrchestrator:
                 ),
                 vision_allowed=self._settings.allow_vision,
                 vision_max_image_bytes=self._settings.vision_max_image_bytes,
-                vision_router_factory=(
-                    lambda: self._router or build_model_router(self._settings)
-                ),
+                vision_router_factory=(lambda: self._budgeted_router()),
             )
             display_attempt = attempt_offset + attempt_number
             attempt_record = self._start_attempt(
@@ -1485,6 +1745,38 @@ class TaskOrchestrator:
                     f"Reused checkpointed {plan.tool_id} result; tool was not re-run.",
                 )
             else:
+                if tracker is not None:
+                    try:
+                        tracker.record_tool()
+                    except BudgetExceededError as exc:
+                        summaries.append(
+                            self._finish_attempt(
+                                attempt_record,
+                                attempt_number=display_attempt,
+                                stage="execution",
+                                status="failed",
+                                action=next_action,
+                                message=str(exc),
+                            )
+                        )
+                        failed = self._tasks.update_status(
+                            task.id,
+                            TaskStatus.FAILED,
+                            message="Task budget exceeded",
+                            error=str(exc),
+                        )
+                        self._tasks.record_event(
+                            task.id, "budget_exceeded", str(exc)
+                        )
+                        return _StepOutcome(
+                            kind="failed",
+                            task=failed,
+                            plan=plan,
+                            recovery_attempts=tuple(summaries),
+                            error=str(exc),
+                            resumed_from_checkpoint=resumed_used,
+                            attempts_used=attempt_number,
+                        )
                 result = self._tools.invoke(plan.tool_id, plan.arguments, context)
                 self._execution.record_tool_invocation(task.id, plan.arguments, result)
                 if result.success and result.output is not None:
@@ -1824,6 +2116,14 @@ class TaskOrchestrator:
         resume_checkpoints: bool = False,
         resumed_result: ToolResult | None = None,
     ) -> ExecutionReport:
+        budget_failure = self._step_budget_failure(
+            task,
+            plan,
+            provider_attempts,
+            source_task_id=source_task_id,
+        )
+        if budget_failure is not None:
+            return budget_failure
         if isinstance(plan, MultiStepPlan):
             return self._run_multistep(
                 task,
@@ -2245,6 +2545,9 @@ class TaskOrchestrator:
             valid = isinstance(pages, int) and pages > 0
             return None, valid, "PDF page count was positive." if valid else "Invalid page count."
 
+        if plan.tool_id == "pdf.inspect_form":
+            return self._verify_pdf_inspect_form(plan, output)
+
         if plan.tool_id == "workspace.list_files":
             files = output.get("files")
             count = output.get("count")
@@ -2347,6 +2650,24 @@ class TaskOrchestrator:
 
         if plan.tool_id == "pdf.split":
             return self._verify_pdf_split(task_id, output, context)
+
+        if plan.tool_id == "pdf.extract_text":
+            return self._verify_pdf_extract_text(plan, output)
+
+        if plan.tool_id == "pdf.extract_tables":
+            return self._verify_pdf_extract_tables(plan, output)
+
+        if plan.tool_id == "pdf.ocr":
+            return self._verify_pdf_ocr(plan, output, context)
+
+        if plan.tool_id == "pdf.search_text":
+            return self._verify_pdf_search_text(task_id, plan, output, context)
+
+        if plan.tool_id in {"pdf.reorder_pages", "pdf.rotate_pages"}:
+            return self._verify_pdf_transform(task_id, plan, output, context)
+
+        if plan.tool_id == "pdf.fill_form":
+            return self._verify_pdf_fill_form(plan, output)
 
         if plan.tool_id == "office.docx_replace_text":
             return self._verify_docx_replace(plan, output)
@@ -3149,6 +3470,523 @@ class TaskOrchestrator:
         ):
             return last, False, "Split output count did not match the source pages."
         return last, True, "Every split page PDF was re-opened and verified."
+
+
+    def _plan_input_file(
+        self, plan: TaskPlan, output: Mapping[str, Any]
+    ) -> Path | None:
+        raw = output.get("path") or plan.arguments.get("path")
+        if not isinstance(raw, str) or not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        target = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (self._settings.workspace_dir / candidate).resolve()
+        )
+        workspace = self._settings.workspace_dir.expanduser().resolve()
+        if target.is_relative_to(workspace):
+            return target if target.is_file() else None
+        for root in plan.external_read_roots:
+            approved = root.expanduser().resolve()
+            if target == approved or target.is_relative_to(approved):
+                return target if target.is_file() else None
+        return None
+
+    @staticmethod
+    def _plan_pdf_pages(
+        plan: TaskPlan, total_pages: int
+    ) -> list[int] | None:
+        raw = plan.arguments.get("pages")
+        if raw is None:
+            return None
+        if isinstance(raw, str) and raw.strip().lower() == "reverse":
+            return list(range(total_pages, 0, -1))
+        return parse_page_selection(str(raw), total_pages)
+
+    def _verify_pdf_extract_text(
+        self, plan: TaskPlan, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        source = self._plan_input_file(plan, output)
+        target = self._workspace_file(output.get("output_path"))
+        if source is None or target is None:
+            return None, False, "PDF text source/output is missing or outside its approved scope."
+        try:
+            total_pages = len(inspect_pdf_page_snapshots(source))
+            pages = self._plan_pdf_pages(plan, total_pages)
+            document = read_pdf_text(source, pages)
+            expected = render_pdf_text_output(
+                document, str(output.get("format") or plan.arguments.get("format") or "text")
+            )
+            actual = target.read_bytes()
+        except (PcAgentError, OSError, UnicodeError) as exc:
+            return None, False, f"PDF text output could not be regenerated for verification: {exc}"
+        digest, size = self._file_digest(target)
+        valid = bool(
+            actual == expected
+            and digest == output.get("sha256")
+            and size == output.get("size_bytes")
+            and output.get("source_pages") == document.source_pages
+            and output.get("extracted_pages")
+            == [page.page for page in document.pages]
+            and output.get("text_pages") == document.text_pages
+            and output.get("characters") == document.characters
+            and output.get("has_embedded_text") == document.has_embedded_text
+        )
+        return (
+            None,
+            valid,
+            "PDF embedded text was independently re-extracted and the written bytes/counts/hash matched."
+            if valid
+            else "PDF text output did not match an independent re-extraction.",
+        )
+
+
+
+    def _verify_pdf_extract_tables(
+        self, plan: TaskPlan, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        source = self._plan_input_file(plan, output)
+        target = self._workspace_file(output.get("output_path"))
+        if source is None or target is None:
+            return None, False, "PDF table source/output is missing or outside its approved scope."
+        try:
+            total_pages = len(inspect_pdf_page_snapshots(source))
+            selected = self._plan_pdf_pages(plan, total_pages) or list(
+                range(1, total_pages + 1)
+            )
+            if len(selected) > 100:
+                raise ValueError("PDF table extraction selected more than 100 pages")
+            min_rows = int(plan.arguments.get("min_rows") or 2)
+            min_columns = int(plan.arguments.get("min_columns") or 2)
+            document = extract_pdf_tables_document(
+                source,
+                selected,
+                min_rows=min_rows,
+                min_columns=min_columns,
+            )
+            expected_format = str(
+                output.get("format")
+                or plan.arguments.get("format")
+                or ("csv" if target.suffix.lower() == ".csv" else "json")
+            )
+            expected = render_pdf_tables_output(document, expected_format)
+            actual = target.read_bytes()
+        except (PcAgentError, OSError, UnicodeError, TypeError, ValueError) as exc:
+            return None, False, f"PDF table output could not be verified: {exc}"
+        digest, size = self._file_digest(target)
+        valid = bool(
+            actual == expected
+            and digest == output.get("sha256")
+            and size == output.get("size_bytes")
+            and output.get("source_pages") == total_pages
+            and output.get("selected_pages") == selected
+            and output.get("page_count") == len(selected)
+            and output.get("text_pages") == document.text_pages
+            and output.get("has_embedded_text") == document.has_embedded_text
+            and output.get("characters") == document.characters
+            and output.get("format") == expected_format
+            and output.get("min_rows") == min_rows
+            and output.get("min_columns") == min_columns
+            and output.get("table_count") == document.table_count
+            and output.get("total_rows") == document.total_rows
+            and output.get("total_cells") == document.total_cells
+            and output.get("max_columns") == document.max_columns
+            and output.get("tables")
+            == [table.summary() for table in document.tables]
+        )
+        return (
+            None,
+            valid,
+            "PDF table output matched independent embedded-text geometry extraction, counts and SHA-256; no OCR was used."
+            if valid
+            else "PDF table output did not match independent re-extraction on verification.",
+        )
+
+    def _verify_pdf_inspect_form(
+        self, plan: TaskPlan, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        source = self._plan_input_file(plan, output)
+        if source is None:
+            return None, False, "PDF form source is missing or outside its approved scope."
+        try:
+            inspection = inspect_pdf_form(source)
+            digest, size = self._file_digest(source)
+        except (PcAgentError, OSError, TypeError, ValueError) as exc:
+            return None, False, f"PDF form inspection could not be verified: {exc}"
+        valid = bool(
+            digest == output.get("sha256") == inspection.sha256
+            and size == output.get("size_bytes") == inspection.size_bytes
+            and output.get("source_pages") == inspection.pages
+            and output.get("page_count") == inspection.pages
+            and output.get("field_count") == inspection.field_count
+            and output.get("fields")
+            == [field.summary() for field in inspection.fields]
+        )
+        return (
+            None,
+            valid,
+            "PDF form fields matched independent AcroForm inspection and SHA-256."
+            if valid
+            else "PDF form inspection did not match independent re-inspection.",
+        )
+
+    def _verify_pdf_fill_form(
+        self, plan: TaskPlan, output: Mapping[str, Any]
+    ) -> tuple[None, bool, str]:
+        source = self._plan_input_file(plan, output)
+        target = self._workspace_file(output.get("output_path"))
+        if source is None or target is None:
+            return None, False, "PDF form source/output is missing or outside its approved scope."
+        try:
+            raw_values = plan.arguments.get("values")
+            planned: dict[str, Any] = {}
+            if isinstance(raw_values, Mapping):
+                planned = dict(raw_values)
+            elif isinstance(raw_values, list):
+                for entry in raw_values:
+                    if not isinstance(entry, Mapping):
+                        raise TypeError("planned PDF form values are invalid")
+                    name = str(entry["name"]).strip()
+                    if name in planned:
+                        raise ValueError("duplicate planned PDF form value")
+                    planned[name] = entry["value"]
+            else:
+                raise TypeError("planned PDF form values are missing")
+            before = inspect_pdf_form(source)
+            expected = expected_pdf_form_values(before, planned)
+            after = inspect_pdf_form(target)
+            digest, size = self._file_digest(target)
+            before_by_name = before.by_name()
+            values_match = all(
+                field.value == expected.get(field.name, before_by_name[field.name].value)
+                for field in after.fields
+            )
+        except (PcAgentError, OSError, KeyError, TypeError, ValueError) as exc:
+            return None, False, f"Filled PDF form could not be verified: {exc}"
+        valid = bool(
+            values_match
+            and after.pages == before.pages
+            and after.field_names == before.field_names
+            and digest == output.get("sha256") == after.sha256
+            and size == output.get("size_bytes") == after.size_bytes
+            and output.get("source_pages") == after.pages
+            and output.get("page_count") == after.pages
+            and output.get("field_count") == after.field_count
+            and output.get("changed_fields") == list(expected)
+            and output.get("values")
+            == [
+                {"name": name, "value": expected[name]}
+                for name in expected
+            ]
+            and output.get("fields")
+            == [field.summary() for field in after.fields]
+        )
+        return (
+            None,
+            valid,
+            "Filled PDF form matched independent source/output field inspection, untouched values and SHA-256."
+            if valid
+            else "Filled PDF form did not match independent field verification.",
+        )
+
+    def _verify_pdf_ocr(
+        self,
+        plan: TaskPlan,
+        output: Mapping[str, Any],
+        context: ToolContext,
+    ) -> tuple[None, bool, str]:
+        source = self._plan_input_file(plan, output)
+        target = self._workspace_file(output.get("output_path"))
+        if source is None or target is None:
+            return None, False, "PDF OCR source/output is missing or outside its approved scope."
+        try:
+            total_pages = len(inspect_pdf_page_snapshots(source))
+            selected = self._plan_pdf_pages(plan, total_pages) or list(
+                range(1, total_pages + 1)
+            )
+            if len(selected) > 10:
+                raise ValueError("PDF OCR selected more than 10 pages")
+            embedded_document = read_pdf_text(source, selected)
+            embedded_text = {
+                page.page: page.text for page in embedded_document.pages
+            }
+            skip_text_pages = plan.arguments.get("skip_text_pages", True)
+            if not isinstance(skip_text_pages, bool):
+                raise TypeError("PDF OCR skip_text_pages is invalid")
+            expected_sources = {
+                page: (
+                    "embedded"
+                    if skip_text_pages and embedded_text.get(page, "").strip()
+                    else "ocr"
+                )
+                for page in selected
+            }
+            expected_format = str(
+                output.get("format")
+                or plan.arguments.get("format")
+                or ("json" if target.suffix.lower() == ".json" else "text")
+            )
+            expected_dpi = int(plan.arguments.get("dpi") or 200)
+            raw_language = plan.arguments.get("language")
+            expected_language = (
+                " ".join(str(raw_language).strip().split())
+                if raw_language is not None and str(raw_language).strip()
+                else None
+            )
+            raw_output = target.read_bytes()
+            rendered_text = raw_output.decode("utf-8")
+            parsed_pages: list[dict[str, Any]] = []
+            payload: dict[str, Any] | None = None
+            if expected_format == "json":
+                loaded = json.loads(rendered_text)
+                if not isinstance(loaded, dict):
+                    raise ValueError("PDF OCR JSON root is not an object")
+                payload = loaded
+                raw_pages = payload.get("pages")
+                if not isinstance(raw_pages, list):
+                    raise ValueError("PDF OCR JSON pages are missing")
+                for item in raw_pages:
+                    if not isinstance(item, dict):
+                        raise TypeError("PDF OCR JSON page is invalid")
+                    parsed_pages.append(dict(item))
+            elif expected_format == "text":
+                pattern = re.compile(
+                    r"^--- Page (\d+) \[(embedded text|OCR)\] ---$",
+                    re.MULTILINE,
+                )
+                matches = list(pattern.finditer(rendered_text))
+                for index, match in enumerate(matches):
+                    start = match.end()
+                    if start < len(rendered_text) and rendered_text[start] == "\n":
+                        start += 1
+                    end = (
+                        matches[index + 1].start()
+                        if index + 1 < len(matches)
+                        else len(rendered_text)
+                    )
+                    segment = rendered_text[start:end]
+                    if index + 1 < len(matches) and segment.endswith("\n\n"):
+                        segment = segment[:-2]
+                    else:
+                        segment = segment.rstrip("\n")
+                    parsed_pages.append(
+                        {
+                            "page": int(match.group(1)),
+                            "source": (
+                                "embedded"
+                                if match.group(2) == "embedded text"
+                                else "ocr"
+                            ),
+                            "text": segment,
+                        }
+                    )
+            else:
+                raise ValueError("PDF OCR format is invalid")
+
+            details = output.get("page_details")
+            if not isinstance(details, list) or len(details) != len(selected):
+                raise ValueError("PDF OCR page details are missing")
+            valid = bool(
+                output.get("source_pages") == total_pages
+                and output.get("selected_pages") == selected
+                and output.get("page_count") == len(selected)
+                and output.get("format") == expected_format
+                and output.get("dpi") == expected_dpi
+                and output.get("language") == expected_language
+                and [item.get("page") for item in parsed_pages] == selected
+                and [item.get("page") for item in details] == selected
+            )
+            providers: list[str] = []
+            models: list[str] = []
+            characters = 0
+            text_pages = 0
+            for parsed, detail in zip(parsed_pages, details, strict=True):
+                if not isinstance(detail, Mapping):
+                    raise TypeError("PDF OCR page detail is invalid")
+                page_number = int(parsed["page"])
+                expected_source = expected_sources[page_number]
+                text = parsed.get("text")
+                if not isinstance(text, str):
+                    raise TypeError("PDF OCR page text is invalid")
+                characters += len(text)
+                text_pages += bool(text.strip())
+                valid = valid and parsed.get("source") == expected_source
+                valid = valid and detail.get("source") == expected_source
+                valid = valid and detail.get("characters") == len(text)
+                if expected_source == "embedded":
+                    valid = valid and text == embedded_text.get(page_number, "")
+                    valid = valid and detail.get("provider") is None
+                    valid = valid and detail.get("model") is None
+                    valid = valid and detail.get("sent_size_bytes") == 0
+                    valid = valid and detail.get("sent_sha256") is None
+                else:
+                    provider = detail.get("provider")
+                    model = detail.get("model")
+                    sent_size = detail.get("sent_size_bytes")
+                    sent_sha = detail.get("sent_sha256")
+                    valid = valid and isinstance(provider, str) and bool(provider)
+                    valid = valid and provider != "mock"
+                    valid = valid and isinstance(model, str) and bool(model)
+                    valid = valid and isinstance(sent_size, int)
+                    valid = valid and 0 < int(sent_size) <= (
+                        context.vision_max_image_bytes
+                    )
+                    valid = valid and isinstance(sent_sha, str) and bool(
+                        re.fullmatch(r"[0-9a-f]{64}", sent_sha)
+                    )
+                    for dimension in (
+                        detail.get("rendered_width"),
+                        detail.get("rendered_height"),
+                        detail.get("sent_width"),
+                        detail.get("sent_height"),
+                    ):
+                        valid = valid and isinstance(dimension, int) and dimension > 0
+                    if isinstance(provider, str) and provider not in providers:
+                        providers.append(provider)
+                    if isinstance(model, str) and model not in models:
+                        models.append(model)
+                if payload is not None:
+                    for key in (
+                        "source",
+                        "characters",
+                        "provider",
+                        "model",
+                        "rendered_width",
+                        "rendered_height",
+                        "sent_width",
+                        "sent_height",
+                        "sent_size_bytes",
+                        "sent_sha256",
+                    ):
+                        valid = valid and parsed.get(key) == detail.get(key)
+            embedded_pages = [
+                page for page in selected if expected_sources[page] == "embedded"
+            ]
+            ocr_pages = [
+                page for page in selected if expected_sources[page] == "ocr"
+            ]
+            valid = valid and output.get("embedded_pages") == embedded_pages
+            valid = valid and output.get("ocr_pages") == ocr_pages
+            valid = valid and output.get("text_pages") == text_pages
+            valid = valid and output.get("characters") == characters
+            valid = valid and output.get("providers") == providers
+            valid = valid and output.get("models") == models
+            if payload is not None:
+                valid = valid and payload.get("method") == "pdf-ocr-v1"
+                valid = valid and payload.get("source_pages") == total_pages
+                valid = valid and payload.get("dpi") == expected_dpi
+                valid = valid and payload.get("language") == expected_language
+                valid = valid and payload.get("embedded_pages") == embedded_pages
+                valid = valid and payload.get("ocr_pages") == ocr_pages
+                valid = valid and payload.get("text_pages") == text_pages
+                valid = valid and payload.get("characters") == characters
+        except (
+            PcAgentError,
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            return None, False, f"PDF OCR output could not be verified: {exc}"
+        digest, size = self._file_digest(target)
+        valid = bool(
+            valid
+            and digest == output.get("sha256")
+            and size == output.get("size_bytes")
+        )
+        return (
+            None,
+            valid,
+            "PDF OCR output was re-opened; embedded pages matched independent re-extraction and OCR page metadata/counts/hash matched. Provider transcription wording was not deterministically re-graded or resent."
+            if valid
+            else "PDF OCR output did not match its source pages, metadata, counts or hash on verification.",
+        )
+
+    def _verify_pdf_search_text(
+        self,
+        task_id: str,
+        plan: TaskPlan,
+        output: Mapping[str, Any],
+        context: ToolContext,
+    ) -> tuple[ToolResult | None, bool, str]:
+        fresh = self._tools.invoke("pdf.search_text", dict(plan.arguments), context)
+        self._execution.record_tool_invocation(task_id, dict(plan.arguments), fresh)
+        if not fresh.success or fresh.output is None:
+            return fresh, False, fresh.error or "PDF text search re-check failed."
+        valid = dict(fresh.output) == dict(output)
+        return (
+            fresh,
+            valid,
+            "PDF embedded text was independently searched again and every match/count matched exactly."
+            if valid
+            else "PDF text search results changed during verification.",
+        )
+
+    def _verify_pdf_transform(
+        self,
+        task_id: str,
+        plan: TaskPlan,
+        output: Mapping[str, Any],
+        context: ToolContext,
+    ) -> tuple[ToolResult | None, bool, str]:
+        source = self._plan_input_file(plan, output)
+        target = self._workspace_file(output.get("output_path"))
+        if source is None or target is None:
+            return None, False, "Transformed PDF source/output is missing or outside its approved scope."
+        arguments: dict[str, Any] = {
+            "path": output.get("output_path"),
+            "expected_pages": output.get("page_count"),
+        }
+        verification = self._tools.invoke("pdf.verify", arguments, context)
+        self._execution.record_tool_invocation(task_id, arguments, verification)
+        if not verification.success or verification.output is None:
+            return verification, False, verification.error or "Transformed PDF verification failed."
+        try:
+            source_snapshots = inspect_pdf_page_snapshots(source)
+            output_snapshots = inspect_pdf_page_snapshots(target)
+            if plan.tool_id == "pdf.reorder_pages":
+                expected_order = self._plan_pdf_pages(
+                    plan, len(source_snapshots)
+                ) or []
+                expected_snapshots = tuple(
+                    source_snapshots[page - 1] for page in expected_order
+                )
+            else:
+                expected_order = list(range(1, len(source_snapshots) + 1))
+                selected = set(
+                    self._plan_pdf_pages(plan, len(source_snapshots))
+                    or expected_order
+                )
+                degrees = int(plan.arguments.get("degrees") or 0)
+                expected_snapshots = tuple(
+                    type(snapshot)(
+                        fingerprint=snapshot.fingerprint,
+                        rotation=(
+                            snapshot.rotation + (degrees if page in selected else 0)
+                        )
+                        % 360,
+                    )
+                    for page, snapshot in enumerate(source_snapshots, start=1)
+                )
+        except (PcAgentError, TypeError, ValueError) as exc:
+            return verification, False, f"PDF page transform could not be rechecked: {exc}"
+        valid = bool(
+            verification.output.get("valid")
+            and verification.output.get("sha256") == output.get("sha256")
+            and output.get("page_order") == expected_order
+            and output.get("page_rotations")
+            == [snapshot.rotation for snapshot in expected_snapshots]
+            and output_snapshots == expected_snapshots
+        )
+        return (
+            verification,
+            valid,
+            "Transformed PDF was re-opened; page fingerprints, order, rotations and SHA-256 matched."
+            if valid
+            else "Transformed PDF page order/rotation did not match the approved plan on recheck.",
+        )
 
     def _verify_docx_replace(
         self, plan: TaskPlan, output: Mapping[str, Any]

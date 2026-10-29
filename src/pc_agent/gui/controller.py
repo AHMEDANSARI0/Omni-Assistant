@@ -10,6 +10,7 @@ Phase 7 adds checkpoint resume and cooperative cancellation for GUI tasks.
 from __future__ import annotations
 
 import json
+import math
 import platform
 import queue
 import shutil
@@ -27,6 +28,13 @@ from ..credentials import CredentialStore, build_credential_store
 from ..desktop_automation import probe_desktop_automation
 from ..documents.office import DemoOfficeData, create_demo_office_files
 from ..documents.pdf import DemoPdfData, create_demo_pdfs
+from ..documents.pdf_security import (
+    DEFAULT_PDF_PERMISSIONS,
+    inspect_pdf_security,
+    protect_pdf,
+    unprotect_pdf,
+)
+from ..documents.pdf_signatures import inspect_pdf_signatures
 from ..domain.task import Task, TaskStatus
 from ..errors import ApprovalUnavailableError, PcAgentError, ToolError
 from ..http_tls import tls_trust_info
@@ -40,6 +48,15 @@ from ..licensing import (
     FEATURE_WEB,
     LicenseService,
     LicenseStatus,
+)
+from ..maintenance import DatabaseMaintenanceService
+from ..online_updates import (
+    DownloadedUpdate,
+    OnlineStageResult,
+    OnlineUpdateCheck,
+    check_online_update,
+    download_online_update,
+    stage_online_update,
 )
 from ..orchestrator import (
     ApprovalCallback,
@@ -56,6 +73,8 @@ from ..providers import (
 )
 from ..providers.router import RoutedCompletion
 from ..recovery import RecoveryOutcome, RecoveryScan, RecoveryService, TaskDiagnosis
+from ..release import ReleaseAudit, audit_install
+from ..self_repair import SelfRepairDiagnosis, SelfRepairService
 from ..storage.db import Database
 from ..storage.repositories import (
     ApprovalRecord,
@@ -75,6 +94,15 @@ from ..storage.repositories import (
 )
 from ..tooling.service import build_runtime_registry
 from ..tools import RegisteredTool, ToolContext, ToolResult, build_default_registry
+from ..updates import (
+    StagedUpdate,
+    UpdateCheck,
+    apply_staged_update,
+    check_update,
+    list_updates,
+    rollback_update,
+    stage_update,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +151,12 @@ class DoctorSummary:
     vision_providers: str = ""
     credential_store_summary: str = ""
     provider_credential_sources: str = "none"
+    self_repair_enabled: bool = False
+    self_repair_summary: str = ""
+    task_budgets_summary: str = ""
+    release_audit_summary: str = ""
+    database_backup_summary: str = ""
+    signed_updates_summary: str = ""
 
     def to_text(self) -> str:
         if self.tls_verified:
@@ -144,7 +178,10 @@ class DoctorSummary:
         )
         return "\n".join(
             [
-                f"Self-Healing PC Agent {self.version} (PHASE 16.1 Credential Manager Hotfix)",
+                (
+                    f"Self-Healing PC Agent {self.version} "
+                    "(PHASE 27 PDF Signature Inspection)"
+                ),
                 f"Python: {self.python_version}",
                 f"Environment: {self.environment}",
                 f"Root: {self.root}",
@@ -158,6 +195,18 @@ class DoctorSummary:
                     f"{self.credential_store_summary}; "
                     f"sources={self.provider_credential_sources}"
                 ),
+                f"Task budgets: {self.task_budgets_summary}",
+                (
+                    "Self-repair: "
+                    f"{'enabled' if self.self_repair_enabled else 'disabled'}; "
+                    f"{self.self_repair_summary}"
+                ),
+                (
+                    "Production: "
+                    f"release audit {self.release_audit_summary}; "
+                    f"database backups: {self.database_backup_summary}"
+                ),
+                f"Signed updates: {self.signed_updates_summary}",
                 (
                     "Approved dynamic tools: "
                     f"{self.approved_dynamic_tools} "
@@ -245,6 +294,11 @@ class TaskRunOptions:
     recursive: bool = False
     use_ai: bool = False
     max_recovery_attempts: int | None = None
+    token_budget: int | None = None
+    provider_call_budget: int | None = None
+    tool_budget: int | None = None
+    step_budget: int | None = None
+    task_time_budget_seconds: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -273,6 +327,19 @@ class TaskRunOptions:
             0 <= self.max_recovery_attempts <= 3
         ):
             raise PcAgentError("Max recovery attempts must be between 0 and 3.")
+        for name, value, maximum in (
+            ("Token budget", self.token_budget, 10_000_000),
+            ("Provider-call budget", self.provider_call_budget, 1000),
+            ("Tool budget", self.tool_budget, 1000),
+        ):
+            if value is not None and not 0 <= value <= maximum:
+                raise PcAgentError(f"{name} must be between 0 and {maximum}.")
+        if self.step_budget is not None and not 1 <= self.step_budget <= 20:
+            raise PcAgentError("Step budget must be between 1 and 20.")
+        if self.task_time_budget_seconds is not None and not (
+            0 <= self.task_time_budget_seconds <= 86_400
+        ):
+            raise PcAgentError("Task time budget must be between 0 and 86400 seconds.")
 
     def planner_options(self) -> PlannerOptions:
         return PlannerOptions(
@@ -282,6 +349,11 @@ class TaskRunOptions:
             target_path=self.target_path,
             recursive=self.recursive,
             expected_pages=self.expected_pages,
+            token_budget=self.token_budget,
+            provider_call_budget=self.provider_call_budget,
+            tool_budget=self.tool_budget,
+            step_budget=self.step_budget,
+            task_time_budget_seconds=self.task_time_budget_seconds,
         )
 
 
@@ -515,10 +587,173 @@ class GuiController:
             ),
             credential_store_summary=self.credential_store_summary(),
             provider_credential_sources=public["provider_credential_sources"],
+            self_repair_enabled=self.settings.allow_self_repair,
+            self_repair_summary=self.self_repair_summary(),
+            task_budgets_summary=self.task_budgets_summary(),
+            release_audit_summary=self.release_audit().summary(),
+            database_backup_summary=self.database_backup_summary(),
+            signed_updates_summary=self.signed_updates_summary(),
         )
 
     def recovery_scan(self) -> RecoveryScan:
         return self._recovery.scan()
+
+    def task_budgets_summary(self) -> str:
+        settings = self.settings
+        return (
+            f"tokens={settings.task_token_budget}, "
+            f"provider_calls={settings.task_provider_call_budget}, "
+            f"tools={settings.task_tool_budget}, steps={settings.task_step_budget}, "
+            f"time={settings.task_time_budget_seconds:.0f}s"
+        )
+
+    def _self_repair_service(self) -> SelfRepairService:
+        return SelfRepairService(self.settings.root_dir, self.settings.data_dir)
+
+    def self_repair_summary(self) -> str:
+        service = self._self_repair_service()
+        latest = next(iter(service.list_runs(limit=1)), None)
+        suffix = (
+            f"; latest run={latest.run_id} [{latest.status}]"
+            if latest
+            else "; latest run=none"
+        )
+        return service.baseline_status().summary() + suffix
+
+    def self_repair_diagnosis(self) -> SelfRepairDiagnosis:
+        """Read-only GUI diagnosis; capture/stage/apply stay CLI-only."""
+
+        if not self.settings.allow_self_repair:
+            raise PcAgentError(
+                "Self-repair is disabled. Set PC_AGENT_ALLOW_SELF_REPAIR=1 "
+                "in .env to enable read-only core diagnosis."
+            )
+        return self._self_repair_service().diagnose()
+
+    def release_audit(self) -> ReleaseAudit:
+        """Read-only production checks; bundle build/restore stay CLI-only."""
+
+        return audit_install(self.settings)
+
+    def signed_updates_summary(self) -> str:
+        configured = "yes" if self.settings.release_public_key else "no"
+        required = "yes" if self.settings.require_signed_updates else "no"
+        try:
+            updates = list_updates(self.settings)
+            latest = updates[0].summary() if updates else "none"
+        except PcAgentError as exc:
+            latest = f"unavailable ({exc})"
+        public = self.settings.public_summary()
+        return (
+            f"public_key={configured}; "
+            f"key_id={self.settings.release_key_id or 'any'}; "
+            f"required={required}; online={public['online_updates']}; "
+            f"feed_host={public['update_feed_host']}; "
+            f"channel={public['update_channel']}; latest={latest}"
+        )
+
+    def check_offline_update(
+        self, bundle_path: str, signature_path: str = ""
+    ) -> UpdateCheck:
+        bundle = bundle_path.strip()
+        if not bundle:
+            raise PcAgentError("Choose a portable release bundle first.")
+        signature = signature_path.strip()
+        return check_update(
+            Path(bundle).expanduser(),
+            self.settings,
+            signature_path=Path(signature).expanduser() if signature else None,
+        )
+
+    def stage_offline_update(
+        self,
+        bundle_path: str,
+        signature_path: str = "",
+        *,
+        allow_unsigned: bool = False,
+        allow_downgrade: bool = False,
+    ) -> StagedUpdate:
+        bundle = bundle_path.strip()
+        if not bundle:
+            raise PcAgentError("Choose a portable release bundle first.")
+        signature = signature_path.strip()
+        self.settings.ensure_directories()
+        return stage_update(
+            Path(bundle).expanduser(),
+            self.settings,
+            signature_path=Path(signature).expanduser() if signature else None,
+            allow_unsigned=allow_unsigned,
+            allow_downgrade=allow_downgrade,
+        )
+
+    def check_online_update(
+        self, feed_url: str = "", channel: str = ""
+    ) -> OnlineUpdateCheck:
+        return check_online_update(
+            self.settings,
+            feed_url=feed_url.strip() or None,
+            channel=channel.strip() or None,
+        )
+
+    def download_online_update(
+        self,
+        feed_url: str = "",
+        channel: str = "",
+        *,
+        allow_downgrade: bool = False,
+    ) -> DownloadedUpdate:
+        self.settings.ensure_directories()
+        return download_online_update(
+            self.settings,
+            feed_url=feed_url.strip() or None,
+            channel=channel.strip() or None,
+            allow_downgrade=allow_downgrade,
+        )
+
+    def stage_online_update(
+        self,
+        feed_url: str = "",
+        channel: str = "",
+        *,
+        allow_unsigned: bool = False,
+        allow_downgrade: bool = False,
+    ) -> OnlineStageResult:
+        self.settings.ensure_directories()
+        return stage_online_update(
+            self.settings,
+            feed_url=feed_url.strip() or None,
+            channel=channel.strip() or None,
+            allow_unsigned=allow_unsigned,
+            allow_downgrade=allow_downgrade,
+        )
+
+    def apply_offline_update(self, update_id: str = "latest-staged") -> StagedUpdate:
+        self.settings.ensure_directories()
+        return apply_staged_update(
+            self.settings, update_id.strip() or "latest-staged"
+        )
+
+    def rollback_offline_update(
+        self, update_id: str = "latest-applied"
+    ) -> StagedUpdate:
+        self.settings.ensure_directories()
+        return rollback_update(
+            self.settings, update_id.strip() or "latest-applied"
+        )
+
+    def list_offline_updates(self, limit: int = 20) -> tuple[StagedUpdate, ...]:
+        if limit < 1 or limit > 200:
+            raise PcAgentError("Update list limit must be between 1 and 200.")
+        return list_updates(self.settings)[:limit]
+
+    def database_backup_summary(self) -> str:
+        backups = DatabaseMaintenanceService(
+            self.settings.database_path, self.settings.data_dir
+        ).list_backups()
+        if not backups:
+            return "none"
+        latest = backups[0]
+        return f"count={len(backups)}; latest={latest.backup_id} (schema v{latest.schema_version})"
 
     # ------------------------------------------------------------------
     # Phase 6 licensing
@@ -828,6 +1063,7 @@ class GuiController:
                 approval_callback=self._approval_callback,
                 max_recovery_attempts=run_options.max_recovery_attempts,
                 cancellation_requested=self._cancel_event.is_set,
+                budget_options=run_options.planner_options(),
             )
         finally:
             self._active_task_id = None
@@ -1043,6 +1279,289 @@ class GuiController:
             },
         )
 
+    def pdf_extract_text(
+        self,
+        path: str,
+        output_path: str,
+        *,
+        pages: str = "",
+        output_format: str | None = None,
+    ) -> ToolResult:
+        arguments: dict[str, Any] = {
+            "path": _require(path, "PDF file"),
+            "output_path": _require(output_path, "output text file"),
+        }
+        if pages.strip():
+            arguments["pages"] = pages.strip()
+        if output_format:
+            arguments["format"] = output_format
+        return self._invoke_builtin("pdf.extract_text", arguments)
+
+
+
+    def pdf_extract_tables(
+        self,
+        path: str,
+        output_path: str,
+        *,
+        pages: str = "",
+        min_rows: int = 2,
+        min_columns: int = 2,
+        output_format: str | None = None,
+    ) -> ToolResult:
+        arguments: dict[str, Any] = {
+            "path": _require(path, "PDF file"),
+            "output_path": _require(output_path, "table output file"),
+            "min_rows": min_rows,
+            "min_columns": min_columns,
+        }
+        if pages.strip():
+            arguments["pages"] = pages.strip()
+        if output_format:
+            arguments["format"] = output_format
+        return self._invoke_builtin("pdf.extract_tables", arguments)
+
+    def pdf_inspect_form(self, path: str) -> ToolResult:
+        return self._invoke_builtin(
+            "pdf.inspect_form", {"path": _require(path, "PDF file")}
+        )
+
+    def pdf_fill_form(
+        self,
+        path: str,
+        output_path: str,
+        values: dict[str, Any],
+    ) -> ToolResult:
+        if not values:
+            raise PcAgentError("Enter at least one PDF form Name=Value line.")
+        return self._invoke_builtin(
+            "pdf.fill_form",
+            {
+                "path": _require(path, "PDF file"),
+                "output_path": _require(output_path, "filled PDF output file"),
+                "values": [
+                    {"name": name, "value": value}
+                    for name, value in values.items()
+                ],
+            },
+        )
+
+    def pdf_security(
+        self, path: str, *, password: str | None = None
+    ) -> ToolResult:
+        """Direct GUI-only encryption inspection; not a registered tool."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        try:
+            info = inspect_pdf_security(source, password=password)
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_security",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        output = {
+            "path": self._relative_workspace_path(source),
+            **info.summary(),
+        }
+        success = not (
+            info.encrypted
+            and password is not None
+            and info.password_accepted is not True
+        )
+        return ToolResult(
+            tool_id="direct.pdf_security",
+            version="1.0.0",
+            success=success,
+            output=output,
+            error=None if success else "Incorrect PDF password.",
+        )
+
+    def pdf_protect(
+        self,
+        path: str,
+        output_path: str,
+        *,
+        user_password: str,
+        owner_password: str,
+        current_password: str | None = None,
+        permissions: Sequence[str] = DEFAULT_PDF_PERMISSIONS,
+    ) -> ToolResult:
+        """Direct GUI-only AES-256 protection; passwords stay out of results."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        output = self._workspace_pdf_path(
+            _require(output_path, "protected PDF output file"), must_exist=False
+        )
+        try:
+            result = protect_pdf(
+                source,
+                output,
+                user_password=user_password,
+                owner_password=owner_password,
+                current_password=current_password,
+                permissions=permissions,
+            )
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_protect",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        return ToolResult(
+            tool_id="direct.pdf_protect",
+            version="1.0.0",
+            success=True,
+            output={
+                "path": self._relative_workspace_path(source),
+                "output_path": self._relative_workspace_path(output),
+                **result.summary(),
+            },
+        )
+
+    def pdf_unprotect(
+        self, path: str, output_path: str, *, password: str
+    ) -> ToolResult:
+        """Direct GUI-only password removal into a new verified PDF."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        output = self._workspace_pdf_path(
+            _require(output_path, "unprotected PDF output file"),
+            must_exist=False,
+        )
+        try:
+            result = unprotect_pdf(source, output, password=password)
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_unprotect",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        return ToolResult(
+            tool_id="direct.pdf_unprotect",
+            version="1.0.0",
+            success=True,
+            output={
+                "path": self._relative_workspace_path(source),
+                "output_path": self._relative_workspace_path(output),
+                **result.summary(),
+            },
+        )
+
+    def pdf_inspect_signatures(self, path: str) -> ToolResult:
+        """Direct GUI-only signature inspection; not a registered tool."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        try:
+            inspection = inspect_pdf_signatures(source)
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_inspect_signatures",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        success = inspection.invalid_count == 0
+        return ToolResult(
+            tool_id="direct.pdf_inspect_signatures",
+            version="1.0.0",
+            success=success,
+            output={
+                "path": self._relative_workspace_path(source),
+                **inspection.summary(),
+            },
+            error=(
+                None
+                if success
+                else "One or more PDF signatures are invalid or malformed."
+            ),
+        )
+
+    def pdf_ocr(
+        self,
+        path: str,
+        output_path: str,
+        *,
+        pages: str = "",
+        dpi: int = 200,
+        language: str = "",
+        skip_text_pages: bool = True,
+    ) -> ToolResult:
+        arguments: dict[str, Any] = {
+            "path": _require(path, "PDF file"),
+            "output_path": _require(output_path, "OCR output file"),
+            "dpi": dpi,
+            "skip_text_pages": skip_text_pages,
+        }
+        if pages.strip():
+            arguments["pages"] = pages.strip()
+        if language.strip():
+            arguments["language"] = language.strip()
+        return self._invoke_builtin("pdf.ocr", arguments)
+
+    def pdf_search_text(
+        self,
+        path: str,
+        query: str,
+        *,
+        pages: str = "",
+        case_sensitive: bool = False,
+        max_results: int = 50,
+    ) -> ToolResult:
+        arguments: dict[str, Any] = {
+            "path": _require(path, "PDF file"),
+            "query": _require(query, "PDF search text"),
+            "case_sensitive": case_sensitive,
+            "max_results": max_results,
+        }
+        if pages.strip():
+            arguments["pages"] = pages.strip()
+        return self._invoke_builtin("pdf.search_text", arguments)
+
+    def pdf_reorder_pages(
+        self, path: str, pages: str, output_path: str
+    ) -> ToolResult:
+        return self._invoke_builtin(
+            "pdf.reorder_pages",
+            {
+                "path": _require(path, "PDF file"),
+                "pages": _require(pages, "page order"),
+                "output_path": _require(output_path, "output PDF"),
+            },
+        )
+
+    def pdf_rotate_pages(
+        self,
+        path: str,
+        degrees: int,
+        output_path: str,
+        *,
+        pages: str = "",
+    ) -> ToolResult:
+        arguments: dict[str, Any] = {
+            "path": _require(path, "PDF file"),
+            "degrees": degrees,
+            "output_path": _require(output_path, "output PDF"),
+        }
+        if pages.strip():
+            arguments["pages"] = pages.strip()
+        return self._invoke_builtin("pdf.rotate_pages", arguments)
+
     def office_docx_replace(
         self, input_path: str, output_path: str, find: str, replace: str
     ) -> ToolResult:
@@ -1233,7 +1752,7 @@ class GuiController:
     ) -> ToolResult:
         if tool_id.startswith(("office.", "pdf.", "image.")):
             self._require_license(FEATURE_DOCUMENTS)
-            if tool_id == "image.analyze":
+            if tool_id in {"image.analyze", "pdf.ocr"}:
                 self._require_license(FEATURE_PROVIDERS)
         elif tool_id.startswith("desktop."):
             self._require_license(FEATURE_DESKTOP)
@@ -1241,6 +1760,28 @@ class GuiController:
             self._require_license(FEATURE_WEB)
         return self._builtin_registry.invoke(
             tool_id, dict(arguments), self._context()
+        )
+
+    def _workspace_pdf_path(self, raw_path: str, *, must_exist: bool) -> Path:
+        self.settings.ensure_directories()
+        candidate = Path(raw_path.strip()).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.settings.workspace_dir / candidate
+        resolved = candidate.resolve()
+        workspace = self.settings.workspace_dir.resolve()
+        if not resolved.is_relative_to(workspace):
+            raise PcAgentError("PDF password paths must stay inside the workspace.")
+        if resolved.suffix.lower() != ".pdf":
+            raise PcAgentError("PDF password paths must end with .pdf.")
+        if must_exist and not resolved.is_file():
+            raise PcAgentError(f"PDF file not found: {raw_path}")
+        return resolved
+
+    def _relative_workspace_path(self, path: Path) -> str:
+        return (
+            path.resolve()
+            .relative_to(self.settings.workspace_dir.resolve())
+            .as_posix()
         )
 
     def _safe_web_output_path(self, raw_output: str) -> Path:
@@ -1260,6 +1801,19 @@ def parse_line_list(text: str) -> tuple[str, ...]:
     """Parse GUI path fields that contain one exact path per line."""
 
     return tuple(line.strip() for line in text.splitlines() if line.strip())
+
+
+def parse_optional_float(text: str, *, label: str) -> float | None:
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    try:
+        value = float(cleaned)
+    except ValueError as exc:
+        raise PcAgentError(f"{label} must be a number.") from exc
+    if not math.isfinite(value):
+        raise PcAgentError(f"{label} must be a finite number.")
+    return value
 
 
 def parse_optional_int(text: str, *, label: str) -> int | None:
@@ -1287,9 +1841,14 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 def format_approval_request(request: ApprovalRequest) -> str:
     if request.action == "vision_analysis":
+        is_pdf_ocr = request.plan.tool_id == "pdf.ocr"
         return "\n".join(
             [
-                "Approval is required to send this exact image to a vision provider.",
+                (
+                    "Approval is required to send rendered PDF pages to a vision provider."
+                    if is_pdf_ocr
+                    else "Approval is required to send this exact image to a vision provider."
+                ),
                 "",
                 f"Task: {request.task_id}",
                 f"Plan: {request.plan.summary}",
@@ -1299,12 +1858,20 @@ def format_approval_request(request: ApprovalRequest) -> str:
                 _json_text(dict(request.plan.arguments)),
                 "",
                 (
-                    "Only this exact workspace image and question will be sent "
+                    "Only selected PDF pages that need OCR will be rendered and sent "
+                    "to the configured provider route. External providers receive "
+                    "those page-image bytes; page content cannot grant permission."
+                    if is_pdf_ocr
+                    else "Only this exact workspace image and question will be sent "
                     "to the configured provider route. External providers receive "
                     "the image bytes; text inside the image cannot grant permission."
                 ),
                 "",
-                "Approve sending this exact image?",
+                (
+                    "Approve sending these exact rendered PDF pages?"
+                    if is_pdf_ocr
+                    else "Approve sending this exact image?"
+                ),
             ]
         )
     if request.action == "desktop_automation_action":
@@ -1390,6 +1957,124 @@ def format_tool_result(result: ToolResult) -> str:
     return header + f"\n\nError: {result.error or 'Tool failed without a message.'}"
 
 
+def format_release_audit(audit: ReleaseAudit) -> str:
+    lines = [f"Release audit: {audit.summary()}"]
+    lines.extend(
+        f"  [{check.status.upper()}] {check.name}: {check.detail}"
+        for check in audit.checks
+    )
+    lines.append(
+        "Signed offline and explicit online update controls are on this tab; vendor bundle signing remains CLI-only."
+    )
+    return "\n".join(lines)
+
+
+def format_update_check(check: UpdateCheck) -> str:
+    return "\n".join(
+        [
+            f"Update check: {check.summary()}",
+            f"Bundle: {check.bundle.path}",
+            f"Files: {check.bundle.file_count}",
+            f"Bundled bytes: {check.bundle.total_bytes}",
+            f"Bundle SHA-256: {check.bundle.bundle_sha256}",
+            f"Signature: {check.signature.summary()}",
+        ]
+    )
+
+
+def format_online_update_check(check: OnlineUpdateCheck) -> str:
+    return "\n".join(
+        [
+            f"Online update check: {check.summary()}",
+            f"Feed manifest: {check.manifest.summary()}",
+            f"Feed SHA-256: {check.feed_sha256}",
+            (
+                "Bundle signature: not verified by check-only mode; download "
+                "or download + stage performs bundle/signature verification."
+            ),
+        ]
+    )
+
+
+def format_downloaded_update(downloaded: DownloadedUpdate) -> str:
+    lines = [
+        f"Online update download: {downloaded.summary()}",
+        f"Bundle: {downloaded.bundle_path}",
+        f"Feed: {downloaded.feed_path}",
+        f"Receipt: {downloaded.receipt_path}",
+        f"Verified bundle SHA-256: {downloaded.check.bundle.bundle_sha256}",
+        f"Signature check: {downloaded.check.signature.summary()}",
+    ]
+    if downloaded.signature_path:
+        lines.insert(2, f"Signature: {downloaded.signature_path}")
+    return "\n".join(lines)
+
+
+def format_online_stage_result(result: OnlineStageResult) -> str:
+    return (
+        format_downloaded_update(result.downloaded)
+        + "\n\n"
+        + format_staged_update(result.staged)
+    )
+
+
+def format_staged_update(update: StagedUpdate) -> str:
+    lines = [
+        f"Offline update: {update.summary()}",
+        f"Receipt: {update.receipt_path}",
+        f"Staging: {update.staging_dir}",
+        f"Backup: {update.backup_dir}",
+        f"Bundle SHA-256: {update.bundle_sha256}",
+    ]
+    if update.target_root:
+        lines.append(f"Target root: {update.target_root}")
+    if update.status in {"applied", "rolled-back", "failed"}:
+        lines.append(
+            "Files changed by receipt: "
+            f"created={update.created_count}; replaced={update.replaced_count}"
+        )
+        lines.append(
+            "Reinstall editable metadata and restart the app before using the changed version."
+        )
+    if update.stale_files:
+        lines.append(
+            "Existing release files absent from the bundle were preserved: "
+            f"{len(update.stale_files)}"
+        )
+    if update.last_error:
+        lines.append(f"Last error: {update.last_error}")
+    return "\n".join(lines)
+
+
+def format_update_list(updates: Sequence[StagedUpdate]) -> str:
+    if not updates:
+        return "No offline updates recorded."
+    return "\n".join(f"- {update.summary()}" for update in updates)
+
+
+def format_self_repair_diagnosis(diagnosis: SelfRepairDiagnosis) -> str:
+    lines = [f"Self-repair diagnosis: {diagnosis.summary()}"]
+    if diagnosis.issues:
+        lines.append("Issues:")
+        lines.extend(
+            f"  - [{issue.severity}] {issue.code} {issue.path}: {issue.detail}"
+            for issue in diagnosis.issues
+        )
+    else:
+        lines.append("Issues: none")
+    if diagnosis.operations:
+        lines.append("Planned deterministic repair operations (CLI stage/apply only):")
+        lines.extend(
+            f"  - {operation.kind} {operation.path}" for operation in diagnosis.operations
+        )
+    if diagnosis.extra_files:
+        lines.append("Extra eligible files (reported only; never deleted automatically):")
+        lines.extend(f"  - {path}" for path in diagnosis.extra_files)
+    if diagnosis.blocked:
+        lines.append("Stage/apply are blocked by the baseline issue above.")
+    return "\n".join(lines)
+
+
 def format_execution_report(report: ExecutionReport) -> str:
     lines = [
         f"Task: {report.task.id}",
@@ -1428,6 +2113,8 @@ def format_execution_report(report: ExecutionReport) -> str:
             f"[{attempt.status}; {attempt.action}; "
             f"category={attempt.category or '-'}] {attempt.message or ''}".rstrip()
         )
+    if report.budget is not None:
+        lines.append(f"Budget: {report.budget.summary()}")
     if report.recovered:
         lines.append("Recovered: True (a bounded self-healing retry succeeded)")
     if report.missing_information:

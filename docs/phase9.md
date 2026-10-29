@@ -78,5 +78,6 @@ find/replace + XLSX cell set/verify (Office panel), and Append Paragraphs
   byte-for-byte); it does not create charts/pivots/styles, and the formula
   evaluator intentionally covers the common arithmetic/aggregate subset —
   anything else is reported as unsupported instead of being mis-computed.
-- PDF page reordering beyond selection order, rotation and text extraction
-  from PDFs remain future work.
+- In Phase 9, PDF page reordering beyond selection order, rotation and
+  text extraction from PDFs remained future work; Phase 20 implements
+  those operations. See `docs/phase20.md`.

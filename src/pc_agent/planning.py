@@ -27,6 +27,7 @@ _ALLOWED_AI_TOOLS = {
     "pdf.merge": "pdf.merge",
     "pdf.verify": "pdf.verify",
     "pdf.inspect": "pdf.inspect",
+    "pdf.search_text": "pdf.search_text",
     "workspace.list_files": "workspace.list_files",
     "office.inspect": "office.inspect",
     "office.csv_inspect": "office.csv_inspect",
@@ -70,6 +71,14 @@ _INTENT_TO_TOOL = {
     "files.search": "files.search",
     "pdf.extract_pages": "pdf.extract_pages",
     "pdf.split": "pdf.split",
+    "pdf.extract_text": "pdf.extract_text",
+    "pdf.extract_tables": "pdf.extract_tables",
+    "pdf.ocr": "pdf.ocr",
+    "pdf.search_text": "pdf.search_text",
+    "pdf.reorder_pages": "pdf.reorder_pages",
+    "pdf.rotate_pages": "pdf.rotate_pages",
+    "pdf.inspect_form": "pdf.inspect_form",
+    "pdf.fill_form": "pdf.fill_form",
     "office.docx_replace_text": "office.docx_replace_text",
     "office.docx_append_paragraphs": "office.docx_append_paragraphs",
     "office.xlsx_set_cells": "office.xlsx_set_cells",
@@ -149,6 +158,30 @@ class PlannerOptions:
     image_quality: int | None = None
     image_question: str | None = None
     image_compare_path: str | None = None
+    # Phase 20 PDF text/page-transform options. Search text reuses the
+    # exact --find option; rotation stays a separate quarter-turn value.
+    pdf_rotate_degrees: int | None = None
+    pdf_case_sensitive: bool = False
+    pdf_max_results: int | None = None
+    # Phase 22 PDF OCR. These exact values stay option-driven; free text
+    # only selects OCR and its target/output.
+    pdf_ocr_dpi: int | None = None
+    pdf_ocr_language: str | None = None
+    pdf_ocr_skip_text_pages: bool = True
+    pdf_ocr_max_output_tokens: int | None = None
+    # Phase 23 PDF tables. Detection thresholds stay option-driven.
+    pdf_table_min_rows: int | None = None
+    pdf_table_min_columns: int | None = None
+    # Phase 25 PDF forms. Exact field names/values stay option-driven and
+    # are never guessed from free-form prose.
+    pdf_form_values: tuple[tuple[str, str], ...] = ()
+    # Phase 17 per-run task-budget overrides. These travel with execution
+    # options but never become tool arguments or planner-visible data.
+    token_budget: int | None = None
+    provider_call_budget: int | None = None
+    tool_budget: int | None = None
+    step_budget: int | None = None
+    task_time_budget_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,6 +528,9 @@ class DeterministicPlanner:
                     image_quality=None,
                     image_question=None,
                     image_compare_path=None,
+                    pdf_rotate_degrees=None,
+                    pdf_case_sensitive=False,
+                    pdf_max_results=None,
                 )
             )
             token = _PROMISED_OUTPUTS.set(frozenset(promised))
@@ -1745,10 +1781,467 @@ class DeterministicPlanner:
             )
         )
 
+
+    def _plan_pdf_text_transform(
+        self, verb: str, instruction: str, options: PlannerOptions
+    ) -> PlanningOutcome:
+        target = self._extract_target_pdf(instruction, options)
+        if isinstance(target, PlanningOutcome):
+            return target
+        external_roots = (
+            (target.external_root,) if target.external_root is not None else ()
+        )
+        selection = options.page_selection or _extract_page_selection(instruction)
+        selection_count: int | None = None
+        if selection:
+            selection_count = _selection_page_count(selection)
+            if selection_count is None:
+                return PlanningOutcome(
+                    missing_information=(
+                        f"Page selection {selection!r} is invalid; use forms like 1-3,5.",
+                    )
+                )
+
+        if verb in {"pdf.inspect_form", "pdf.fill_form"}:
+            if selection:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "PDF form inspection/filling works on the whole form; "
+                            "--pages is not supported for this operation."
+                        ),
+                    )
+                )
+            if verb == "pdf.inspect_form":
+                return PlanningOutcome(
+                    plan=TaskPlan(
+                        intent="pdf.inspect_form",
+                        tool_id="pdf.inspect_form",
+                        arguments={"path": target.argument},
+                        summary=f"Inspect PDF form fields in {target.argument}.",
+                        planner="deterministic",
+                        external_read_roots=external_roots,
+                    )
+                )
+            if not options.pdf_form_values:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "PDF form filling needs at least one exact "
+                            "--form-field Name=Value option."
+                        ),
+                    )
+                )
+            if len(options.pdf_form_values) > 200:
+                return PlanningOutcome(
+                    missing_information=(
+                        "PDF form filling accepts at most 200 --form-field values.",
+                    )
+                )
+            seen_names: set[str] = set()
+            entries: list[dict[str, str]] = []
+            for raw_name, raw_value in options.pdf_form_values:
+                name = raw_name.strip()
+                if not name or len(name) > 500:
+                    return PlanningOutcome(
+                        missing_information=(
+                            "Every --form-field name must be 1-500 characters.",
+                        )
+                    )
+                if name in seen_names:
+                    return PlanningOutcome(
+                        missing_information=(
+                            f"Duplicate --form-field value for {name!r}.",
+                        )
+                    )
+                if len(raw_value) > 10_000:
+                    return PlanningOutcome(
+                        missing_information=(
+                            f"--form-field value for {name!r} exceeds 10000 characters.",
+                        )
+                    )
+                seen_names.add(name)
+                entries.append({"name": name, "value": raw_value})
+            output = self._workspace_output(
+                options.output_path,
+                default_name=f"{Path(target.argument).stem}-filled.pdf",
+                expected_suffix=".pdf",
+                format_label="filled PDF form",
+            )
+            if isinstance(output, PlanningOutcome):
+                return output
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="pdf.fill_form",
+                    tool_id="pdf.fill_form",
+                    arguments={
+                        "path": target.argument,
+                        "output_path": output,
+                        "values": entries,
+                    },
+                    summary=(
+                        f"Fill {len(entries)} PDF form field(s) in "
+                        f"{target.argument} into {output}."
+                    ),
+                    planner="deterministic",
+                    external_read_roots=external_roots,
+                )
+            )
+
+        if verb == "pdf.extract_tables":
+            if selection_count is not None and selection_count > 100:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "PDF table extraction is limited to 100 selected "
+                            "pages per run; choose a smaller --pages range."
+                        ),
+                    )
+                )
+            if options.pdf_table_min_rows is not None and not (
+                1 <= options.pdf_table_min_rows <= 1000
+            ):
+                return PlanningOutcome(
+                    missing_information=(
+                        "--pdf-table-min-rows must be between 1 and 1000.",
+                    )
+                )
+            if options.pdf_table_min_columns is not None and not (
+                1 <= options.pdf_table_min_columns <= 50
+            ):
+                return PlanningOutcome(
+                    missing_information=(
+                        "--pdf-table-min-columns must be between 1 and 50.",
+                    )
+                )
+            raw_suffix = (
+                Path(options.output_path).suffix.lower()
+                if options.output_path
+                else ".json"
+            )
+            if options.output_path and raw_suffix not in {".json", ".csv"}:
+                return PlanningOutcome(
+                    missing_information=(
+                        "PDF table output must end with .json or .csv.",
+                    )
+                )
+            expected_suffix = raw_suffix if raw_suffix in {".json", ".csv"} else ".json"
+            output = self._workspace_output(
+                options.output_path,
+                default_name=f"{Path(target.argument).stem}-tables{expected_suffix}",
+                expected_suffix=expected_suffix,
+                format_label="PDF tables",
+            )
+            if isinstance(output, PlanningOutcome):
+                return output
+            arguments = {
+                "path": target.argument,
+                "output_path": output,
+                "format": "csv" if expected_suffix == ".csv" else "json",
+            }
+            if selection:
+                arguments["pages"] = selection.replace(" ", "")
+            if options.pdf_table_min_rows is not None:
+                arguments["min_rows"] = options.pdf_table_min_rows
+            if options.pdf_table_min_columns is not None:
+                arguments["min_columns"] = options.pdf_table_min_columns
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="pdf.extract_tables",
+                    tool_id="pdf.extract_tables",
+                    arguments=arguments,
+                    summary=(
+                        f"Extract embedded-text tables from {target.argument} "
+                        f"into {output}."
+                    ),
+                    planner="deterministic",
+                    external_read_roots=external_roots,
+                    expected_pages=selection_count,
+                )
+            )
+
+        if verb == "pdf.ocr":
+            if selection_count is not None and selection_count > 10:
+                return PlanningOutcome(
+                    missing_information=(
+                        (
+                            "PDF OCR is limited to 10 selected pages per run; "
+                            "choose a smaller --pages range."
+                        ),
+                    )
+                )
+            if options.pdf_ocr_dpi is not None and not (
+                72 <= options.pdf_ocr_dpi <= 300
+            ):
+                return PlanningOutcome(
+                    missing_information=(
+                        "--pdf-ocr-dpi must be between 72 and 300.",
+                    )
+                )
+            language = (
+                " ".join(options.pdf_ocr_language.strip().split())
+                if options.pdf_ocr_language
+                else None
+            )
+            if language is not None and len(language) > 50:
+                return PlanningOutcome(
+                    missing_information=(
+                        "--pdf-ocr-language must be at most 50 characters.",
+                    )
+                )
+            if options.pdf_ocr_max_output_tokens is not None and not (
+                256 <= options.pdf_ocr_max_output_tokens <= 4096
+            ):
+                return PlanningOutcome(
+                    missing_information=(
+                        "--pdf-ocr-max-output-tokens must be between 256 and 4096.",
+                    )
+                )
+            raw_suffix = (
+                Path(options.output_path).suffix.lower()
+                if options.output_path
+                else ".txt"
+            )
+            if options.output_path and raw_suffix not in {".txt", ".md", ".json"}:
+                return PlanningOutcome(
+                    missing_information=(
+                        "PDF OCR output must end with .txt, .md or .json.",
+                    )
+                )
+            expected_suffix = raw_suffix if raw_suffix in {".txt", ".md", ".json"} else ".txt"
+            output = self._workspace_output(
+                options.output_path,
+                default_name=f"{Path(target.argument).stem}-ocr{expected_suffix}",
+                expected_suffix=expected_suffix,
+                format_label="PDF OCR",
+            )
+            if isinstance(output, PlanningOutcome):
+                return output
+            arguments = {
+                "path": target.argument,
+                "output_path": output,
+                "format": "json" if expected_suffix == ".json" else "text",
+            }
+            if selection:
+                arguments["pages"] = selection.replace(" ", "")
+            if options.pdf_ocr_dpi is not None:
+                arguments["dpi"] = options.pdf_ocr_dpi
+            if language:
+                arguments["language"] = language
+            if not options.pdf_ocr_skip_text_pages:
+                arguments["skip_text_pages"] = False
+            if options.pdf_ocr_max_output_tokens is not None:
+                arguments["max_output_tokens"] = (
+                    options.pdf_ocr_max_output_tokens
+                )
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="pdf.ocr",
+                    tool_id="pdf.ocr",
+                    arguments=arguments,
+                    summary=(
+                        f"OCR selected pages in {target.argument} into {output} "
+                        "with the approved vision provider route."
+                    ),
+                    planner="deterministic",
+                    external_read_roots=external_roots,
+                    expected_pages=selection_count,
+                )
+            )
+
+        if verb == "pdf.search_text":
+            quoted = _extract_quoted(instruction)
+            query = options.find_text or (quoted[0] if quoted else None)
+            if not query or not query.strip():
+                return PlanningOutcome(
+                    missing_information=(
+                        "What exact text should be searched? Quote it or pass --find.",
+                    )
+                )
+            if len(" ".join(query.strip().split())) > 200:
+                return PlanningOutcome(
+                    missing_information=(
+                        "PDF text search needs an exact phrase of at most 200 characters.",
+                    )
+                )
+            if options.pdf_max_results is not None and not (
+                1 <= options.pdf_max_results <= 200
+            ):
+                return PlanningOutcome(
+                    missing_information=("--max-results must be between 1 and 200.",)
+                )
+            arguments: dict[str, Any] = {
+                "path": target.argument,
+                "query": " ".join(query.strip().split()),
+            }
+            if selection:
+                arguments["pages"] = selection.replace(" ", "")
+            if options.pdf_case_sensitive:
+                arguments["case_sensitive"] = True
+            if options.pdf_max_results is not None:
+                arguments["max_results"] = options.pdf_max_results
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="pdf.search_text",
+                    tool_id="pdf.search_text",
+                    arguments=arguments,
+                    summary=(
+                        f"Search embedded text in {target.argument} "
+                        f"for {arguments['query']!r}."
+                    ),
+                    planner="deterministic",
+                    external_read_roots=external_roots,
+                )
+            )
+
+        if verb == "pdf.extract_text":
+            raw_suffix = (
+                Path(options.output_path).suffix.lower()
+                if options.output_path
+                else ".txt"
+            )
+            if options.output_path and raw_suffix not in {".txt", ".md", ".json"}:
+                return PlanningOutcome(
+                    missing_information=(
+                        "PDF text output must end with .txt, .md or .json.",
+                    )
+                )
+            expected_suffix = raw_suffix if raw_suffix in {".txt", ".md", ".json"} else ".txt"
+            output = self._workspace_output(
+                options.output_path,
+                default_name=f"{Path(target.argument).stem}-text{expected_suffix}",
+                expected_suffix=expected_suffix,
+                format_label="PDF text",
+            )
+            if isinstance(output, PlanningOutcome):
+                return output
+            arguments = {
+                "path": target.argument,
+                "output_path": output,
+                "format": "json" if expected_suffix == ".json" else "text",
+            }
+            if selection:
+                arguments["pages"] = selection.replace(" ", "")
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="pdf.extract_text",
+                    tool_id="pdf.extract_text",
+                    arguments=arguments,
+                    summary=f"Extract embedded text from {target.argument} into {output}.",
+                    planner="deterministic",
+                    external_read_roots=external_roots,
+                    expected_pages=selection_count,
+                )
+            )
+
+        if verb == "pdf.reorder_pages":
+            lowered = instruction.lower()
+            raw_order = options.page_selection or (
+                "reverse"
+                if re.search(r"\breverse\b", lowered)
+                else _extract_page_selection(instruction)
+            )
+            if not raw_order:
+                return PlanningOutcome(
+                    missing_information=(
+                        'What page order? Pass --pages "3,1,2" or --pages reverse.',
+                    )
+                )
+            order_count: int | None = None
+            if raw_order.strip().lower() != "reverse":
+                order_count = _selection_page_count(raw_order)
+                if order_count is None:
+                    return PlanningOutcome(
+                        missing_information=(
+                            f"Page order {raw_order!r} is invalid; list every page once.",
+                        )
+                    )
+            output = self._workspace_output(
+                options.output_path,
+                default_name=f"{Path(target.argument).stem}-reordered.pdf",
+                expected_suffix=".pdf",
+                format_label="PDF",
+            )
+            if isinstance(output, PlanningOutcome):
+                return output
+            return PlanningOutcome(
+                plan=TaskPlan(
+                    intent="pdf.reorder_pages",
+                    tool_id="pdf.reorder_pages",
+                    arguments={
+                        "path": target.argument,
+                        "pages": raw_order.replace(" ", ""),
+                        "output_path": output,
+                    },
+                    summary=f"Reorder pages in {target.argument} into {output}.",
+                    planner="deterministic",
+                    external_read_roots=external_roots,
+                    expected_pages=order_count,
+                )
+            )
+
+        degrees = options.pdf_rotate_degrees
+        if degrees is None:
+            degrees = _extract_pdf_rotation(instruction)
+        if degrees is None:
+            return PlanningOutcome(
+                missing_information=(
+                    "Rotate by how many degrees? Pass --pdf-rotate 90 (quarter-turns only).",
+                )
+            )
+        if degrees % 90 or degrees % 360 == 0 or not -270 <= degrees <= 270:
+            return PlanningOutcome(
+                missing_information=(
+                    "PDF rotation must be -270, -180, -90, 90, 180 or 270 degrees.",
+                )
+            )
+        output = self._workspace_output(
+            options.output_path,
+            default_name=f"{Path(target.argument).stem}-rotated.pdf",
+            expected_suffix=".pdf",
+            format_label="PDF",
+        )
+        if isinstance(output, PlanningOutcome):
+            return output
+        arguments = {
+            "path": target.argument,
+            "degrees": degrees,
+            "output_path": output,
+        }
+        if selection:
+            arguments["pages"] = selection.replace(" ", "")
+        return PlanningOutcome(
+            plan=TaskPlan(
+                intent="pdf.rotate_pages",
+                tool_id="pdf.rotate_pages",
+                arguments=arguments,
+                summary=(
+                    f"Rotate selected pages in {target.argument} by "
+                    f"{degrees} degrees into {output}."
+                ),
+                planner="deterministic",
+                external_read_roots=external_roots,
+            )
+        )
+
     def _plan_deeper_office(
         self, instruction: str, options: PlannerOptions
     ) -> PlanningOutcome | None:
         lowered = instruction.lower()
+        raw_target_hint = options.target_path or (
+            options.input_files[0] if options.input_files else None
+        )
+        pdf_context = (
+            "pdf" in lowered
+            or ".pdf" in lowered
+            or (
+                raw_target_hint is not None
+                and Path(raw_target_hint).suffix.lower() == ".pdf"
+            )
+        )
+        phase20_verb = _pdf_text_transform_verb(lowered, pdf_context=pdf_context)
+        if phase20_verb is not None:
+            return self._plan_pdf_text_transform(phase20_verb, instruction, options)
         verb = _deeper_office_verb(lowered)
         if verb is None:
             return None
@@ -2524,6 +3017,13 @@ def _validate_ai_arguments(intent: str, raw: Mapping[str, Any]) -> dict[str, Any
         "pdf.merge": {"input_paths", "output_path"},
         "pdf.verify": {"path", "expected_pages"},
         "pdf.inspect": {"path"},
+        "pdf.search_text": {
+            "path",
+            "query",
+            "pages",
+            "case_sensitive",
+            "max_results",
+        },
         "workspace.list_files": {"directory", "pattern", "recursive", "max_results"},
         "office.inspect": {"path"},
         "office.csv_inspect": {"path", "sample_rows"},
@@ -2560,6 +3060,39 @@ def _validate_ai_arguments(intent: str, raw: Mapping[str, Any]) -> dict[str, Any
     elif intent == "pdf.merge":
         result["input_paths"] = _ai_path_list(raw.get("input_paths"), "input_paths", min_items=2)
         result["output_path"] = _ai_output_path(raw.get("output_path"))
+    elif intent == "pdf.search_text":
+        path = _ai_relative_path(raw.get("path"), "path")
+        if Path(path).suffix.lower() != ".pdf":
+            raise PlanningError("AI pdf.search_text path must end with .pdf.")
+        result["path"] = path
+        query = raw.get("query")
+        if not isinstance(query, str) or not query.strip():
+            raise PlanningError("AI pdf.search_text query is required.")
+        clean_query = " ".join(query.strip().split())
+        if len(clean_query) > 200:
+            raise PlanningError("AI pdf.search_text query is too long.")
+        result["query"] = clean_query
+        if raw.get("pages") is not None:
+            pages = raw["pages"]
+            if (
+                not isinstance(pages, str)
+                or _selection_page_count(pages) is None
+            ):
+                raise PlanningError("AI pdf.search_text pages selection is invalid.")
+            result["pages"] = pages.replace(" ", "")
+        if raw.get("case_sensitive") is not None:
+            result["case_sensitive"] = _ai_bool(
+                raw["case_sensitive"], "case_sensitive"
+            )
+        if raw.get("max_results") is not None:
+            max_results = raw["max_results"]
+            if (
+                not isinstance(max_results, int)
+                or isinstance(max_results, bool)
+                or not 1 <= max_results <= 200
+            ):
+                raise PlanningError("AI pdf.search_text max_results is invalid.")
+            result["max_results"] = max_results
     elif intent in {"pdf.verify", "pdf.inspect"}:
         result["path"] = _ai_relative_path(raw.get("path"), "path")
         if intent == "pdf.verify" and raw.get("expected_pages") is not None:
@@ -2921,7 +3454,7 @@ def _looks_like_verify(lowered: str) -> bool:
 
 
 def _looks_like_inspect(lowered: str) -> bool:
-    return "pdf" in lowered and any(
+    return "pdf" in lowered and "form" not in lowered and any(
         phrase in lowered
         for phrase in ("inspect", "how many pages", "page count", "kitne page", "kitnay page")
     )
@@ -2965,6 +3498,55 @@ def _office_conversion(
         return "office.csv_to_xlsx", ".csv", ".xlsx", "to XLSX"
     return None
 
+
+
+def _pdf_text_transform_verb(lowered: str, *, pdf_context: bool) -> str | None:
+    """Detect a Phase 20 PDF text/page-transform verb, most specific first."""
+
+    if not pdf_context:
+        return None
+    if "form" in lowered and re.search(
+        r"\b(fill|complete|populate)\b", lowered
+    ):
+        return "pdf.fill_form"
+    if "form" in lowered and re.search(
+        r"\b(inspect|show|list|read|get)\b", lowered
+    ):
+        return "pdf.inspect_form"
+    if "table" in lowered and re.search(
+        r"\b(extract|export|convert|pull|get)\b", lowered
+    ):
+        return "pdf.extract_tables"
+    if (
+        re.search(r"\bocr\b", lowered)
+        or re.search(r"\brecogn(?:ise|ize)\b.*\btext\b", lowered)
+        or ("scanned" in lowered and "text" in lowered)
+    ):
+        return "pdf.ocr"
+    if re.search(r"\b(search|find|look\s+for)\b", lowered):
+        return "pdf.search_text"
+    if (
+        re.search(r"\bextract\b", lowered)
+        and "text" in lowered
+        or re.search(r"\bconvert\b", lowered)
+        and "text" in lowered
+    ):
+        return "pdf.extract_text"
+    if re.search(r"\b(reorder|rearrange|reverse)\b", lowered) and "page" in lowered:
+        return "pdf.reorder_pages"
+    if re.search(r"\brotate\b", lowered) and "page" in lowered:
+        return "pdf.rotate_pages"
+    if re.search(r"\brotate\b", lowered):
+        return "pdf.rotate_pages"
+    return None
+
+
+def _extract_pdf_rotation(instruction: str) -> int | None:
+    match = re.search(r"(-?\d+)\s*(?:degrees?|°)", instruction.lower())
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\brotate\b[^.]*?\bby\s+(-?\d+)\b", instruction.lower())
+    return int(match.group(1)) if match else None
 
 def _deeper_office_verb(lowered: str) -> str | None:
     """Detect a Phase 9 deeper-office verb, most specific first."""

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from ..config import Settings
 from ..errors import ProviderError
 from ..logging_config import redact_text
+from .anthropic import AnthropicProvider
 from .base import AIProvider, CompletionRequest, CompletionResponse, JsonTransport
 from .gemini_adapter import GeminiProvider
 from .mock import MockProvider
@@ -40,27 +41,6 @@ class ProviderStatus:
     implemented: bool
     in_route: bool
     detail: str
-
-
-class UnsupportedProvider:
-    """A reserved provider slot with no direct adapter in this build."""
-
-    implemented = False
-    supports_vision = False
-
-    def __init__(self, name: str, model: str = "") -> None:
-        self.name = name
-        self.model = model or "not configured"
-
-    @property
-    def configured(self) -> bool:
-        return False
-
-    def complete(self, request: CompletionRequest) -> CompletionResponse:
-        raise ProviderError(
-            f"Direct {self.name} adapter is reserved but not implemented in this build. "
-            "Use an implemented provider or an OpenRouter model for that vendor."
-        )
 
 
 class ModelRouter:
@@ -268,8 +248,14 @@ def _build_provider(
             timeout_seconds=timeout,
             transport=transport,
         )
-    if name == "anthropic":
-        return UnsupportedProvider(name, settings.anthropic_model)
+    if name == "anthropic" and settings.anthropic_api_key:
+        return AnthropicProvider(
+            api_key=settings.anthropic_api_key,
+            model=settings.anthropic_model,
+            base_url=settings.anthropic_base_url,
+            timeout_seconds=timeout,
+            transport=transport,
+        )
     return None
 
 
@@ -302,9 +288,10 @@ def _status_detail(name: str, settings: Settings) -> tuple[bool, bool, str]:
     if name == "ollama":
         return bool(settings.ollama_model), True, "Ollama endpoint; server availability is not probed."
     if name == "anthropic":
-        return (
-            bool(settings.anthropic_api_key),
-            False,
-            "Reserved slot; no direct adapter in this build (OpenRouter can route Anthropic models).",
+        configured = bool(
+            settings.anthropic_api_key
+            and settings.anthropic_model
+            and settings.anthropic_base_url
         )
+        return configured, True, "Anthropic Messages API adapter."
     return False, False, "Unknown provider slot."

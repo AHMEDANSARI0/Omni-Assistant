@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -46,6 +48,7 @@ DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_OPENROUTER_MODEL = "openrouter/auto"
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 DEFAULT_OLLAMA_MODEL = "llama3.1"
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5-5"
 
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -137,6 +140,15 @@ class Settings:
     credential_store_available: bool = False
     credential_store_detail: str = ""
     credential_sources: tuple[tuple[str, str], ...] = ()
+    # Phase 17: self-repair is a separate default-off maintenance gate;
+    # task budgets are deterministic local ceilings (0 means unlimited,
+    # except the step budget which is 1..20).
+    allow_self_repair: bool = False
+    task_token_budget: int = 20_000
+    task_provider_call_budget: int = 10
+    task_tool_budget: int = 25
+    task_step_budget: int = 5
+    task_time_budget_seconds: float = 600.0
     # Phase 6 licensing. Enforcement defaults to "off" so development and
     # existing installs keep working; commercial builds opt in explicitly.
     license_enforcement: str = "off"
@@ -144,6 +156,17 @@ class Settings:
     license_public_key: str | None = field(default=None, repr=False)
     license_key_id: str = "default"
     trial_days: int = 14
+    # Phase 21 signed offline updates. This is a public trust anchor, never a
+    # secret. Updates stay explicit and local; requiring signatures makes an
+    # unsigned or unverifiable bundle fail closed during staging.
+    release_public_key: str | None = field(default=None, repr=False)
+    release_key_id: str | None = None
+    require_signed_updates: bool = False
+    online_updates_enabled: bool = False
+    update_feed_url: str | None = None
+    update_channel: str = "stable"
+    online_update_timeout_seconds: float = 30.0
+    online_update_max_bytes: int = 25_000_000
     gemini_api_key: str | None = field(default=None, repr=False)
     openrouter_api_key: str | None = field(default=None, repr=False)
     openai_api_key: str | None = field(default=None, repr=False)
@@ -155,7 +178,7 @@ class Settings:
     openai_model: str = DEFAULT_OPENAI_MODEL
     openai_compatible_model: str = ""
     ollama_model: str = DEFAULT_OLLAMA_MODEL
-    anthropic_model: str = ""
+    anthropic_model: str = DEFAULT_ANTHROPIC_MODEL
     gemini_base_url: str = DEFAULT_GEMINI_BASE_URL
     openrouter_base_url: str = DEFAULT_OPENROUTER_BASE_URL
     openai_base_url: str = DEFAULT_OPENAI_BASE_URL
@@ -226,10 +249,33 @@ class Settings:
                 "yes" if self.credential_store_available else "no"
             ),
             "provider_credential_sources": credential_sources or "none",
+            "allow_self_repair": "yes" if self.allow_self_repair else "no",
+            "task_token_budget": str(self.task_token_budget),
+            "task_provider_call_budget": str(self.task_provider_call_budget),
+            "task_tool_budget": str(self.task_tool_budget),
+            "task_step_budget": str(self.task_step_budget),
+            "task_time_budget_seconds": str(self.task_time_budget_seconds),
             "license_enforcement": self.license_enforcement,
             "license_public_key_configured": "yes" if self.license_public_key else "no",
             "license_file": str(self.license_file),
             "trial_days": str(self.trial_days),
+            "release_public_key_configured": (
+                "yes" if self.release_public_key else "no"
+            ),
+            "release_key_id": self.release_key_id or "any",
+            "require_signed_updates": "yes" if self.require_signed_updates else "no",
+            "online_updates": "yes" if self.online_updates_enabled else "no",
+            "update_feed_configured": "yes" if self.update_feed_url else "no",
+            "update_feed_host": (
+                urlparse(self.update_feed_url).hostname or "none"
+                if self.update_feed_url
+                else "none"
+            ),
+            "update_channel": self.update_channel,
+            "online_update_timeout_seconds": str(
+                self.online_update_timeout_seconds
+            ),
+            "online_update_max_bytes": str(self.online_update_max_bytes),
         }
 
     @classmethod
@@ -325,6 +371,30 @@ class Settings:
             credential_store_mode
         )
         credential_status = status_store.status(include_stored=False)
+        allow_self_repair = _parse_allow_self_repair(
+            get("PC_AGENT_ALLOW_SELF_REPAIR", "0")
+        )
+        task_token_budget = _parse_nonnegative_budget(
+            "PC_AGENT_TASK_TOKEN_BUDGET",
+            get("PC_AGENT_TASK_TOKEN_BUDGET", "20000"),
+            maximum=10_000_000,
+        )
+        task_provider_call_budget = _parse_nonnegative_budget(
+            "PC_AGENT_TASK_PROVIDER_CALL_BUDGET",
+            get("PC_AGENT_TASK_PROVIDER_CALL_BUDGET", "10"),
+            maximum=1000,
+        )
+        task_tool_budget = _parse_nonnegative_budget(
+            "PC_AGENT_TASK_TOOL_BUDGET",
+            get("PC_AGENT_TASK_TOOL_BUDGET", "25"),
+            maximum=1000,
+        )
+        task_step_budget = _parse_task_step_budget(
+            get("PC_AGENT_TASK_STEP_BUDGET", "5")
+        )
+        task_time_budget_seconds = _parse_task_time_budget(
+            get("PC_AGENT_TASK_TIME_BUDGET_SECONDS", "600")
+        )
         lookup_store = (
             status_store
             if credential_store_mode != "env"
@@ -348,6 +418,26 @@ class Settings:
             get("PC_AGENT_LICENSE_KEY_ID", "default")
         )
         trial_days = _parse_trial_days(get("PC_AGENT_TRIAL_DAYS", "14"))
+        release_public_key = _parse_release_public_key(
+            get("PC_AGENT_RELEASE_PUBLIC_KEY")
+        )
+        release_key_id = _parse_release_key_id(get("PC_AGENT_RELEASE_KEY_ID"))
+        require_signed_updates = _parse_require_signed_updates(
+            get("PC_AGENT_REQUIRE_SIGNED_UPDATES", "0")
+        )
+        online_updates_enabled = _parse_online_updates_enabled(
+            get("PC_AGENT_ONLINE_UPDATES", "0")
+        )
+        update_feed_url = _parse_update_feed_url(get("PC_AGENT_UPDATE_FEED_URL"))
+        update_channel = _parse_update_channel(
+            get("PC_AGENT_UPDATE_CHANNEL", "stable")
+        )
+        online_update_timeout_seconds = _parse_online_update_timeout(
+            get("PC_AGENT_ONLINE_UPDATE_TIMEOUT_SECONDS", "30")
+        )
+        online_update_max_bytes = _parse_online_update_max_bytes(
+            get("PC_AGENT_ONLINE_UPDATE_MAX_BYTES", "25000000")
+        )
 
         gemini_model = _parse_model(
             "PC_AGENT_GEMINI_MODEL", get("PC_AGENT_GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
@@ -368,7 +458,8 @@ class Settings:
             "PC_AGENT_OLLAMA_MODEL", get("PC_AGENT_OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
         )
         anthropic_model = _parse_model(
-            "PC_AGENT_ANTHROPIC_MODEL", get("PC_AGENT_ANTHROPIC_MODEL"), allow_empty=True
+            "PC_AGENT_ANTHROPIC_MODEL",
+            get("PC_AGENT_ANTHROPIC_MODEL") or DEFAULT_ANTHROPIC_MODEL,
         )
 
         gemini_base_url = _parse_base_url(
@@ -454,11 +545,25 @@ class Settings:
             credential_store_available=credential_status.available,
             credential_store_detail=credential_status.detail,
             credential_sources=tuple(credential_sources),
+            allow_self_repair=allow_self_repair,
+            task_token_budget=task_token_budget,
+            task_provider_call_budget=task_provider_call_budget,
+            task_tool_budget=task_tool_budget,
+            task_step_budget=task_step_budget,
+            task_time_budget_seconds=task_time_budget_seconds,
             license_enforcement=license_enforcement,
             license_file=license_file,
             license_public_key=license_public_key,
             license_key_id=license_key_id,
             trial_days=trial_days,
+            release_public_key=release_public_key,
+            release_key_id=release_key_id,
+            require_signed_updates=require_signed_updates,
+            online_updates_enabled=online_updates_enabled,
+            update_feed_url=update_feed_url,
+            update_channel=update_channel,
+            online_update_timeout_seconds=online_update_timeout_seconds,
+            online_update_max_bytes=online_update_max_bytes,
             gemini_api_key=api_keys["gemini"],
             openrouter_api_key=api_keys["openrouter"],
             openai_api_key=api_keys["openai"],
@@ -680,6 +785,146 @@ def _parse_credential_store(raw: str) -> str:
     return value
 
 
+def _parse_allow_self_repair(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        "PC_AGENT_ALLOW_SELF_REPAIR must be a boolean (1/0, true/false, yes/no, on/off)."
+    )
+
+
+def _parse_require_signed_updates(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        "PC_AGENT_REQUIRE_SIGNED_UPDATES must be a boolean "
+        "(1/0, true/false, yes/no, on/off)."
+    )
+
+
+def _parse_online_updates_enabled(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        "PC_AGENT_ONLINE_UPDATES must be a boolean "
+        "(1/0, true/false, yes/no, on/off)."
+    )
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _parse_update_feed_url(raw: str) -> str | None:
+    value = raw.strip()
+    if not value:
+        return None
+    if (
+        len(value) > 4096
+        or "\\" in value
+        or any(ord(char) < 32 or ord(char) == 127 or char.isspace() for char in value)
+    ):
+        raise ConfigError("PC_AGENT_UPDATE_FEED_URL must be a single safe URL.")
+    parsed = urlparse(value)
+    host = parsed.hostname or ""
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc or not host:
+        raise ConfigError("PC_AGENT_UPDATE_FEED_URL must be a valid http(s) URL.")
+    if parsed.scheme == "http" and not _is_loopback_host(host):
+        raise ConfigError(
+            "PC_AGENT_UPDATE_FEED_URL must use HTTPS unless it points to loopback."
+        )
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ConfigError(
+            "PC_AGENT_UPDATE_FEED_URL must not contain credentials, a query "
+            "string, or a fragment."
+        )
+    if not parsed.path or parsed.path == "/":
+        raise ConfigError("PC_AGENT_UPDATE_FEED_URL must include a feed path.")
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_UPDATE_FEED_URL has an invalid port.") from exc
+    return value
+
+
+def _parse_update_channel(raw: str) -> str:
+    return _parse_key_id("PC_AGENT_UPDATE_CHANNEL", raw.strip().lower())
+
+
+def _parse_online_update_timeout(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            "PC_AGENT_ONLINE_UPDATE_TIMEOUT_SECONDS must be a number."
+        ) from exc
+    if not math.isfinite(value) or value <= 0 or value > 120:
+        raise ConfigError(
+            "PC_AGENT_ONLINE_UPDATE_TIMEOUT_SECONDS must be greater than 0 "
+            "and at most 120."
+        )
+    return value
+
+
+def _parse_online_update_max_bytes(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_ONLINE_UPDATE_MAX_BYTES must be an integer.") from exc
+    if value < 1_000_000 or value > 100_000_000:
+        raise ConfigError(
+            "PC_AGENT_ONLINE_UPDATE_MAX_BYTES must be between 1000000 and 100000000."
+        )
+    return value
+
+
+def _parse_nonnegative_budget(name: str, raw: str, *, maximum: int) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer.") from exc
+    if value < 0 or value > maximum:
+        raise ConfigError(f"{name} must be between 0 and {maximum} (0 means unlimited).")
+    return value
+
+
+def _parse_task_step_budget(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_TASK_STEP_BUDGET must be an integer.") from exc
+    if value < 1 or value > 20:
+        raise ConfigError("PC_AGENT_TASK_STEP_BUDGET must be between 1 and 20.")
+    return value
+
+
+def _parse_task_time_budget(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError("PC_AGENT_TASK_TIME_BUDGET_SECONDS must be a number.") from exc
+    if not math.isfinite(value) or value < 0 or value > 86_400:
+        raise ConfigError(
+            "PC_AGENT_TASK_TIME_BUDGET_SECONDS must be between 0 and 86400 "
+            "(0 means unlimited)."
+        )
+    return value
+
+
 def _parse_command_timeout(raw: str) -> float:
     try:
         value = float(raw)
@@ -712,27 +957,49 @@ def _parse_trial_days(raw: str) -> int:
     return value
 
 
-def _parse_license_key_id(raw: str) -> str:
+def _parse_key_id(name: str, raw: str) -> str:
     value = raw.strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
         raise ConfigError(
-            "PC_AGENT_LICENSE_KEY_ID must be 1-64 letters, digits, '.', '_' or '-'."
+            f"{name} must be 1-64 letters, digits, '.', '_' or '-'."
         )
     return value
 
 
-def _parse_license_public_key(raw: str) -> str | None:
+def _parse_license_key_id(raw: str) -> str:
+    return _parse_key_id("PC_AGENT_LICENSE_KEY_ID", raw)
+
+
+def _parse_release_key_id(raw: str) -> str | None:
+    if not raw.strip():
+        return None
+    return _parse_key_id("PC_AGENT_RELEASE_KEY_ID", raw)
+
+
+def _parse_public_key(name: str, raw: str) -> str | None:
     value = raw.strip()
     if not value:
         return None
+    if re.fullmatch(r"[A-Za-z0-9_-]+", value) is None:
+        raise ConfigError(f"{name} must be unpadded base64url data.")
     padded = value + "=" * (-len(value) % 4)
     try:
-        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        decoded = base64.b64decode(
+            padded.encode("ascii"), altchars=b"-_", validate=True
+        )
     except (binascii.Error, ValueError, UnicodeEncodeError) as exc:
-        raise ConfigError("PC_AGENT_LICENSE_PUBLIC_KEY must be base64url data.") from exc
+        raise ConfigError(f"{name} must be base64url data.") from exc
     if len(decoded) != 32:
-        raise ConfigError("PC_AGENT_LICENSE_PUBLIC_KEY must decode to a 32-byte Ed25519 key.")
+        raise ConfigError(f"{name} must decode to a 32-byte Ed25519 key.")
     return value
+
+
+def _parse_license_public_key(raw: str) -> str | None:
+    return _parse_public_key("PC_AGENT_LICENSE_PUBLIC_KEY", raw)
+
+
+def _parse_release_public_key(raw: str) -> str | None:
+    return _parse_public_key("PC_AGENT_RELEASE_PUBLIC_KEY", raw)
 
 
 def _parse_model(name: str, raw: str, *, allow_empty: bool = False) -> str:

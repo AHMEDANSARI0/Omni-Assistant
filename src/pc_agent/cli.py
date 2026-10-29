@@ -37,8 +37,17 @@ from .credentials import (
     canonical_credential_provider,
 )
 from .desktop_automation import probe_desktop_automation
+from .diagnostics import build_diagnostics, export_diagnostics
 from .documents.office import create_demo_office_files
 from .documents.pdf import create_demo_pdfs
+from .documents.pdf_security import (
+    DEFAULT_PDF_PERMISSIONS,
+    PDF_PERMISSION_NAMES,
+    inspect_pdf_security,
+    protect_pdf,
+    unprotect_pdf,
+)
+from .documents.pdf_signatures import inspect_pdf_signatures
 from .domain.task import Task, TaskStatus
 from .errors import ApprovalUnavailableError, PcAgentError, ToolBuilderError
 from .http_tls import tls_trust_info
@@ -54,10 +63,21 @@ from .licensing import (
     LicenseStatus,
 )
 from .logging_config import configure_logging
+from .maintenance import DatabaseMaintenanceService
+from .online_updates import (
+    DownloadedUpdate,
+    OnlineStageResult,
+    OnlineUpdateCheck,
+    check_online_update,
+    download_online_update,
+    stage_online_update,
+)
 from .orchestrator import ApprovalRequest, ExecutionReport, TaskOrchestrator
 from .planning import DeterministicPlanner, PlannerOptions
 from .providers import CompletionRequest, build_model_router, provider_statuses
 from .recovery import RecoveryService, TaskDiagnosis
+from .release import audit_install, build_release_bundle, verify_release_bundle
+from .self_repair import SelfRepairService
 from .storage.db import Database
 from .storage.repositories import (
     DynamicToolRecord,
@@ -72,6 +92,37 @@ from .tooling.models import DynamicToolStatus
 from .tooling.service import ToolBuilderService, build_runtime_registry
 from .tooling.templates import TEMPLATES
 from .tools import ToolContext, ToolResult, build_default_registry
+from .updates import (
+    apply_staged_update,
+    check_update,
+    get_update,
+    list_updates,
+    rollback_update,
+    stage_update,
+)
+
+
+def _add_budget_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--token-budget", type=int, default=None,
+        help="Per-task provider-token budget (0 means unlimited; default from config)",
+    )
+    parser.add_argument(
+        "--provider-call-budget", type=int, default=None,
+        help="Per-task provider-call budget (0 means unlimited; default from config)",
+    )
+    parser.add_argument(
+        "--tool-budget", type=int, default=None,
+        help="Per-task tool-invocation budget (0 means unlimited; default from config)",
+    )
+    parser.add_argument(
+        "--step-budget", type=int, default=None,
+        help="Per-task planned-step budget, 1 to 20 (default from config)",
+    )
+    parser.add_argument(
+        "--task-time-budget-seconds", type=float, default=None,
+        help="Per-task wall-time budget in seconds (0 means unlimited; default from config)",
+    )
 
 
 def _add_execution_options(parser: argparse.ArgumentParser) -> None:
@@ -91,9 +142,54 @@ def _add_execution_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target", default=None, help="Exact target file/folder for the task")
     parser.add_argument("--expected-pages", type=int, default=None)
     parser.add_argument(
-        "--pages", default=None, help='PDF page selection for extract tasks, e.g. "1-3,5"'
+        "--pages", default=None, help='PDF page selection/order, e.g. "1-3,5", "3,1,2" or reverse'
     )
-    parser.add_argument("--find", default=None, help="Exact DOCX text to replace")
+    parser.add_argument(
+        "--find", default=None, help="Exact text to find (DOCX replace or PDF text search)"
+    )
+    parser.add_argument(
+        "--pdf-rotate", dest="pdf_rotate_degrees", type=int, default=None,
+        help="Rotate selected PDF pages by -270, -180, -90, 90, 180 or 270 degrees",
+    )
+    parser.add_argument(
+        "--case-sensitive", dest="pdf_case_sensitive", action="store_true",
+        help="Make a PDF embedded-text search case-sensitive",
+    )
+    parser.add_argument(
+        "--max-results", dest="pdf_max_results", type=int, default=None,
+        help="Maximum PDF text-search matches to return (1-200)",
+    )
+    parser.add_argument(
+        "--pdf-ocr-dpi", type=int, default=None,
+        help="PDF OCR render DPI (72-300; default 200)",
+    )
+    parser.add_argument(
+        "--pdf-ocr-language", default=None,
+        help="Optional PDF OCR language hint, e.g. Urdu or English",
+    )
+    parser.add_argument(
+        "--pdf-ocr-all-pages", action="store_true",
+        help="OCR even selected pages that already have embedded text",
+    )
+    parser.add_argument(
+        "--pdf-ocr-max-output-tokens", type=int, default=None,
+        help="Maximum provider output tokens per OCR page (256-4096)",
+    )
+    parser.add_argument(
+        "--pdf-table-min-rows", type=int, default=None,
+        help="Minimum rows for a detected PDF table (1-1000; default 2)",
+    )
+    parser.add_argument(
+        "--pdf-table-min-columns", type=int, default=None,
+        help="Minimum columns for a detected PDF table (1-50; default 2)",
+    )
+    parser.add_argument(
+        "--form-field",
+        dest="form_fields",
+        action="append",
+        default=[],
+        help="PDF form value as Name=Value (repeatable; checkbox true/false; multi-select uses |)",
+    )
     parser.add_argument("--replace", default=None, help="Replacement DOCX text")
     parser.add_argument("--cell", default=None, help="Spreadsheet cell reference, e.g. B2")
     parser.add_argument(
@@ -254,6 +350,7 @@ def _add_execution_options(parser: argparse.ArgumentParser) -> None:
         dest="max_recovery_attempts",
         help="Disable automatic self-healing retries for this run",
     )
+    _add_budget_options(parser)
     parser.add_argument("--json", action="store_true", help="Print the execution report as JSON")
 
 
@@ -295,7 +392,7 @@ def _add_desktop_element_selector_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent",
-        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 14)",
+        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 27)",
     )
     parser.add_argument("--version", action="version", version=f"pc-agent {__version__}")
     parser.add_argument(
@@ -306,7 +403,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("doctor", help="Check configuration, folders and the local database")
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Check configuration, folders and the local database"
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print redacted structured diagnostics instead of the text report",
+    )
 
     gui_parser = subparsers.add_parser(
         "gui", help="Open the local desktop GUI (same services and policy as the CLI)"
@@ -501,6 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     workflow_run_parser.add_argument(
         "--max-recovery-attempts", type=int, choices=[0, 1, 2, 3], default=None
     )
+    _add_budget_options(workflow_run_parser)
     workflow_run_parser.add_argument("--json", action="store_true")
     workflow_delete_parser = workflow_subparsers.add_parser(
         "delete", help="Delete a verified workflow record (tasks are kept)"
@@ -649,6 +754,221 @@ def build_parser() -> argparse.ArgumentParser:
         "provider", nargs="?", default=None, choices=credential_provider_choices
     )
     credential_migrate_parser.add_argument("--yes", action="store_true")
+
+    self_repair_parser = subparsers.add_parser(
+        "self-repair",
+        help="Diagnose and safely restore the core source tree from a known-good baseline",
+    )
+    self_repair_subparsers = self_repair_parser.add_subparsers(
+        dest="self_repair_command"
+    )
+    self_repair_baseline_parser = self_repair_subparsers.add_parser(
+        "baseline", help="Capture a verified known-good core baseline"
+    )
+    self_repair_baseline_parser.add_argument(
+        "--check", choices=("static", "import", "full"), default="import"
+    )
+    self_repair_baseline_parser.add_argument("--force", action="store_true")
+    self_repair_baseline_parser.add_argument("--yes", action="store_true")
+    self_repair_baseline_parser.add_argument("--json", action="store_true")
+    self_repair_diagnose_parser = self_repair_subparsers.add_parser(
+        "diagnose", help="Read-only core-source diagnosis against the baseline"
+    )
+    self_repair_diagnose_parser.add_argument("--json", action="store_true")
+    self_repair_stage_parser = self_repair_subparsers.add_parser(
+        "stage", help="Stage and verify a deterministic repair without applying it"
+    )
+    self_repair_stage_parser.add_argument(
+        "--check", choices=("static", "import", "full"), default="import"
+    )
+    self_repair_stage_parser.add_argument("--json", action="store_true")
+    self_repair_apply_parser = self_repair_subparsers.add_parser(
+        "apply", help="Apply one verified staged repair run with automatic backup"
+    )
+    self_repair_apply_parser.add_argument("run_id", help="Exact run ID or latest")
+    self_repair_apply_parser.add_argument(
+        "--check", choices=("static", "import", "full"), default=None
+    )
+    self_repair_apply_parser.add_argument("--yes", action="store_true")
+    self_repair_apply_parser.add_argument("--json", action="store_true")
+    self_repair_rollback_parser = self_repair_subparsers.add_parser(
+        "rollback", help="Roll back one applied self-repair run from its backup"
+    )
+    self_repair_rollback_parser.add_argument("run_id", help="Exact run ID or latest")
+    self_repair_rollback_parser.add_argument("--yes", action="store_true")
+    self_repair_rollback_parser.add_argument("--json", action="store_true")
+    self_repair_list_parser = self_repair_subparsers.add_parser(
+        "list", help="List recorded self-repair runs"
+    )
+    self_repair_list_parser.add_argument("--limit", type=int, default=20)
+    self_repair_list_parser.add_argument("--json", action="store_true")
+    self_repair_show_parser = self_repair_subparsers.add_parser(
+        "show", help="Show one self-repair run"
+    )
+    self_repair_show_parser.add_argument("run_id", help="Exact run ID or latest")
+    self_repair_show_parser.add_argument("--json", action="store_true")
+
+    release_parser = subparsers.add_parser(
+        "release",
+        help="Audit production readiness and build/verify portable release bundles",
+    )
+    release_subparsers = release_parser.add_subparsers(dest="release_command")
+    release_audit_parser = release_subparsers.add_parser(
+        "audit", help="Run read-only production-readiness checks (no secrets shown)"
+    )
+    release_audit_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Treat warnings as a failing exit status",
+    )
+    release_audit_parser.add_argument("--json", action="store_true")
+    release_build_parser = release_subparsers.add_parser(
+        "build",
+        help="Build a reproducible portable ZIP (excludes .env, data and workspace contents)",
+    )
+    release_build_parser.add_argument(
+        "--output", type=Path, default=None, help="Output .zip path (must not exist)"
+    )
+    release_build_parser.add_argument("--json", action="store_true")
+    release_verify_parser = release_subparsers.add_parser(
+        "verify", help="Verify a portable release ZIP without extracting it"
+    )
+    release_verify_parser.add_argument("bundle", type=Path)
+    release_verify_parser.add_argument("--json", action="store_true")
+    release_info_parser = release_subparsers.add_parser(
+        "info", help="Verify and summarize a portable release ZIP"
+    )
+    release_info_parser.add_argument("bundle", type=Path)
+    release_info_parser.add_argument(
+        "--files", action="store_true", help="Also list every bundled file"
+    )
+    release_info_parser.add_argument("--json", action="store_true")
+
+    update_parser = subparsers.add_parser(
+        "update",
+        help="Check, download, stage, apply or roll back signed release updates",
+    )
+    update_subparsers = update_parser.add_subparsers(dest="update_command")
+    update_check_parser = update_subparsers.add_parser(
+        "check", help="Verify a bundle and compare its version/signature"
+    )
+    update_check_parser.add_argument("bundle", type=Path)
+    update_check_parser.add_argument("--signature", type=Path, default=None)
+    update_check_parser.add_argument("--json", action="store_true")
+    update_stage_parser = update_subparsers.add_parser(
+        "stage", help="Verify and stage a bundle without applying it"
+    )
+    update_stage_parser.add_argument("bundle", type=Path)
+    update_stage_parser.add_argument("--signature", type=Path, default=None)
+    update_stage_parser.add_argument("--allow-unsigned", action="store_true")
+    update_stage_parser.add_argument("--allow-downgrade", action="store_true")
+    update_stage_parser.add_argument("--json", action="store_true")
+    update_online_check_parser = update_subparsers.add_parser(
+        "online-check",
+        help="Fetch only the configured update feed and compare its version",
+    )
+    update_online_check_parser.add_argument("--feed-url", default=None)
+    update_online_check_parser.add_argument("--channel", default=None)
+    update_online_check_parser.add_argument("--json", action="store_true")
+    update_online_download_parser = update_subparsers.add_parser(
+        "online-download",
+        help="Download and verify one online bundle without staging it",
+    )
+    update_online_download_parser.add_argument("--feed-url", default=None)
+    update_online_download_parser.add_argument("--channel", default=None)
+    update_online_download_parser.add_argument("--allow-downgrade", action="store_true")
+    update_online_download_parser.add_argument("--json", action="store_true")
+    update_online_stage_parser = update_subparsers.add_parser(
+        "online-stage",
+        help="Download, verify and stage one online bundle without applying it",
+    )
+    update_online_stage_parser.add_argument("--feed-url", default=None)
+    update_online_stage_parser.add_argument("--channel", default=None)
+    update_online_stage_parser.add_argument("--allow-unsigned", action="store_true")
+    update_online_stage_parser.add_argument("--allow-downgrade", action="store_true")
+    update_online_stage_parser.add_argument("--json", action="store_true")
+    update_apply_parser = update_subparsers.add_parser(
+        "apply", help="Apply one staged update with backup and verification"
+    )
+    update_apply_parser.add_argument(
+        "update_id",
+        nargs="?",
+        default="latest-staged",
+        help="Exact update ID or latest-staged",
+    )
+    update_apply_parser.add_argument("--yes", action="store_true")
+    update_apply_parser.add_argument("--json", action="store_true")
+    update_rollback_parser = update_subparsers.add_parser(
+        "rollback", help="Roll back one applied update from its receipt backup"
+    )
+    update_rollback_parser.add_argument(
+        "update_id",
+        nargs="?",
+        default="latest-applied",
+        help="Exact update ID or latest-applied",
+    )
+    update_rollback_parser.add_argument("--yes", action="store_true")
+    update_rollback_parser.add_argument("--json", action="store_true")
+    update_list_parser = update_subparsers.add_parser(
+        "list", help="List staged, applied, rolled-back and failed updates"
+    )
+    update_list_parser.add_argument("--limit", type=int, default=20)
+    update_list_parser.add_argument("--json", action="store_true")
+    update_show_parser = update_subparsers.add_parser(
+        "show", help="Show one recorded update receipt"
+    )
+    update_show_parser.add_argument(
+        "update_id", nargs="?", default="latest", help="Exact update ID or latest"
+    )
+    update_show_parser.add_argument("--json", action="store_true")
+
+    maintenance_parser = subparsers.add_parser(
+        "maintenance",
+        help="Create, verify and restore local SQLite database backups",
+    )
+    maintenance_subparsers = maintenance_parser.add_subparsers(
+        dest="maintenance_command"
+    )
+    maintenance_backup_parser = maintenance_subparsers.add_parser(
+        "backup", help="Create and verify a consistent database backup"
+    )
+    maintenance_backup_parser.add_argument("--label", default="manual")
+    maintenance_backup_parser.add_argument("--json", action="store_true")
+    maintenance_list_parser = maintenance_subparsers.add_parser(
+        "list", help="List database backups"
+    )
+    maintenance_list_parser.add_argument("--json", action="store_true")
+    maintenance_verify_parser = maintenance_subparsers.add_parser(
+        "verify", help="Verify one database backup"
+    )
+    maintenance_verify_parser.add_argument(
+        "backup", help="Exact backup ID, filename, or latest"
+    )
+    maintenance_verify_parser.add_argument("--json", action="store_true")
+    maintenance_restore_parser = maintenance_subparsers.add_parser(
+        "restore",
+        help="Restore one verified database backup (creates a pre-restore backup first)",
+    )
+    maintenance_restore_parser.add_argument(
+        "backup", help="Exact backup ID, filename, or latest"
+    )
+    maintenance_restore_parser.add_argument("--yes", action="store_true")
+    maintenance_restore_parser.add_argument("--json", action="store_true")
+
+    diagnostics_parser = subparsers.add_parser(
+        "diagnostics",
+        help="Export redacted support diagnostics (no secrets or task content)",
+    )
+    diagnostics_subparsers = diagnostics_parser.add_subparsers(
+        dest="diagnostics_command"
+    )
+    diagnostics_export_parser = diagnostics_subparsers.add_parser(
+        "export", help="Write a redacted diagnostics JSON file"
+    )
+    diagnostics_export_parser.add_argument(
+        "--output", type=Path, default=None, help="Output .json path (must not exist)"
+    )
+    diagnostics_export_parser.add_argument("--json", action="store_true")
 
     ask_parser = subparsers.add_parser(
         "ask", help="Ask the configured provider route (uses the network unless only mock is available)"
@@ -1048,6 +1368,177 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-folder", required=True, help="Workspace folder for the page PDFs"
     )
     split_parser.add_argument("--prefix", default=None, help="Output name prefix")
+    extract_text_parser = pdf_subparsers.add_parser(
+        "extract-text", help="Extract embedded PDF text (not OCR) to .txt/.md/.json"
+    )
+    extract_text_parser.add_argument("path", help="PDF path relative to the workspace")
+    extract_text_parser.add_argument(
+        "--output", required=True, help="New .txt, .md or .json output in the workspace"
+    )
+    extract_text_parser.add_argument(
+        "--pages", default=None, help='Optional page selection like "1-3,5" (1-based)'
+    )
+    extract_text_parser.add_argument(
+        "--format", choices=("text", "json"), default=None,
+        help="Output format (default follows the output extension)",
+    )
+    extract_tables_parser = pdf_subparsers.add_parser(
+        "extract-tables",
+        help="Extract embedded-text PDF tables (never OCR) to .json or single-table .csv",
+    )
+    extract_tables_parser.add_argument("path", help="PDF path relative to the workspace")
+    extract_tables_parser.add_argument(
+        "--output", required=True, help="New .json or .csv output in the workspace"
+    )
+    extract_tables_parser.add_argument(
+        "--pages", default=None, help='Optional page selection like "1-3,5" (maximum 100)'
+    )
+    extract_tables_parser.add_argument(
+        "--format", choices=("json", "csv"), default=None,
+        help="Output format (default follows the output extension; CSV needs exactly one table)",
+    )
+    extract_tables_parser.add_argument(
+        "--min-rows", type=int, default=2, help="Minimum rows per detected table"
+    )
+    extract_tables_parser.add_argument(
+        "--min-columns", type=int, default=2, help="Minimum columns per detected table"
+    )
+    extract_tables_parser.add_argument("--json", action="store_true")
+
+    search_text_parser = pdf_subparsers.add_parser(
+        "search", help="Search embedded PDF text (not OCR) for one exact phrase"
+    )
+    search_text_parser.add_argument("path", help="PDF path relative to the workspace")
+    search_text_parser.add_argument("query", help="Exact phrase to find")
+    search_text_parser.add_argument(
+        "--pages", default=None, help='Optional page selection like "1-3,5" (1-based)'
+    )
+    search_text_parser.add_argument("--case-sensitive", action="store_true")
+    search_text_parser.add_argument("--max-results", type=int, default=50)
+    reorder_parser = pdf_subparsers.add_parser(
+        "reorder", help="Write a new PDF with pages in a new full order"
+    )
+    reorder_parser.add_argument("path", help="PDF path relative to the workspace")
+    reorder_parser.add_argument(
+        "--pages", required=True,
+        help='Every page once in the new order, e.g. "3,1,2", or reverse',
+    )
+    reorder_parser.add_argument(
+        "--output", required=True, help="New output PDF in the workspace"
+    )
+    rotate_parser = pdf_subparsers.add_parser(
+        "rotate", help="Write a new PDF with selected pages rotated by a quarter-turn"
+    )
+    rotate_parser.add_argument("path", help="PDF path relative to the workspace")
+    rotate_parser.add_argument(
+        "--degrees", type=int, required=True,
+        help="Rotation: -270, -180, -90, 90, 180 or 270",
+    )
+    rotate_parser.add_argument(
+        "--output", required=True, help="New output PDF in the workspace"
+    )
+    rotate_parser.add_argument(
+        "--pages", default=None, help='Optional page selection like "1-3,5" (default all)'
+    )
+
+    inspect_form_parser = pdf_subparsers.add_parser(
+        "inspect-form", help="Inspect existing interactive PDF form fields"
+    )
+    inspect_form_parser.add_argument("path", help="PDF path relative to the workspace")
+    inspect_form_parser.add_argument("--json", action="store_true")
+    fill_form_parser = pdf_subparsers.add_parser(
+        "fill-form", help="Fill existing interactive PDF form fields into a new PDF"
+    )
+    fill_form_parser.add_argument("path", help="PDF path relative to the workspace")
+    fill_form_parser.add_argument(
+        "--output", required=True, help="New output PDF in the workspace"
+    )
+    fill_form_parser.add_argument(
+        "--field",
+        dest="form_fields",
+        action="append",
+        default=[],
+        help="Field value as Name=Value (repeatable; checkbox true/false; multi-select uses |)",
+    )
+    fill_form_parser.add_argument("--json", action="store_true")
+
+    security_parser = pdf_subparsers.add_parser(
+        "security",
+        help="Inspect PDF encryption status (optional hidden-password test)",
+    )
+    security_parser.add_argument("path", help="PDF path relative to the workspace")
+    security_parser.add_argument(
+        "--unlock",
+        action="store_true",
+        help="Prompt hiddenly for the current password and test it in memory",
+    )
+    security_parser.add_argument("--json", action="store_true")
+
+    protect_parser = pdf_subparsers.add_parser(
+        "protect",
+        help="Write a new AES-256 password-protected PDF (hidden prompts only)",
+    )
+    protect_parser.add_argument("path", help="PDF path relative to the workspace")
+    protect_parser.add_argument(
+        "--output", required=True, help="New output PDF in the workspace"
+    )
+    protect_parser.add_argument(
+        "--permission",
+        dest="permissions",
+        choices=PDF_PERMISSION_NAMES,
+        action="append",
+        default=[],
+        help=(
+            "Allowed user permission (repeatable); default: "
+            + ", ".join(DEFAULT_PDF_PERMISSIONS)
+        ),
+    )
+    protect_parser.add_argument("--json", action="store_true")
+
+    unprotect_parser = pdf_subparsers.add_parser(
+        "unprotect",
+        help="Write a new unencrypted PDF after a hidden current-password prompt",
+    )
+    unprotect_parser.add_argument("path", help="PDF path relative to the workspace")
+    unprotect_parser.add_argument(
+        "--output", required=True, help="New output PDF in the workspace"
+    )
+    unprotect_parser.add_argument("--json", action="store_true")
+
+    signatures_parser = pdf_subparsers.add_parser(
+        "inspect-signatures",
+        help="Inspect PDF digital signatures (trust/revocation not evaluated)",
+    )
+    signatures_parser.add_argument("path", help="PDF path relative to the workspace")
+    signatures_parser.add_argument("--json", action="store_true")
+
+    ocr_parser = pdf_subparsers.add_parser(
+        "ocr",
+        help="OCR up to 10 scanned PDF pages with gated vision (approval required)",
+    )
+    ocr_parser.add_argument("path", help="PDF path relative to the workspace")
+    ocr_parser.add_argument(
+        "--output", required=True, help="New .txt, .md or .json output in the workspace"
+    )
+    ocr_parser.add_argument(
+        "--pages", default=None, help='Optional page selection like "1-3,5" (maximum 10)'
+    )
+    ocr_parser.add_argument(
+        "--format", choices=("text", "json"), default=None,
+        help="Output format (default follows the output extension)",
+    )
+    ocr_parser.add_argument("--dpi", type=int, default=200, help="Render DPI (72-300)")
+    ocr_parser.add_argument("--language", default=None, help="Optional language hint")
+    ocr_parser.add_argument(
+        "--include-text-pages", action="store_true",
+        help="OCR even selected pages that already have embedded text",
+    )
+    ocr_parser.add_argument(
+        "--max-output-tokens", type=int, default=2048,
+        help="Maximum provider output tokens per page (256-4096)",
+    )
+    ocr_parser.add_argument("--yes", action="store_true")
+    ocr_parser.add_argument("--json", action="store_true")
 
     files_parser = subparsers.add_parser(
         "files", help="Run deterministic workspace file operations"
@@ -1098,7 +1589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         if args.command == "doctor":
-            return _run_doctor(settings)
+            return _run_doctor(settings, as_json=bool(getattr(args, "json", False)))
         if args.command == "gui":
             return _run_gui_command(settings, args)
         if args.command == "license":
@@ -1121,6 +1612,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_providers_command(settings, args)
         if args.command == "credentials":
             return _run_credentials_command(settings, args)
+        if args.command == "self-repair":
+            return _run_self_repair_command(settings, args)
+        if args.command == "release":
+            return _run_release_command(settings, args)
+        if args.command == "update":
+            return _run_update_command(settings, args)
+        if args.command == "maintenance":
+            return _run_maintenance_command(settings, args)
+        if args.command == "diagnostics":
+            return _run_diagnostics_command(settings, args)
         if args.command == "ask":
             return _run_ask_command(settings, args)
         if args.command == "tools":
@@ -1400,8 +1901,11 @@ def _run_gui_command(settings: Settings, args: argparse.Namespace) -> int:
     return launch_gui(settings)
 
 
-def _run_doctor(settings: Settings) -> int:
+def _run_doctor(settings: Settings, *, as_json: bool = False) -> int:
     database = _open_database(settings)
+    if as_json:
+        print(json.dumps(build_diagnostics(settings, database), indent=2))
+        return 0
     summary = settings.public_summary()
     route = build_model_router(settings).provider_names
     approved_dynamic = DynamicToolRepository(database).approved_candidates()
@@ -1418,7 +1922,10 @@ def _run_doctor(settings: Settings) -> int:
         / "dynamic-tools"
         / "word_count_arguments.json"
     )
-    print(f"Self-Healing PC Agent {__version__} (PHASE 16.1 Credential Manager Hotfix)")
+    print(
+        f"Self-Healing PC Agent {__version__} "
+        "(PHASE 27 PDF Signature Inspection)"
+    )
     print(f"Python: {platform.python_version()}")
     print(f"Environment: {summary['environment']}")
     print(f"Root: {summary['root']}")
@@ -1571,6 +2078,49 @@ def _run_doctor(settings: Settings) -> int:
         f"notes={memory_counts['note']}, workflows={memory_counts['workflow']}, "
         f"checkpoints={execution_repo.count_checkpoints()}, "
         f"verifications={execution_repo.count_verifications()}"
+    )
+    self_repair = SelfRepairService(settings.root_dir, settings.data_dir)
+    baseline = self_repair.baseline_status()
+    latest_repair = next(iter(self_repair.list_runs(limit=1)), None)
+    print(
+        "Task budgets: "
+        f"tokens={settings.task_token_budget}, "
+        f"provider_calls={settings.task_provider_call_budget}, "
+        f"tools={settings.task_tool_budget}, steps={settings.task_step_budget}, "
+        f"time={settings.task_time_budget_seconds:.0f}s"
+    )
+    print(
+        "Self-repair: "
+        f"{'enabled' if settings.allow_self_repair else 'disabled'}; "
+        f"{baseline.summary()}"
+        + (
+            f"; latest run={latest_repair.run_id} [{latest_repair.status}]"
+            if latest_repair
+            else "; latest run=none"
+        )
+    )
+    print(
+        "Signed updates: "
+        f"public_key={summary['release_public_key_configured']}; "
+        f"key_id={summary['release_key_id']}; "
+        f"required={summary['require_signed_updates']}; "
+        f"online={summary['online_updates']}; "
+        f"feed_host={summary['update_feed_host']}; "
+        f"channel={summary['update_channel']}"
+    )
+    production_audit = audit_install(settings)
+    database_backups = DatabaseMaintenanceService(
+        settings.database_path, settings.data_dir
+    ).list_backups()
+    print(
+        "Production: "
+        f"release audit {production_audit.summary()}; "
+        f"database backups={len(database_backups)}"
+        + (
+            f"; latest backup={database_backups[0].backup_id}"
+            if database_backups
+            else "; latest backup=none"
+        )
     )
     print("Note: deterministic supported tasks run without an AI provider call.")
     if scan.stale_tasks or scan.orphan_temp_pdfs:
@@ -2398,11 +2948,295 @@ def _report_tool_failure(result: ToolResult) -> int:
     return 1
 
 
+def _workspace_pdf_path(
+    settings: Settings, raw_path: str, *, must_exist: bool
+) -> Path:
+    settings.ensure_directories()
+    candidate = Path(raw_path.strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = settings.workspace_dir / candidate
+    resolved = candidate.resolve()
+    workspace = settings.workspace_dir.resolve()
+    if not resolved.is_relative_to(workspace):
+        raise PcAgentError("PDF password paths must stay inside the workspace.")
+    if resolved.suffix.lower() != ".pdf":
+        raise PcAgentError("PDF password paths must end with .pdf.")
+    if must_exist and not resolved.is_file():
+        raise PcAgentError(f"PDF file not found: {raw_path}")
+    return resolved
+
+
+def _relative_workspace_path(settings: Settings, path: Path) -> str:
+    return path.resolve().relative_to(settings.workspace_dir.resolve()).as_posix()
+
+
+def _prompt_pdf_password(label: str, *, confirm: bool = False) -> str:
+    try:
+        password = getpass.getpass(f"{label}: ")
+        if confirm:
+            repeated = getpass.getpass(f"Repeat {label[0].lower() + label[1:]}: ")
+            if repeated != password:
+                raise PcAgentError("PDF passwords do not match.")
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise PcAgentError(
+            "PDF password input was cancelled or is unavailable."
+        ) from exc
+    return password
+
+
+def _pdf_security_failure(exc: PcAgentError, *, as_json: bool) -> int:
+    if as_json:
+        print(
+            json.dumps(
+                {"success": False, "output": None, "error": str(exc)},
+                indent=2,
+            )
+        )
+    else:
+        print(f"Error: {exc}", file=sys.stderr)
+    return 1
+
+
+def _run_pdf_security_command(settings: Settings, args: argparse.Namespace) -> int:
+    """Run Phase 26 direct-only operations without a registered tool/task."""
+
+    as_json = bool(getattr(args, "json", False))
+    try:
+        source = _workspace_pdf_path(settings, args.path, must_exist=True)
+        source_label = _relative_workspace_path(settings, source)
+
+        if args.pdf_command == "security":
+            password = (
+                _prompt_pdf_password("Current PDF password")
+                if args.unlock
+                else None
+            )
+            info = inspect_pdf_security(source, password=password)
+            payload = {"path": source_label, **info.summary()}
+            success = not (
+                args.unlock
+                and info.encrypted
+                and info.password_accepted is not True
+            )
+            if as_json:
+                print(
+                    json.dumps(
+                        {"success": success, "output": payload, "error": None},
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"PDF security: {source_label}")
+                print(f"Encrypted: {info.encrypted}")
+                print(f"Pages: {info.pages}")
+                print(f"Unlocked: {info.unlocked}")
+                if info.encrypted:
+                    print(
+                        f"Algorithm: {info.algorithm} | key bits: {info.key_bits} | "
+                        f"handler: V{info.handler_version}/R{info.handler_revision}"
+                    )
+                    print(
+                        "Permissions: "
+                        + (", ".join(info.permissions) if info.permissions else "none")
+                    )
+                if args.unlock and info.encrypted:
+                    print(f"Password accepted: {info.password_accepted}")
+                    print(f"Password type: {info.password_type}")
+                print(f"SHA-256: {info.sha256}")
+            return 0 if success else 1
+
+        output = _workspace_pdf_path(settings, args.output, must_exist=False)
+        output_label = _relative_workspace_path(settings, output)
+
+        if args.pdf_command == "unprotect":
+            current_password = _prompt_pdf_password("Current PDF password")
+            result = unprotect_pdf(source, output, password=current_password)
+            payload = {
+                "path": source_label,
+                "output_path": output_label,
+                **result.summary(),
+            }
+            if as_json:
+                print(
+                    json.dumps(
+                        {"success": True, "output": payload, "error": None},
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Unprotected PDF: {output_label}")
+                print(
+                    f"Pages: {result.output_pages} of {result.source_pages} | "
+                    "encrypted: false"
+                )
+                print(f"SHA-256: {result.sha256}")
+            return 0
+
+        if args.pdf_command == "protect":
+            before = inspect_pdf_security(source)
+            current_password: str | None = None
+            if before.encrypted:
+                current_password = _prompt_pdf_password("Current PDF password")
+                unlocked = inspect_pdf_security(
+                    source, password=current_password
+                )
+                if unlocked.password_accepted is not True:
+                    raise PcAgentError("Incorrect PDF password.")
+            user_password = _prompt_pdf_password(
+                "New PDF user password (minimum 8 characters)", confirm=True
+            )
+            owner_password = _prompt_pdf_password(
+                "New PDF owner password (different from user)", confirm=True
+            )
+            chosen_permissions = (
+                tuple(args.permissions)
+                if args.permissions
+                else DEFAULT_PDF_PERMISSIONS
+            )
+            result = protect_pdf(
+                source,
+                output,
+                user_password=user_password,
+                owner_password=owner_password,
+                current_password=current_password,
+                permissions=chosen_permissions,
+            )
+            payload = {
+                "path": source_label,
+                "output_path": output_label,
+                **result.summary(),
+            }
+            if as_json:
+                print(
+                    json.dumps(
+                        {"success": True, "output": payload, "error": None},
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Protected PDF: {output_label}")
+                print(
+                    f"Pages: {result.output_pages} of {result.source_pages} | "
+                    f"algorithm: {result.algorithm}"
+                )
+                print(
+                    "Permissions: "
+                    + (", ".join(result.permissions) if result.permissions else "none")
+                )
+                print(f"SHA-256: {result.sha256}")
+            return 0
+
+        raise PcAgentError(f"Unknown PDF security command: {args.pdf_command}")
+    except PcAgentError as exc:
+        return _pdf_security_failure(exc, as_json=as_json)
+
+
+def _run_pdf_signature_command(
+    settings: Settings, args: argparse.Namespace
+) -> int:
+    """Run the Phase 27 direct-only signature inspection."""
+
+    as_json = bool(getattr(args, "json", False))
+    try:
+        source = _workspace_pdf_path(settings, args.path, must_exist=True)
+        source_label = _relative_workspace_path(settings, source)
+        inspection = inspect_pdf_signatures(source)
+    except PcAgentError as exc:
+        return _pdf_security_failure(exc, as_json=as_json)
+
+    payload = {"path": source_label, **inspection.summary()}
+    success = inspection.invalid_count == 0
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "success": success,
+                    "output": payload,
+                    "error": (
+                        None
+                        if success
+                        else "One or more PDF signatures are invalid or malformed."
+                    ),
+                },
+                indent=2,
+            )
+        )
+        return 0 if success else 1
+
+    print(f"PDF signatures: {source_label}")
+    print(
+        f"Pages: {inspection.pages} | signature fields: "
+        f"{inspection.signature_count} | signed: {inspection.signed_count} | "
+        f"cryptographically valid: {inspection.valid_count} | invalid: "
+        f"{inspection.invalid_count} | unsupported: "
+        f"{inspection.unsupported_count} | unsigned: {inspection.unsigned_count}"
+    )
+    print("Trust/revocation: not evaluated")
+    for signature in inspection.signatures:
+        page_text = str(signature.page) if signature.page is not None else "?"
+        print(
+            f"  {signature.field_name} (page {page_text}): "
+            f"{signature.status} - {signature.status_detail}"
+        )
+        if signature.signer_name:
+            print(f"    Signer: {signature.signer_name}")
+        if signature.reason:
+            print(f"    Reason: {signature.reason}")
+        if signature.location:
+            print(f"    Location: {signature.location}")
+        if signature.signature_date:
+            print(f"    PDF date: {signature.signature_date}")
+        if signature.sub_filter:
+            print(
+                f"    Type: {signature.filter_name or 'unknown'} / "
+                f"{signature.sub_filter}"
+            )
+        if signature.byte_range:
+            print(
+                "    ByteRange: "
+                + ", ".join(str(value) for value in signature.byte_range)
+                + f" | covers whole file: {signature.covers_whole_file}"
+            )
+        if signature.docmdp_permission is not None:
+            print(f"    DocMDP permission: P{signature.docmdp_permission}")
+        for signer in signature.signers:
+            certificate = signer.certificate
+            subject = certificate.subject if certificate else "not embedded"
+            print(
+                "    CMS: "
+                f"digest={signer.digest_algorithm} match={signer.digest_matches} | "
+                f"signature={signer.signature_algorithm} valid="
+                f"{signer.signature_valid} | signer={subject}"
+            )
+            if signer.signing_time:
+                print(f"    CMS signing time: {signer.signing_time}")
+        for certificate in signature.certificates:
+            print(
+                "    Certificate: "
+                f"{certificate.subject} | issuer={certificate.issuer} | "
+                f"serial={certificate.serial_number} | self-signed="
+                f"{certificate.self_signed} | expired now={certificate.expired_now}"
+            )
+    print(f"SHA-256: {inspection.sha256}")
+    return 0 if success else 1
+
+
 def _run_pdf_command(settings: Settings, args: argparse.Namespace) -> int:
     if args.pdf_command is None:
-        print("Usage: pc-agent pdf inspect|verify|merge|merge-folders|extract|split ...", file=sys.stderr)
+        print(
+            "Usage: pc-agent pdf inspect|verify|merge|merge-folders|extract|split|"
+            "extract-text|extract-tables|ocr|search|reorder|rotate|inspect-form|"
+            "fill-form|security|protect|unprotect|inspect-signatures ...",
+            file=sys.stderr,
+        )
         return 2
     _require_license(settings, FEATURE_DOCUMENTS)
+    if args.pdf_command in {"security", "protect", "unprotect"}:
+        return _run_pdf_security_command(settings, args)
+    if args.pdf_command == "inspect-signatures":
+        return _run_pdf_signature_command(settings, args)
+    if args.pdf_command == "ocr":
+        _require_license(settings, FEATURE_PROVIDERS)
 
     registry = build_default_registry()
     context = _tool_context(settings)
@@ -2461,6 +3295,275 @@ def _run_pdf_command(settings: Settings, args: argparse.Namespace) -> int:
         )
         for output_path in result.output["outputs"]:
             print(f"  {output_path}")
+        return 0
+
+
+    if args.pdf_command == "extract-text":
+        arguments: dict[str, object] = {
+            "path": args.path,
+            "output_path": args.output,
+        }
+        if args.pages:
+            arguments["pages"] = args.pages
+        if args.format:
+            arguments["format"] = args.format
+        result = registry.invoke("pdf.extract_text", arguments, context)
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"Extracted PDF text: {result.output['output_path']}")
+        print(
+            f"Pages: {result.output['page_count']} of {result.output['source_pages']} | "
+            f"text pages: {result.output['text_pages']} | "
+            f"characters: {result.output['characters']}"
+        )
+        print(
+            "Embedded text: "
+            f"{'yes' if result.output['has_embedded_text'] else 'no (OCR is not performed)'}"
+        )
+        print(f"SHA-256: {result.output['sha256']}")
+        return 0
+
+
+
+    if args.pdf_command == "extract-tables":
+        arguments = {
+            "path": args.path,
+            "output_path": args.output,
+            "min_rows": args.min_rows,
+            "min_columns": args.min_columns,
+        }
+        if args.pages:
+            arguments["pages"] = args.pages
+        if args.format:
+            arguments["format"] = args.format
+        result = registry.invoke("pdf.extract_tables", arguments, context)
+        if getattr(args, "json", False):
+            print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+            return 0 if result.success else 1
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"Extracted PDF tables: {result.output['output_path']}")
+        print(
+            f"Pages: {result.output['page_count']} selected of {result.output['source_pages']} | "
+            f"tables: {result.output['table_count']} | rows: {result.output['total_rows']} | "
+            f"cells: {result.output['total_cells']}"
+        )
+        print(
+            "Embedded text: "
+            f"{'yes' if result.output['has_embedded_text'] else 'no (OCR is not performed)'}"
+        )
+        for table in result.output["tables"]:
+            print(
+                f"  Page {table['page']} table {table['index']}: "
+                f"{table['row_count']} rows x {table['column_count']} columns"
+            )
+        print(f"SHA-256: {result.output['sha256']}")
+        return 0
+
+    if args.pdf_command == "inspect-form":
+        result = registry.invoke(
+            "pdf.inspect_form", {"path": args.path}, context
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+            return 0 if result.success else 1
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"PDF form: {result.output['path']}")
+        print(
+            f"Pages: {result.output['page_count']} | "
+            f"fields: {result.output['field_count']}"
+        )
+        for field in result.output["fields"]:
+            flags = []
+            if field["required"]:
+                flags.append("required")
+            if field["read_only"]:
+                flags.append("read-only")
+            if field["radio"]:
+                flags.append("radio")
+            if field["pushbutton"]:
+                flags.append("pushbutton")
+            if field["multi_select"]:
+                flags.append("multi-select")
+            extras = f" ({', '.join(flags)})" if flags else ""
+            print(
+                f"  {field['name']}: {field['type']} = {field['value']!r}{extras}"
+            )
+            if field["options"]:
+                print(f"    options: {', '.join(field['options'])}")
+            if field["states"]:
+                print(f"    states: {', '.join(field['states'])}")
+        print(f"SHA-256: {result.output['sha256']}")
+        return 0
+
+    if args.pdf_command == "fill-form":
+        parsed_fields = _parse_form_fields(args.form_fields)
+        if not parsed_fields:
+            raise PcAgentError(
+                "PDF form filling needs at least one --field Name=Value."
+            )
+        arguments = {
+            "path": args.path,
+            "output_path": args.output,
+            "values": [
+                {"name": name, "value": value}
+                for name, value in parsed_fields
+            ],
+        }
+        result = registry.invoke("pdf.fill_form", arguments, context)
+        if getattr(args, "json", False):
+            print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+            return 0 if result.success else 1
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"Filled PDF form: {result.output['output_path']}")
+        print(
+            f"Pages: {result.output['page_count']} | fields: "
+            f"{result.output['field_count']} | changed: "
+            f"{len(result.output['changed_fields'])}"
+        )
+        for entry in result.output["values"]:
+            print(f"  {entry['name']} = {entry['value']!r}")
+        print(f"SHA-256: {result.output['sha256']}")
+        return 0
+
+    if args.pdf_command == "ocr":
+        arguments = {
+            "path": args.path,
+            "output_path": args.output,
+            "dpi": args.dpi,
+            "skip_text_pages": not args.include_text_pages,
+            "max_output_tokens": args.max_output_tokens,
+        }
+        if args.pages:
+            arguments["pages"] = args.pages
+        if args.format:
+            arguments["format"] = args.format
+        if args.language:
+            arguments["language"] = args.language
+        if getattr(args, "json", False):
+            confirmed = bool(args.yes)
+            if not confirmed:
+                print(
+                    "PDF OCR needs approval. Re-run with --yes; JSON mode stays non-interactive.",
+                    file=sys.stderr,
+                )
+        else:
+            route = " -> ".join(build_model_router(settings).provider_names)
+            summary = (
+                f"OCR PDF {args.path!r}, pages {args.pages or 'all (maximum 10)'}, "
+                f"into new file {args.output!r} at {args.dpi} DPI via provider "
+                f"route ({route}). Pages with embedded text are "
+                f"{'also sent for OCR' if args.include_text_pages else 'reused locally without a provider send'}; "
+                "rendered scanned-page images will be sent to external providers on the route. "
+                "Requires PC_AGENT_ALLOW_VISION=1."
+            )
+            retry_parts = [
+                "pc-agent pdf ocr",
+                _hint_quote(args.path),
+                "--output",
+                _hint_quote(args.output),
+                "--dpi",
+                str(args.dpi),
+                "--max-output-tokens",
+                str(args.max_output_tokens),
+            ]
+            if args.pages:
+                retry_parts.extend(["--pages", _hint_quote(args.pages)])
+            if args.format:
+                retry_parts.extend(["--format", args.format])
+            if args.language:
+                retry_parts.extend(["--language", _hint_quote(args.language)])
+            if args.include_text_pages:
+                retry_parts.append("--include-text-pages")
+            retry_parts.append("--yes")
+            confirmed = _confirm_direct_write(
+                summary,
+                preapproved=bool(args.yes),
+                retry_hint=" ".join(retry_parts),
+                heading="Approval required to send rendered PDF pages to a vision provider:",
+            )
+        if not confirmed:
+            print("Nothing was executed.")
+            return 4
+        result = registry.invoke("pdf.ocr", arguments, context)
+        if getattr(args, "json", False):
+            print(json.dumps(_tool_result_to_dict(result), indent=2, default=str))
+            return 0 if result.success else 1
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"OCR PDF text: {result.output['output_path']}")
+        print(
+            f"Pages: {result.output['page_count']} selected of {result.output['source_pages']} | "
+            f"OCR pages: {', '.join(str(page) for page in result.output['ocr_pages']) or 'none'} | "
+            f"embedded pages reused: {', '.join(str(page) for page in result.output['embedded_pages']) or 'none'}"
+        )
+        print(
+            f"Characters: {result.output['characters']} | DPI: {result.output['dpi']} | "
+            f"providers: {', '.join(result.output['providers']) or 'none'} | "
+            f"models: {', '.join(result.output['models']) or 'none'}"
+        )
+        print("Note: OCR transcription is provider output; output bytes/hash/counts are verified.")
+        print(f"SHA-256: {result.output['sha256']}")
+        return 0
+
+    if args.pdf_command == "search":
+        arguments = {
+            "path": args.path,
+            "query": args.query,
+            "case_sensitive": args.case_sensitive,
+            "max_results": args.max_results,
+        }
+        if args.pages:
+            arguments["pages"] = args.pages
+        result = registry.invoke("pdf.search_text", arguments, context)
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"PDF: {result.output['path']}")
+        print(
+            f"Occurrences: {result.output['total_occurrences']} | "
+            f"matching pages: {', '.join(str(page) for page in result.output['matching_pages']) or 'none'}"
+        )
+        if not result.output["has_embedded_text"]:
+            print("Embedded text: no (OCR is not performed)")
+        for match in result.output["matches"]:
+            print(f"  Page {match['page']}: {match['snippet']}")
+        if result.output["truncated"]:
+            print("More matches exist; raise --max-results (maximum 200).")
+        return 0
+
+    if args.pdf_command == "reorder":
+        result = registry.invoke(
+            "pdf.reorder_pages",
+            {"path": args.path, "pages": args.pages, "output_path": args.output},
+            context,
+        )
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"Reordered PDF: {result.output['output_path']}")
+        print(f"Page order: {', '.join(str(page) for page in result.output['page_order'])}")
+        print(f"SHA-256: {result.output['sha256']}")
+        return 0
+
+    if args.pdf_command == "rotate":
+        arguments = {
+            "path": args.path,
+            "degrees": args.degrees,
+            "output_path": args.output,
+        }
+        if args.pages:
+            arguments["pages"] = args.pages
+        result = registry.invoke("pdf.rotate_pages", arguments, context)
+        if not result.success or result.output is None:
+            return _report_tool_failure(result)
+        print(f"Rotated PDF: {result.output['output_path']}")
+        print(
+            f"Rotated pages: {', '.join(str(page) for page in result.output['rotated_pages'])} "
+            f"by {result.output['degrees']} degrees"
+        )
+        print(f"Final rotations: {', '.join(str(value) for value in result.output['page_rotations'])}")
+        print(f"SHA-256: {result.output['sha256']}")
         return 0
 
     if args.pdf_command == "merge":
@@ -3108,6 +4211,7 @@ def _run_workflow_command(settings: Settings, args: argparse.Namespace) -> int:
             record.key,
             approval_callback=_approval_callback(preapproved=bool(args.yes)),
             max_recovery_attempts=args.max_recovery_attempts,
+            budget_options=_planner_options(args),
         )
     except KeyboardInterrupt:
         print(
@@ -3749,6 +4853,24 @@ def _run_desktop_command(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_form_fields(raw_fields: Any) -> tuple[tuple[str, str], ...]:
+    parsed: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in raw_fields or ():
+        text = str(raw)
+        if "=" not in text:
+            raise PcAgentError("--form-field must use Name=Value.")
+        name, value = text.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise PcAgentError("--form-field name must not be empty.")
+        if name in seen:
+            raise PcAgentError(f"Duplicate --form-field value for {name!r}.")
+        seen.add(name)
+        parsed.append((name, value))
+    return tuple(parsed)
+
+
 def _planner_options(args: argparse.Namespace) -> PlannerOptions:
     raw_command = getattr(args, "run_command_text", None)
     try:
@@ -3802,6 +4924,23 @@ def _planner_options(args: argparse.Namespace) -> PlannerOptions:
         image_quality=getattr(args, "image_quality", None),
         image_question=getattr(args, "image_question", None),
         image_compare_path=getattr(args, "image_compare_path", None),
+        pdf_rotate_degrees=getattr(args, "pdf_rotate_degrees", None),
+        pdf_case_sensitive=bool(getattr(args, "pdf_case_sensitive", False)),
+        pdf_max_results=getattr(args, "pdf_max_results", None),
+        pdf_ocr_dpi=getattr(args, "pdf_ocr_dpi", None),
+        pdf_ocr_language=getattr(args, "pdf_ocr_language", None),
+        pdf_ocr_skip_text_pages=not bool(getattr(args, "pdf_ocr_all_pages", False)),
+        pdf_ocr_max_output_tokens=getattr(
+            args, "pdf_ocr_max_output_tokens", None
+        ),
+        pdf_table_min_rows=getattr(args, "pdf_table_min_rows", None),
+        pdf_table_min_columns=getattr(args, "pdf_table_min_columns", None),
+        pdf_form_values=_parse_form_fields(getattr(args, "form_fields", [])),
+        token_budget=getattr(args, "token_budget", None),
+        provider_call_budget=getattr(args, "provider_call_budget", None),
+        tool_budget=getattr(args, "tool_budget", None),
+        step_budget=getattr(args, "step_budget", None),
+        task_time_budget_seconds=getattr(args, "task_time_budget_seconds", None),
     )
 
 
@@ -3819,6 +4958,10 @@ def _approval_callback(*, preapproved: bool):
                 "desktop_automation_action": "Approval required for this exact action in a Windows application:",
                 "vision_analysis": "Approval required to send this exact image to a vision provider:",
             }
+            if request.plan.tool_id == "pdf.ocr":
+                headings["vision_analysis"] = (
+                    "Approval required to send rendered PDF pages to a vision provider:"
+                )
             print(headings[request.action])
             print(f"Task: {request.task_id}")
             print(f"Plan: {request.plan.summary}")
@@ -3846,7 +4989,10 @@ def _approval_callback(*, preapproved: bool):
                     "through Windows UI Automation."
                 ),
                 "vision_analysis": (
-                    "Only this exact image/question is sent to the configured "
+                    "Only the exact selected PDF pages that need OCR are rendered and sent to the configured "
+                    "provider route; external providers receive those page-image bytes."
+                    if request.plan.tool_id == "pdf.ocr"
+                    else "Only this exact image/question is sent to the configured "
                     "provider route; external providers receive the image bytes."
                 ),
             }
@@ -3999,6 +5145,7 @@ def _report_to_dict(report: ExecutionReport) -> dict[str, Any]:
         "workflow_reused": report.workflow_reused,
         "plan_summary": report.plan_summary,
         "steps_total": report.steps_total,
+        "budget": report.budget.to_dict() if report.budget else None,
         "steps": [
             {
                 "step": step.index + 1,
@@ -4060,6 +5207,8 @@ def _print_execution_report(report: ExecutionReport, *, as_json: bool) -> int:
                 f"[{attempt.status}; {attempt.action}; category={attempt.category or '-'}] "
                 f"{attempt.message or ''}".rstrip()
             )
+        if report.budget is not None:
+            print(f"Budget: {report.budget.summary()}")
         if report.recovered:
             print("Recovered: True (a bounded self-healing retry succeeded)")
         if report.missing_information:
@@ -4284,6 +5433,26 @@ def _print_tool_output(report: ExecutionReport) -> None:
         if "valid" in output:
             print(f"Valid: {output['valid']}")
         print(f"Pages: {output['pages']}")
+    elif tool_id == "pdf.extract_text":
+        print(f"Extracted PDF text: {output['output_path']}")
+        print(
+            f"Pages: {output['page_count']} of {output['source_pages']} | "
+            f"characters: {output['characters']} | SHA-256: {output['sha256']}"
+        )
+    elif tool_id == "pdf.search_text":
+        print(
+            f"PDF occurrences: {output['total_occurrences']} | matching pages: "
+            f"{', '.join(str(page) for page in output['matching_pages']) or 'none'}"
+        )
+        for match in output["matches"]:
+            print(f"  Page {match['page']}: {match['snippet']}")
+    elif tool_id in {"pdf.reorder_pages", "pdf.rotate_pages"}:
+        print(f"Transformed PDF: {output['output_path']}")
+        print(
+            f"Pages: {output['page_count']} | rotations: "
+            f"{', '.join(str(value) for value in output['page_rotations'])} | "
+            f"SHA-256: {output['sha256']}"
+        )
 
 
 def _credential_store(settings: Settings):
@@ -4311,6 +5480,526 @@ def _credential_status_text(settings: Settings) -> str:
             f"backend={settings.credential_store_backend}; "
             f"available=no; stored=unknown; {exc}"
         )
+
+
+def _confirm_self_repair_action(summary: str, *, assume_yes: bool) -> bool:
+    return _confirm_direct_write(
+        summary,
+        preapproved=assume_yes,
+        heading="Approval required for this exact self-repair operation:",
+    )
+
+
+def _print_self_repair_diagnosis(diagnosis: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(diagnosis.to_dict(), indent=2))
+        return
+    print(f"Self-repair diagnosis: {diagnosis.summary()}")
+    if diagnosis.issues:
+        print("Issues:")
+        for issue in diagnosis.issues:
+            print(f"  - [{issue.severity}] {issue.code} {issue.path}: {issue.detail}")
+    else:
+        print("Issues: none")
+    if diagnosis.operations:
+        print("Planned deterministic repair operations:")
+        for operation in diagnosis.operations:
+            print(f"  - {operation.kind} {operation.path}")
+    if diagnosis.extra_files:
+        print("Extra eligible files (reported only; never deleted automatically):")
+        for path in diagnosis.extra_files:
+            print(f"  - {path}")
+    if diagnosis.blocked:
+        print("Stage/apply are blocked by the baseline issue above.")
+
+
+def _print_self_repair_run(run: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(run.to_dict(), indent=2))
+        return
+    print(f"Self-repair run: {run.run_id}")
+    print(f"Status: {run.status}")
+    print(f"Check profile: {run.check_profile}")
+    if run.operations:
+        print("Operations:")
+        for operation in run.operations:
+            print(f"  - {operation.kind} {operation.path}")
+    for label, checks in (("Staged", run.checks), ("Post-apply", run.post_checks)):
+        if checks:
+            print(f"{label} checks:")
+            for check in checks:
+                state = "PASS" if check.success else "FAIL"
+                detail = check.output.strip().splitlines()[-1] if check.output.strip() else ""
+                print(f"  - [{state}] {check.name}: {detail[:500]}")
+    if run.backups:
+        print(f"Backed-up files: {len(run.backups)}")
+    if run.error:
+        print(f"Error: {run.error}", file=sys.stderr)
+
+
+def _run_self_repair_command(settings: Settings, args: argparse.Namespace) -> int:
+    if not settings.allow_self_repair:
+        raise PcAgentError(
+            "Self-repair is disabled. Set PC_AGENT_ALLOW_SELF_REPAIR=1 in .env "
+            "to enable core baseline diagnosis and repair."
+        )
+    service = SelfRepairService(settings.root_dir, settings.data_dir)
+    command = getattr(args, "self_repair_command", None) or "diagnose"
+    if command == "baseline":
+        if not _confirm_self_repair_action(
+            "capture self-repair baseline "
+            f"(checks={args.check}, force={'yes' if args.force else 'no'})",
+            assume_yes=bool(args.yes),
+        ):
+            print("Self-repair baseline capture cancelled.")
+            return 3
+        baseline = service.create_baseline(
+            force=bool(args.force), check_profile=args.check
+        )
+        if args.json:
+            print(json.dumps(baseline.to_dict(), indent=2))
+        else:
+            print(f"Self-repair baseline captured: {baseline.summary()}")
+        return 0
+    if command == "diagnose":
+        diagnosis = service.diagnose()
+        _print_self_repair_diagnosis(diagnosis, as_json=bool(args.json))
+        return 1 if diagnosis.blocked else 0
+    if command == "stage":
+        run = service.stage(check_profile=args.check)
+        _print_self_repair_run(run, as_json=bool(args.json))
+        return 0 if run.status == "staged" else 1
+    if command == "apply":
+        run_id = service.resolve_run_id(args.run_id)
+        if not _confirm_self_repair_action(
+            f"apply self-repair run {run_id}", assume_yes=bool(args.yes)
+        ):
+            print("Self-repair apply cancelled.")
+            return 3
+        run = service.apply(run_id, post_check_profile=args.check)
+        _print_self_repair_run(run, as_json=bool(args.json))
+        return 0 if run.status == "applied" else 1
+    if command == "rollback":
+        run_id = service.resolve_run_id(args.run_id)
+        if not _confirm_self_repair_action(
+            f"rollback self-repair run {run_id}", assume_yes=bool(args.yes)
+        ):
+            print("Self-repair rollback cancelled.")
+            return 3
+        run = service.rollback(run_id)
+        _print_self_repair_run(run, as_json=bool(args.json))
+        return 0
+    if command == "list":
+        runs = service.list_runs(limit=args.limit)
+        if args.json:
+            print(json.dumps([run.to_dict() for run in runs], indent=2))
+        elif not runs:
+            print("No self-repair runs recorded.")
+        else:
+            for run in runs:
+                print(f"- {run.run_id} [{run.status}] operations={len(run.operations)}")
+        return 0
+    if command == "show":
+        run_id = service.resolve_run_id(args.run_id)
+        _print_self_repair_run(service.load_run(run_id), as_json=bool(args.json))
+        return 0
+    raise PcAgentError(f"Unknown self-repair command: {command}")
+
+
+def _resolve_cli_path(
+    settings: Settings, raw: Path, *, existing: bool = False
+) -> Path:
+    path = raw.expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if existing:
+        for base in (Path.cwd(), settings.root_dir, settings.workspace_dir):
+            candidate = (base / path).resolve()
+            if candidate.is_file():
+                return candidate
+    return (settings.root_dir / path).resolve()
+
+
+def _print_release_audit(audit: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(audit.to_dict(), indent=2))
+        return
+    print(f"Release audit: {audit.summary()}")
+    for check in audit.checks:
+        print(f"  [{check.status.upper()}] {check.name}: {check.detail}")
+
+
+def _print_release_bundle(
+    info: Any, *, as_json: bool, files: bool = False, built: bool = False
+) -> None:
+    if as_json:
+        print(json.dumps(info.to_dict(), indent=2))
+        return
+    verb = "built and verified" if built else "verified"
+    print(f"Release bundle {verb}: {info.path}")
+    print(f"Version: {info.version}")
+    print(f"Files: {info.file_count}")
+    print(f"Bundled bytes: {info.total_bytes}")
+    print(f"Bundle SHA-256: {info.bundle_sha256}")
+    if files:
+        print("Bundled files:")
+        for record in info.files:
+            print(f"  - {record.path} ({record.size} bytes)")
+
+
+def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "release_command", None)
+    if command is None:
+        print(
+            "Usage: pc-agent release audit|build|verify|info ...",
+            file=sys.stderr,
+        )
+        return 2
+    if command == "audit":
+        audit = audit_install(settings)
+        _print_release_audit(audit, as_json=bool(args.json))
+        if audit.failures or (args.strict and audit.warnings):
+            return 1
+        return 0
+    if command == "build":
+        settings.ensure_directories()
+        output = (
+            _resolve_cli_path(settings, args.output)
+            if args.output is not None
+            else settings.workspace_dir
+            / f"self-healing-pc-agent-v{__version__}-portable.zip"
+        )
+        info = build_release_bundle(settings.root_dir, output)
+        _print_release_bundle(info, as_json=bool(args.json), built=True)
+        return 0
+    if command in {"verify", "info"}:
+        bundle = _resolve_cli_path(settings, args.bundle, existing=True)
+        info = verify_release_bundle(bundle)
+        _print_release_bundle(
+            info,
+            as_json=bool(args.json),
+            files=bool(getattr(args, "files", False)),
+        )
+        return 0
+    raise PcAgentError(f"Unknown release command: {command}")
+
+
+def _confirm_update_action(summary: str, *, assume_yes: bool) -> bool:
+    return _confirm_direct_write(
+        summary,
+        preapproved=assume_yes,
+        heading="Approval required for this exact offline update operation:",
+    )
+
+
+def _print_update_check(check: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(check.to_dict(), indent=2))
+        return
+    print(f"Update check: {check.summary()}")
+    print(f"Bundle: {check.bundle.path}")
+    print(f"Files: {check.bundle.file_count}")
+    print(f"Bundled bytes: {check.bundle.total_bytes}")
+    print(f"Bundle SHA-256: {check.bundle.bundle_sha256}")
+    print(f"Signature: {check.signature.summary()}")
+    if check.signature.path:
+        print(f"Signature file: {check.signature.path}")
+
+
+def _print_staged_update(update: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(update.to_dict(), indent=2))
+        return
+    print(f"Offline update: {update.summary()}")
+    print(f"Receipt: {update.receipt_path}")
+    print(f"Staging: {update.staging_dir}")
+    print(f"Backup: {update.backup_dir}")
+    print(f"Bundle SHA-256: {update.bundle_sha256}")
+    if update.target_root:
+        print(f"Target root: {update.target_root}")
+    if update.status in {"applied", "rolled-back", "failed"}:
+        print(
+            "Files changed by receipt: "
+            f"created={update.created_count}; replaced={update.replaced_count}"
+        )
+    if update.stale_files:
+        print(
+            "Existing release files not present in this bundle were preserved "
+            f"(not deleted): {len(update.stale_files)}"
+        )
+        for path in update.stale_files[:20]:
+            print(f"  - {path}")
+        if len(update.stale_files) > 20:
+            print("  - ... see the update receipt for the complete list")
+    if update.last_error:
+        print(f"Last error: {update.last_error}", file=sys.stderr)
+
+
+def _print_online_update_check(
+    check: OnlineUpdateCheck, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(check.to_dict(), indent=2))
+        return
+    print(f"Online update check: {check.summary()}")
+    print(f"Feed manifest: {check.manifest.summary()}")
+    print(f"Feed SHA-256: {check.feed_sha256}")
+    print(
+        "Bundle signature: not verified by online-check; "
+        "run online-download or online-stage to download and verify it."
+    )
+
+
+def _print_downloaded_update(
+    downloaded: DownloadedUpdate, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(downloaded.to_dict(), indent=2))
+        return
+    print(f"Online update download: {downloaded.summary()}")
+    print(f"Bundle: {downloaded.bundle_path}")
+    if downloaded.signature_path:
+        print(f"Signature: {downloaded.signature_path}")
+    print(f"Feed: {downloaded.feed_path}")
+    print(f"Receipt: {downloaded.receipt_path}")
+    print(f"Verified bundle SHA-256: {downloaded.check.bundle.bundle_sha256}")
+    print(f"Signature check: {downloaded.check.signature.summary()}")
+
+
+def _print_online_stage_result(
+    result: OnlineStageResult, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(result.to_dict(), indent=2))
+        return
+    _print_downloaded_update(result.downloaded, as_json=False)
+    _print_staged_update(result.staged, as_json=False)
+
+
+def _run_update_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "update_command", None)
+    if command is None:
+        print(
+            "Usage: pc-agent update check|stage|online-check|online-download|"
+            "online-stage|apply|rollback|list|show ...",
+            file=sys.stderr,
+        )
+        return 2
+    if command == "check":
+        bundle = _resolve_cli_path(settings, args.bundle, existing=True)
+        signature = (
+            _resolve_cli_path(settings, args.signature, existing=True)
+            if args.signature is not None
+            else None
+        )
+        check = check_update(bundle, settings, signature_path=signature)
+        _print_update_check(check, as_json=bool(args.json))
+        return 1 if check.signature.status in {"invalid", "key-mismatch"} else 0
+    if command == "stage":
+        settings.ensure_directories()
+        bundle = _resolve_cli_path(settings, args.bundle, existing=True)
+        signature = (
+            _resolve_cli_path(settings, args.signature, existing=True)
+            if args.signature is not None
+            else None
+        )
+        staged = stage_update(
+            bundle,
+            settings,
+            signature_path=signature,
+            allow_unsigned=bool(args.allow_unsigned),
+            allow_downgrade=bool(args.allow_downgrade),
+        )
+        _print_staged_update(staged, as_json=bool(args.json))
+        if not args.json:
+            print(f"Next: pc-agent update apply {staged.update_id}")
+        return 0
+    if command == "online-check":
+        online_check = check_online_update(
+            settings,
+            feed_url=args.feed_url,
+            channel=args.channel,
+        )
+        _print_online_update_check(online_check, as_json=bool(args.json))
+        return 0
+    if command == "online-download":
+        settings.ensure_directories()
+        downloaded = download_online_update(
+            settings,
+            feed_url=args.feed_url,
+            channel=args.channel,
+            allow_downgrade=bool(args.allow_downgrade),
+        )
+        _print_downloaded_update(downloaded, as_json=bool(args.json))
+        if not args.json and downloaded.status == "downloaded":
+            print(
+                "Next: pc-agent update stage "
+                f"{downloaded.bundle_path} --signature {downloaded.signature_path}"
+                if downloaded.signature_path
+                else f"Next: pc-agent update stage {downloaded.bundle_path}"
+            )
+        return 0 if downloaded.status == "downloaded" else 1
+    if command == "online-stage":
+        settings.ensure_directories()
+        result = stage_online_update(
+            settings,
+            feed_url=args.feed_url,
+            channel=args.channel,
+            allow_unsigned=bool(args.allow_unsigned),
+            allow_downgrade=bool(args.allow_downgrade),
+        )
+        _print_online_stage_result(result, as_json=bool(args.json))
+        if not args.json:
+            print(f"Next: pc-agent update apply {result.staged.update_id}")
+        return 0
+    if command == "apply":
+        settings.ensure_directories()
+        staged = get_update(settings, args.update_id, status="staged")
+        summary = (
+            f"apply staged offline update {staged.update_id} "
+            f"({staged.current_version} -> {staged.bundle_version}, "
+            f"files={staged.file_count}) to {settings.root_dir}"
+        )
+        confirmed = bool(args.yes) if args.json else _confirm_update_action(
+            summary, assume_yes=bool(args.yes)
+        )
+        if not confirmed:
+            print("Offline update apply cancelled.")
+            return 3
+        applied = apply_staged_update(settings, staged.update_id)
+        _print_staged_update(applied, as_json=bool(args.json))
+        if not args.json:
+            print(
+                "Next: reinstall editable metadata with "
+                "pip install -e .[dev,gui], restart pc-agent, then run "
+                "pc-agent doctor."
+            )
+        return 0
+    if command == "rollback":
+        settings.ensure_directories()
+        applied = get_update(settings, args.update_id, status="applied")
+        summary = (
+            f"roll back applied offline update {applied.update_id} "
+            f"(bundle version {applied.bundle_version}, "
+            f"files={applied.file_count}) in {settings.root_dir}"
+        )
+        confirmed = bool(args.yes) if args.json else _confirm_update_action(
+            summary, assume_yes=bool(args.yes)
+        )
+        if not confirmed:
+            print("Offline update rollback cancelled.")
+            return 3
+        rolled_back = rollback_update(settings, applied.update_id)
+        _print_staged_update(rolled_back, as_json=bool(args.json))
+        if not args.json:
+            print(
+                "Next: reinstall editable metadata with "
+                "pip install -e .[dev,gui], restart pc-agent, then run "
+                "pc-agent doctor."
+            )
+        return 0
+    if command == "list":
+        if args.limit < 1 or args.limit > 200:
+            raise PcAgentError("Update list --limit must be between 1 and 200.")
+        updates = list_updates(settings)[: args.limit]
+        if args.json:
+            print(json.dumps([update.to_dict() for update in updates], indent=2))
+        elif not updates:
+            print("No offline updates recorded.")
+        else:
+            for update in updates:
+                print(f"- {update.summary()}")
+        return 0
+    if command == "show":
+        update = get_update(settings, args.update_id)
+        _print_staged_update(update, as_json=bool(args.json))
+        return 0
+    raise PcAgentError(f"Unknown update command: {command}")
+
+
+def _run_maintenance_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "maintenance_command", None)
+    if command is None:
+        print(
+            "Usage: pc-agent maintenance backup|list|verify|restore ...",
+            file=sys.stderr,
+        )
+        return 2
+    settings.ensure_directories()
+    service = DatabaseMaintenanceService(settings.database_path, settings.data_dir)
+    if command == "backup":
+        _open_database(settings)
+        info = service.create_backup(args.label)
+        if args.json:
+            print(json.dumps(info.to_dict(), indent=2))
+        else:
+            print(f"Database backup created and verified: {info.summary()}")
+            print(f"Backup file: {info.path}")
+        return 0
+    if command == "list":
+        backups = service.list_backups()
+        if args.json:
+            print(json.dumps([backup.to_dict() for backup in backups], indent=2))
+        elif not backups:
+            print("No database backups recorded.")
+        else:
+            for backup in backups:
+                print(f"- {backup.summary()} label={backup.label} created={backup.created_at}")
+        return 0
+    if command == "verify":
+        info = service.verify_backup(args.backup)
+        if args.json:
+            print(json.dumps(info.to_dict(), indent=2))
+        else:
+            print(f"Database backup verified: {info.summary()}")
+        return 0
+    if command == "restore":
+        info = service.verify_backup(args.backup)
+        confirmed = bool(args.yes) if args.json else _confirm_direct_write(
+            "restore database backup "
+            f"{info.backup_id} (schema v{info.schema_version}); "
+            "a pre-restore backup of the live database will be created first",
+            preapproved=bool(args.yes),
+            heading="Approval required for this exact database restore:",
+        )
+        if not confirmed:
+            print("Database restore cancelled; the live database is unchanged.")
+            return 3
+        result = service.restore_backup(info.backup_id)
+        database = _open_database(settings)
+        payload = result.to_dict()
+        payload["live_schema_version"] = database.schema_version()
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"Database restored: {result.restored.summary()}")
+            print(f"Pre-restore backup: {result.pre_restore_backup_id or 'none'}")
+            print(f"Live database schema: v{database.schema_version()}")
+        return 0
+    raise PcAgentError(f"Unknown maintenance command: {command}")
+
+
+def _run_diagnostics_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "diagnostics_command", None) or "export"
+    if command != "export":
+        raise PcAgentError(f"Unknown diagnostics command: {command}")
+    database = _open_database(settings)
+    output = (
+        _resolve_cli_path(settings, args.output) if args.output is not None else None
+    )
+    info = export_diagnostics(settings, output, database)
+    if args.json:
+        print(json.dumps(info.to_dict(), indent=2))
+    else:
+        print(f"Diagnostics exported: {info.path}")
+        print(f"Bytes: {info.size}")
+        print(f"SHA-256: {info.sha256}")
+        print(
+            "Privacy check: the file contains paths and counts, but no API keys, "
+            "task instructions, memory values or document contents. Inspect it "
+            "before sharing."
+        )
+    return 0
 
 
 def _run_credentials_command(settings: Settings, args: argparse.Namespace) -> int:

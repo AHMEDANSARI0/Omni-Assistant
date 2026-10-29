@@ -488,8 +488,8 @@ def test_cli_image_commands_and_vision_confirmation(
 
     assert main([*root, "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 16.1 Credential Manager Hotfix" in doctor
-    assert "built-ins=54" in doctor
+    assert "PHASE 27 PDF Signature Inspection" in doctor
+    assert "built-ins=62" in doctor
     assert "Vision: disabled" in doctor
 
     assert main([*root, "image", "inspect", "sample.png"]) == 0
@@ -568,8 +568,8 @@ def test_gui_controller_images_and_doctor(tmp_path: Path) -> None:
     _write_sample(settings.workspace_dir / "sample.png")
 
     summary = controller.doctor_summary()
-    assert "PHASE 16.1 Credential Manager Hotfix" in summary.to_text()
-    assert summary.builtin_tools == 54
+    assert "PHASE 27 PDF Signature Inspection" in summary.to_text()
+    assert summary.builtin_tools == 62
     assert "Vision: enabled" in summary.to_text()
 
     router = StubVisionRouter()

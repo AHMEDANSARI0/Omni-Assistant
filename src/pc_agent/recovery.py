@@ -53,6 +53,7 @@ _POLICY_MARKERS = (
     "outside the workspace",
     "outside the approved",
     "credential",
+    "task budget exceeded",
     "sensitive path",
     "not allowed",
     "permission policy",
@@ -102,6 +103,12 @@ _OUTPUT_TOOLS = frozenset(
         # Phase 9 editors also write a brand-new output from a surviving
         # source, so fresh-output retries are equally safe for them.
         "pdf.extract_pages",
+        # Phase 20/23/25 PDF writers also create a fresh output from a surviving source.
+        "pdf.extract_text",
+        "pdf.extract_tables",
+        "pdf.reorder_pages",
+        "pdf.rotate_pages",
+        "pdf.fill_form",
         "office.docx_replace_text",
         "office.docx_append_paragraphs",
         "office.xlsx_set_cells",
@@ -110,7 +117,7 @@ _OUTPUT_TOOLS = frozenset(
         "image.transform",
     }
 )
-# Phase 12/13/14/15: re-running a command, browser/desktop action or a
+# Phase 12/13/14/15/22: re-running a command, browser/desktop action or a
 # provider vision send can duplicate side effects/cost, so these steps are
 # never auto-retried - not even after a verification failure.
 _SUBPROCESS_TOOLS = frozenset(
@@ -136,6 +143,7 @@ _SUBPROCESS_TOOLS = frozenset(
         "desktop.send_keys",
         "desktop.screenshot",
         "image.analyze",
+        "pdf.ocr",
     }
 )
 _TRANSIENT_MARKERS = (

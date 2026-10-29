@@ -43,6 +43,12 @@ _WRITER_TOOLS = frozenset(
         "files.move",
         "files.rename",
         "pdf.extract_pages",
+        "pdf.extract_text",
+        "pdf.extract_tables",
+        "pdf.ocr",
+        "pdf.reorder_pages",
+        "pdf.rotate_pages",
+        "pdf.fill_form",
         "office.docx_replace_text",
         "office.docx_append_paragraphs",
         "office.xlsx_set_cells",
@@ -53,7 +59,20 @@ _WRITER_TOOLS = frozenset(
     }
 )
 _PDF_PAGE_TOOLS = frozenset(
-    {"pdf.merge", "pdf.merge_folders", "pdf.verify", "pdf.inspect", "pdf.extract_pages"}
+    {
+        "pdf.merge",
+        "pdf.merge_folders",
+        "pdf.verify",
+        "pdf.inspect",
+        "pdf.extract_pages",
+        "pdf.extract_text",
+        "pdf.extract_tables",
+        "pdf.ocr",
+        "pdf.reorder_pages",
+        "pdf.rotate_pages",
+        "pdf.inspect_form",
+        "pdf.fill_form",
+    }
 )
 _ROW_COUNT_TOOLS = frozenset({"office.csv_inspect", "office.csv_to_json", "office.json_to_csv"})
 

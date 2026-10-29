@@ -57,17 +57,17 @@ def test_gui_controller_doctor_summary(tmp_path: Path) -> None:
 
     summary = controller.doctor_summary()
 
-    assert __version__ == "0.18.1"
-    assert summary.version == "0.18.1"
+    assert __version__ == "0.29.0"
+    assert summary.version == "0.29.0"
     assert summary.schema_version == 6
     assert summary.provider_route == ("mock",)
-    assert summary.builtin_tools == 54
+    assert summary.builtin_tools == 62
     assert summary.office_tools == 11
     assert summary.file_tools == 5
     assert summary.tls_verified
     assert summary.tls_ca_certificates > 50
     assert summary.status == "OK"
-    assert "PHASE 16.1 Credential Manager Hotfix" in summary.to_text()
+    assert "PHASE 27 PDF Signature Inspection" in summary.to_text()
     assert "License: state=unconfigured, enforcement=off" in summary.to_text()
 
 
@@ -253,13 +253,13 @@ def test_cli_gui_check_and_doctor(
 
     assert main(["--root", str(tmp_path), "gui", "--check"]) == expected
     check_output = capsys.readouterr().out
-    assert "Self-Healing PC Agent GUI 0.18.1" in check_output
+    assert "Self-Healing PC Agent GUI 0.29.0" in check_output
     assert "schema v6" in check_output
     assert "License: state=unconfigured, enforcement=off" in check_output
 
     assert main(["--root", str(tmp_path), "doctor"]) == 0
     doctor_output = capsys.readouterr().out
-    assert "PHASE 16.1 Credential Manager Hotfix" in doctor_output
+    assert "PHASE 27 PDF Signature Inspection" in doctor_output
     assert "Desktop GUI:" in doctor_output
     assert "gui" in build_parser().format_help()
 

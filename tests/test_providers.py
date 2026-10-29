@@ -186,15 +186,18 @@ def test_factory_skips_unkeyed_providers_and_defaults_to_mock(tmp_path: Path) ->
     router = build_model_router(settings)
     statuses = provider_statuses(settings)
 
-    assert router.provider_names == ("openrouter", "anthropic")
+    assert router.provider_names == ("openrouter",)
     assert all("router-secret" not in repr(status) for status in statuses)
-    assert next(status for status in statuses if status.name == "anthropic").implemented is False
+    anthropic_status = next(status for status in statuses if status.name == "anthropic")
+    assert anthropic_status.implemented is True
+    assert anthropic_status.configured is False
+    assert anthropic_status.in_route is False
 
     empty = Settings.from_env(tmp_path, environ={})
     assert build_model_router(empty).provider_names == ("mock",)
 
 
-def test_anthropic_reserved_slot_does_not_block_mock_fallback(tmp_path: Path) -> None:
+def test_unkeyed_anthropic_is_skipped_before_mock_fallback(tmp_path: Path) -> None:
     settings = Settings.from_env(
         tmp_path,
         environ={"PC_AGENT_PROVIDER_ORDER": "anthropic,mock"},
@@ -202,7 +205,7 @@ def test_anthropic_reserved_slot_does_not_block_mock_fallback(tmp_path: Path) ->
     routed = build_model_router(settings).complete(CompletionRequest.from_prompt("hi"))
 
     assert routed.response.provider == "mock"
-    assert routed.attempts[0].success is False
+    assert routed.attempts[0].success is True
 
 
 def test_provider_config_rejects_plaintext_remote_endpoint_and_bad_model(tmp_path: Path) -> None:

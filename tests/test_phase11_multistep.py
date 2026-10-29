@@ -427,7 +427,7 @@ def test_cli_multistep_text_json_and_workflow_show(
     assert "Multi-step plan: 2 step(s)" in capsys.readouterr().out
 
     assert main([*root, "doctor"]) == 0
-    assert "PHASE 16.1 Credential Manager Hotfix" in capsys.readouterr().out
+    assert "PHASE 27 PDF Signature Inspection" in capsys.readouterr().out
 
 
 def test_gui_controller_multistep(tmp_path: Path) -> None:

@@ -1,4 +1,4 @@
-# Architecture - through PHASE 16.1
+# Architecture - through PHASE 17
 
 ## Shape
 
@@ -406,3 +406,58 @@ does not silently read the developer's vault unless a store is injected;
 the test suite additionally defaults to ``PC_AGENT_CREDENTIAL_STORE=env``.
 Credential values never enter tool schemas, task plans, logs or status
 objects—only provider names and source labels are exposed.
+
+## Phase 17 core self-repair and task budgets
+
+`pc_agent.self_repair.SelfRepairService` is a maintenance service, not a
+registered tool. It snapshots only `src/`, `tests/` and `pyproject.toml`
+under `data/self-repair/baseline/`, diagnoses compile/version errors and
+baseline drift, and can emit only baseline-restore or generated-cache-delete
+operations. A repair is staged in an isolated copy (`.env` excluded), checked
+with fixed static/import/full argv vectors in a scrubbed environment, and
+applied only through the separately approved CLI apply step after a stale-plan
+check and per-file backup. Failed post-checks restore the backup; manual
+rollback uses the same records. Corrupt/invalid/version-mismatched baselines
+block staging, and extra files are evidence only. The separate
+`pc-agent-self-repair` bootstrap imports only this service (not the full CLI,
+planner, orchestrator or budgets), so it can repair most core files even
+when the normal CLI cannot start.
+
+`pc_agent.budgets` owns one mutable `TaskBudgetTracker` per orchestrated
+execute/resume/workflow replay. The orchestrator stores it in a context
+variable so the same tracker covers AI planning, provider vision inside a
+tool, multistep execution and bounded recovery re-executions without passing
+budget state through tool schemas. `BudgetedModelRouter` wraps the configured
+router: it reserves estimated input + maximum output before a call, prefers
+reported usage afterwards, and records fallback attempts separately. Step
+checks sit before every execution entry point (`_run_plan`, deterministic
+single/multi outcomes and stored-plan resume); time/tool checks sit before
+each planned invocation. Snapshots are attached to execution reports and task
+events, while recovery treats budget exhaustion as policy/non-retryable.
+
+
+## Phase 18 production hardening and portable releases
+
+`pc_agent.release` is a user-invoked maintenance boundary, not a tool. Its
+audit reads settings, version files, folder state and SQLite through a
+read-only connection; it does not initialize the database or call a
+provider. Bundle construction starts from a fixed allow-list, writes a
+sorted SHA-256 manifest and fixed-timestamp ZIP entries, and verifies the
+temporary archive before publishing it without overwrite. Bundle
+verification hashes entries in memory and never extracts them, so unsafe
+paths, duplicates, symlinks and forbidden private areas fail closed.
+
+`pc_agent.maintenance` uses SQLite's backup API for consistent database
+copies below `data/backups`. A strict sidecar manifest binds each copy to
+its size, hash, app version and schema. Restore verifies the selected copy,
+creates a pre-restore backup, checkpoints/removes exact WAL sidecars,
+stages and re-verifies the replacement, and leaves normal schema migration
+to the existing `Database.initialize()` call after the CLI approval step.
+
+`pc_agent.diagnostics` composes only public settings, provider statuses,
+tool IDs, counts and status objects. It never reads task instructions,
+preference/memory values, prompts or workspace contents into the export.
+The GUI reuses the same read-only audit and otherwise leaves bundle build,
+diagnostics export and backup/restore as explicit CLI operations. Windows
+scripts are packaging helpers around those same entry points; uninstall
+removal is exact-path-checked and preserves user data by default.

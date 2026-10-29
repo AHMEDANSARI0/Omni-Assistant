@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-healing-pc-agent"
-version = "0.18.1"
-description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file/Office operations + verified workflow reuse + multi-step planning)"
+version = "0.29.0"
+description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file/Office operations + verified workflow reuse + multi-step planning + core self-repair + task budgets + portable production releases + direct Anthropic provider + PDF text/page transforms + scanned PDF OCR + PDF table extraction + explicit online signed update downloads + PDF form inspection/filling + direct-only PDF password protection + PDF digital-signature inspection)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
@@ -14,9 +14,12 @@ license = { text = "Proprietary" }
 # hotfix uses certifi as a portable Mozilla CA bundle. Phase 14 uses
 # comtypes only on Windows for Microsoft UI Automation COM interop. Phase 15
 # uses Pillow for bounded local image decoding/encoding and transformations.
+# Phase 22 uses pypdfium2/PDFium only to render selected PDF pages for gated OCR.
+# Phase 26 uses pypdf's crypto extra for standards-based AES PDF encryption.
 dependencies = [
     "certifi>=2024.7.4",
-    "pypdf>=5.0,<7",
+    "pypdf[crypto]>=5.0,<7",
+    "pypdfium2>=5,<6",
     "Pillow>=10.4,<14",
     "comtypes>=1.4,<2; sys_platform == 'win32'",
 ]
@@ -29,9 +32,13 @@ dev = [
 
 [project.scripts]
 pc-agent = "pc_agent.cli:main"
+# Minimal bootstrap for repairing core files when the full CLI cannot import.
+pc-agent-self-repair = "pc_agent.self_repair_cli:main"
 # Vendor-only license issuing tool; customer production builds should keep
 # private keys (and may omit this launcher) off end-user machines.
 pc-agent-license-admin = "pc_agent.licensing.admin:main"
+# Vendor-only release bundle signing tool; keep its private keys off customer PCs.
+pc-agent-release-admin = "pc_agent.release_admin:main"
 
 [project.gui-scripts]
 pc-agent-gui = "pc_agent.gui.app:main"

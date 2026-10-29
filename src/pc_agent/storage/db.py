@@ -15,6 +15,7 @@ from ..domain.task import TaskStatus
 from ..errors import StorageError
 
 _STATUS_CHECK = ", ".join(f"'{status.value}'" for status in TaskStatus)
+LATEST_SCHEMA_VERSION = 6
 
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (

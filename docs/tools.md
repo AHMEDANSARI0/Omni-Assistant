@@ -1,4 +1,4 @@
-# Registered tools - through Phase 16.1
+# Registered tools - through Phase 27
 
 Built-in tools are reviewed source-code handlers. Phase 2 adds approved
 `custom.*` dynamic tools loaded from SQLite. Both kinds expose a stable id,
@@ -20,6 +20,14 @@ arguments before execution and validates the returned object afterwards.
 | `files.search` | 1.0.0 | Search file names and optionally bounded UTF-8 content; credential-like contents never searched | list_files, read_file |
 | `pdf.extract_pages` | 1.0.0 | Extract selected pages (`1-3,5`) into a new verified PDF | read_file, write_file |
 | `pdf.split` | 1.0.0 | Split into verified single-page PDFs (max 200 pages) | read_file, write_file |
+| `pdf.extract_text` | 1.0.0 | Extract bounded embedded text (never OCR) to a new verified .txt/.md/.json | read_file, write_file |
+| `pdf.extract_tables` | 1.0.0 | Detect bounded tables from embedded text geometry (never OCR) to new verified JSON, or CSV for exactly one table | read_file, write_file |
+| `pdf.inspect_form` | 1.0.0 | Inspect bounded interactive AcroForm fields, values, options, button states and widget pages | read_file |
+| `pdf.fill_form` | 1.0.0 | Fill validated existing AcroForm text/choice/checkbox/radio fields into a new verified PDF; never overwrites | read_file, write_file |
+| `pdf.ocr` | 1.0.0 | Render up to 10 selected pages and OCR scanned pages through gated provider vision into a new verified .txt/.md/.json; embedded-text pages reused by default | read_file, write_file, vision_analysis |
+| `pdf.search_text` | 1.0.0 | Search bounded embedded text (never OCR) for one exact phrase with page snippets | read_file |
+| `pdf.reorder_pages` | 1.0.0 | Write every page exactly once in a requested/full-reverse order; fingerprint-verified | read_file, write_file |
+| `pdf.rotate_pages` | 1.0.0 | Rotate selected pages by a quarter-turn; fingerprint/rotation-verified | read_file, write_file |
 | `office.docx_replace_text` | 1.0.0 | Replace exact paragraph text (run-boundary safe) into a new DOCX | read_file, write_file |
 | `office.docx_append_paragraphs` | 1.0.0 | Append paragraphs to a DOCX body into a new file | read_file, write_file |
 | `office.xlsx_set_cells` | 1.0.0 | Set cell values/`=`formulas in one sheet with computed cached values | read_file, write_file |
@@ -64,6 +72,77 @@ arguments before execution and validates the returned object afterwards.
 | `image.transform` | 1.0.0 | Crop/resize/thumbnail/rotate/flip/grayscale into a new workspace image | write_file |
 | `image.compare` | 1.0.0 | Compare two local images by bytes, pixels and bounded similarity | none |
 | `image.analyze` | 1.0.0 | Send one exact image/question to a vision provider; needs `PC_AGENT_ALLOW_VISION=1` and fresh approval in tasks | network_access |
+
+Phase 17 adds **no registered tool**. Core self-repair is a CLI maintenance
+service behind `PC_AGENT_ALLOW_SELF_REPAIR=1`; it is intentionally absent
+from this registry and from every planner catalog. Orchestrated executions
+also enforce a planned-tool budget (default 25): each planned registry-tool
+execution, including a bounded recovery re-execution, consumes one unit,
+while internal verification helpers for that step do not. See
+`docs/phase17.md`.
+
+Phase 18 also adds **no registered tool**. Release audit/bundle,
+diagnostics and database backup/restore are explicit CLI maintenance
+operations (with only read-only audit status in the GUI); they are absent
+from planner catalogs and cannot be invoked by a task. See
+`docs/phase18.md`.
+
+Phase 19 also adds **no registered tool**; it completes the direct Anthropic
+provider slot. Phase 20 adds the four PDF tools above, for **58 built-ins**.
+Embedded-text tools never OCR, page/text work is bounded, writers never
+overwrite, and transformed PDFs are verified by page fingerprints plus
+final rotations. See `docs/phase20.md`.
+
+Phase 21 also adds **no registered tool**. Signed offline update check,
+stage, apply and rollback are explicit direct CLI/GUI administration
+operations, absent from planner catalogs and task execution. Updating the
+application itself must never be delegated to an AI-proposed tool plan.
+See `docs/phase21.md`.
+
+Phase 22 adds `pdf.ocr`, for **59 built-ins**. It renders at most 10 selected
+pages locally with PDFium, sends only pages needing OCR through the Phase
+15 vision gate and provider route, and writes a new hash-verified text or
+JSON artifact. Embedded-text pages are reused by default. Verification
+checks embedded text, source/selected pages, counts, provider/model and
+sent-image metadata plus output hash; it does not deterministically grade
+OCR wording or resend pages. OCR is never auto-retried, and AI planning
+cannot propose this writer. See `docs/phase22.md`.
+
+Phase 23 adds `pdf.extract_tables`, for **60 built-ins**. It reconstructs
+bounded tables from embedded PDF character geometry on up to 100 selected
+pages, without rendering or OCR. JSON can carry zero or multiple tables;
+CSV deliberately requires exactly one detected table. Writers never
+overwrite, orchestrated verification independently reruns the extraction,
+and output-collision recovery can use a fresh output. AI planning cannot
+propose this writer. See `docs/phase23.md`.
+
+Phase 24 also adds **no registered tool**, so the built-in count remains
+**60**. Online update check/download/staging are explicit direct CLI/GUI
+administration operations behind `PC_AGENT_ONLINE_UPDATES=1`; they are
+absent from planner catalogs, task execution and dynamic tools. A task or
+AI plan cannot contact an update feed, download application code or stage
+an update. See `docs/phase24.md`.
+
+Phase 25 adds `pdf.inspect_form` and `pdf.fill_form`, for **62 built-ins**.
+They operate only on interactive AcroForm fields already in the PDF. Text,
+single/multi-select choice, checkbox and radio/button assignments are
+validated before writing; unknown, duplicate-name, read-only, signature,
+pushbutton and unknown fields are refused for filling. A fill writes a new
+PDF only after the temporary output is reopened and every changed/untouched
+value matches. AI planning cannot propose either form tool. See
+`docs/phase25.md`.
+
+Phase 26 adds **no registered tool**, so the count remains **62**. PDF
+security, protect and unprotect are direct CLI/GUI operations because their
+passwords must never become tool arguments, task plans or persisted tool
+records. They use hidden prompts/masked dialogs only and are absent from
+planner catalogs and dynamic tools. See `docs/phase26.md`.
+
+Phase 27 also adds **no registered tool**. PDF digital-signature inspection
+is a direct CLI/GUI operation that verifies ByteRange digests and embedded
+CMS signatures but labels certificate trust/revocation as not evaluated. It
+is absent from planner catalogs, task execution and dynamic tools, and it
+cannot create a signature. See `docs/phase27.md`.
 
 ## Approved dynamic tools
 
@@ -174,6 +253,10 @@ deterministic; `image.convert`/`image.transform` only create new workspace
 outputs and are independently re-inspected. AI planning may propose only
 `image.inspect` and `image.compare`. `image.analyze` is deterministic-only,
 requires the vision gate and fresh approval, and is never auto-retried.
+Phase 20 adds four PDF tools: AI planning may propose only read-only
+`pdf.search_text`; `pdf.extract_text`, `pdf.reorder_pages` and
+`pdf.rotate_pages` are deterministic/direct writers with independent
+re-extraction or page-fingerprint/rotation verification.
 
 Phase 16 does not add a tool. Provider credentials remain outside the tool
 registry and task/AI surfaces; only Settings and the dedicated local

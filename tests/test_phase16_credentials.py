@@ -337,11 +337,11 @@ def test_cli_doctor_credential_store_line(
 
     assert main(["--root", str(tmp_path), "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 16.1 Credential Manager Hotfix" in doctor
+    assert "PHASE 27 PDF Signature Inspection" in doctor
     assert "Credential store:" in doctor
     assert "stored=gemini" in doctor
     assert "openrouter=environment" in doctor
-    assert "built-ins=54" in doctor
+    assert "built-ins=62" in doctor
     assert "doctor-secret" not in doctor
     assert "doctor-env-secret" not in doctor
 
@@ -359,7 +359,7 @@ def test_gui_controller_credential_summary(tmp_path: Path) -> None:
 
     summary = controller.doctor_summary()
     text = summary.to_text()
-    assert "PHASE 16.1 Credential Manager Hotfix" in text
+    assert "PHASE 27 PDF Signature Inspection" in text
     assert "Credential store:" in text
     assert "stored=gemini" in text
     assert "gemini=windows-credential-manager" in text
