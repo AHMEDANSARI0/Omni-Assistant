@@ -432,7 +432,7 @@ def test_gui_controller_release_audit_and_doctor_text(tmp_path: Path) -> None:
     assert "CLI-only" in rendered_audit
     assert "count=1" in summary.database_backup_summary
     text = summary.to_text()
-    assert "PHASE 27 PDF Signature Inspection" in text
+    assert "PHASE 39 Secure .env Key Cleanup" in text
     assert "Production: release audit" in text
     assert _SECRET not in text
 
@@ -481,7 +481,7 @@ def test_current_project_candidates_include_phase18_but_no_private_areas() -> No
         path.as_posix() for path in release_candidate_files(project_root)
     }
 
-    assert __version__ == "0.29.0"
+    assert __version__ == "0.41.0"
     assert LATEST_SCHEMA_VERSION == 6
     assert len(build_default_registry().list_tools()) == 62
     assert "src/pc_agent/release.py" in candidates

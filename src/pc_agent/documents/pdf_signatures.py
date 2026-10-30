@@ -11,15 +11,16 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, padding, rsa
+from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from ..errors import ToolError
 from .pdf import _load_pypdf, inspect_pdf, sha256_file
@@ -44,10 +45,14 @@ MAX_CMS_SIGNERS = 10
 MAX_DER_NODES = 10_000
 MAX_DER_DEPTH = 30
 
+_OID_DATA = "1.2.840.113549.1.7.1"
 _OID_SIGNED_DATA = "1.2.840.113549.1.7.2"
 _OID_CONTENT_TYPE = "1.2.840.113549.1.9.3"
 _OID_MESSAGE_DIGEST = "1.2.840.113549.1.9.4"
 _OID_SIGNING_TIME = "1.2.840.113549.1.9.5"
+_OID_SIGNING_CERTIFICATE_V2 = "1.2.840.113549.1.9.16.2.47"
+_OID_TIMESTAMP_TOKEN = "1.2.840.113549.1.9.16.2.14"
+_OID_TST_INFO = "1.2.840.113549.1.9.16.1.4"
 _OID_RSA_PSS = "1.2.840.113549.1.1.10"
 _OID_MGF1 = "1.2.840.113549.1.1.8"
 
@@ -59,7 +64,11 @@ _DIGEST_OIDS = {
     "2.16.840.1.101.3.4.2.2": "sha384",
     "2.16.840.1.101.3.4.2.3": "sha512",
 }
-_SUPPORTED_SUBFILTERS = {"adbe.pkcs7.detached", "ETSI.CAdES.detached"}
+_SUPPORTED_SUBFILTERS = {
+    "adbe.pkcs7.detached",
+    "ETSI.CAdES.detached",
+    "ETSI.RFC3161",
+}
 
 
 class _DerError(ValueError):
@@ -93,6 +102,10 @@ class PdfCertificateSummary:
     self_signed: bool
     key_type: str
     key_size: int | str | None
+    # Retained only for in-process Phase 29 trust analysis. It is deliberately
+    # excluded from summary(), repr() and equality so raw certificate bytes do
+    # not reach CLI/GUI text, reports, tasks or logs.
+    der_bytes: bytes = field(default=b"", repr=False, compare=False)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -110,6 +123,41 @@ class PdfCertificateSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class PdfTimestampSummary:
+    status: str
+    status_detail: str
+    generation_time: str | None
+    policy_oid: str | None
+    serial_number: str | None
+    hash_algorithm: str | None
+    message_imprint_matches: bool | None
+    nonce: str | None
+    token_size: int
+    signer_certificate: PdfCertificateSummary | None
+    certificates: tuple[PdfCertificateSummary, ...]
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "status_detail": self.status_detail,
+            "generation_time": self.generation_time,
+            "policy_oid": self.policy_oid,
+            "serial_number": self.serial_number,
+            "hash_algorithm": self.hash_algorithm,
+            "message_imprint_matches": self.message_imprint_matches,
+            "nonce": self.nonce,
+            "token_size": self.token_size,
+            "signer_certificate": (
+                self.signer_certificate.summary()
+                if self.signer_certificate is not None
+                else None
+            ),
+            "certificates": [item.summary() for item in self.certificates],
+            "trust_status": "not_evaluated",
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PdfSignerSummary:
     digest_algorithm: str | None
     digest_matches: bool | None
@@ -119,6 +167,14 @@ class PdfSignerSummary:
     certificate_valid_at_signing: bool | None
     certificate: PdfCertificateSummary | None
     status_detail: str
+    timestamp: PdfTimestampSummary | None = None
+    claimed_signing_time: str | None = None
+    claimed_signing_time_source: str | None = None
+    cms_content_type: str | None = None
+    signed_attribute_oids: tuple[str, ...] = ()
+    signing_certificate_v2_present: bool = False
+    signing_certificate_v2_valid: bool | None = None
+    signing_certificate_v2_hash_algorithm: str | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -127,11 +183,23 @@ class PdfSignerSummary:
             "signature_algorithm": self.signature_algorithm,
             "signature_valid": self.signature_valid,
             "signing_time": self.signing_time,
+            "claimed_signing_time": self.claimed_signing_time,
+            "claimed_signing_time_source": self.claimed_signing_time_source,
+            "cms_content_type": self.cms_content_type,
+            "signed_attribute_oids": list(self.signed_attribute_oids),
+            "signing_certificate_v2_present": (
+                self.signing_certificate_v2_present
+            ),
+            "signing_certificate_v2_valid": self.signing_certificate_v2_valid,
+            "signing_certificate_v2_hash_algorithm": (
+                self.signing_certificate_v2_hash_algorithm
+            ),
             "certificate_valid_at_signing": self.certificate_valid_at_signing,
             "certificate": (
                 self.certificate.summary() if self.certificate is not None else None
             ),
             "status_detail": self.status_detail,
+            "timestamp": self.timestamp.summary() if self.timestamp else None,
         }
 
 
@@ -158,6 +226,9 @@ class PdfSignatureSummary:
     docmdp_permission: int | None
     signers: tuple[PdfSignerSummary, ...]
     certificates: tuple[PdfCertificateSummary, ...]
+    document_timestamp: PdfTimestampSummary | None = None
+    pades_profile_status: str = "not_evaluated"
+    pades_profile_detail: str = "PAdES profile structure was not evaluated"
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -182,6 +253,14 @@ class PdfSignatureSummary:
             "docmdp_permission": self.docmdp_permission,
             "signers": [item.summary() for item in self.signers],
             "certificates": [item.summary() for item in self.certificates],
+            "document_timestamp": (
+                self.document_timestamp.summary()
+                if self.document_timestamp is not None
+                else None
+            ),
+            "pades_profile_status": self.pades_profile_status,
+            "pades_profile_detail": self.pades_profile_detail,
+            "pades_conformance_status": "not_externally_evaluated",
             "trust_status": "not_evaluated",
         }
 
@@ -429,6 +508,13 @@ def _parse_asn1_time(node: _DerNode) -> datetime | None:
             return None
     except ValueError:
         return None
+    if rest.startswith((".", ",")):
+        fraction_match = re.match(r"[.,](\d+)", rest)
+        if fraction_match is None:
+            return None
+        digits = fraction_match.group(1)[:6].ljust(6, "0")
+        parsed = parsed.replace(microsecond=int(digits))
+        rest = rest[fraction_match.end() :]
     offset = UTC
     if rest and rest not in {"Z"}:
         match = re.fullmatch(r"([+-])(\d{2})(\d{2})", rest)
@@ -511,6 +597,7 @@ def _certificate_summary(certificate: x509.Certificate) -> PdfCertificateSummary
         self_signed=self_signed,
         key_type=key_type,
         key_size=key_size,
+        der_bytes=certificate.public_bytes(serialization.Encoding.DER),
     )
 
 
@@ -644,12 +731,158 @@ def _verify_cms_signature(
     return True
 
 
+def _validate_signing_certificate_v2(
+    node: _DerNode,
+    certificate: x509.Certificate | None,
+) -> tuple[bool | None, str | None, str]:
+    """Validate one RFC 5035 SigningCertificateV2 signed-attribute value."""
+
+    if certificate is None:
+        return None, None, "signer certificate is unavailable"
+    _require(node, 0, 16, "signing-certificate-v2")
+    if len(node.children) not in {1, 2}:
+        raise _DerError("Malformed ESS signing-certificate-v2")
+    certificates = _require(
+        node.children[0], 0, 16, "signing-certificate-v2 certificates"
+    )
+    if len(node.children) == 2:
+        _require(node.children[1], 0, 16, "signing-certificate-v2 policies")
+    if not certificates.children or len(certificates.children) > 20:
+        raise _DerError("ESS signing-certificate-v2 certificate count is invalid")
+
+    certificate_der = certificate.public_bytes(serialization.Encoding.DER)
+    seen_algorithm: str | None = None
+    for entry in certificates.children:
+        _require(entry, 0, 16, "ESS certificate identifier v2")
+        if not entry.children or len(entry.children) > 3:
+            raise _DerError("Malformed ESS certificate identifier v2")
+        index = 0
+        algorithm_name = "sha256"
+        if _is(entry.children[0], 0, 16, constructed=True):
+            algorithm_name = _digest_name_from_algorithm(entry.children[0])
+            index = 1
+        if algorithm_name is not None:
+            seen_algorithm = algorithm_name
+        if index >= len(entry.children):
+            raise _DerError("ESS certificate identifier v2 has no certificate hash")
+        cert_hash = _require(
+            entry.children[index], 0, 4, "ESS certificate hash"
+        ).value
+        issuer_serial = (
+            entry.children[index + 1] if index + 1 < len(entry.children) else None
+        )
+        if index + 1 < len(entry.children) and index + 2 != len(entry.children):
+            raise _DerError("Malformed ESS certificate identifier v2")
+        if algorithm_name not in {"sha256", "sha384", "sha512"}:
+            continue
+        if hashlib.new(algorithm_name, certificate_der).digest() != cert_hash:
+            continue
+        if issuer_serial is not None:
+            _require(issuer_serial, 0, 16, "ESS issuer serial")
+            if len(issuer_serial.children) != 2:
+                raise _DerError("Malformed ESS issuer serial")
+            general_names = _require(
+                issuer_serial.children[0], 0, 16, "ESS issuer general names"
+            )
+            if _integer(issuer_serial.children[1]) != certificate.serial_number:
+                continue
+            issuer_matches = any(
+                _is(name, 2, 4, constructed=True)
+                and len(name.children) == 1
+                and name.children[0].raw == certificate.issuer.public_bytes()
+                for name in general_names.children
+            )
+            if not issuer_matches:
+                continue
+        return True, algorithm_name, "ESS signing-certificate-v2 matches the signer"
+    return (
+        False,
+        seen_algorithm,
+        "ESS signing-certificate-v2 does not match the signer certificate",
+    )
+
+
+def _parse_iso_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _pades_bb_assessment(
+    *,
+    sub_filter: str | None,
+    filter_name: str | None,
+    signature_date: str | None,
+    cert_entry_present: bool,
+    status: str,
+    signers: tuple[PdfSignerSummary, ...],
+) -> tuple[str, str]:
+    """Assess locally checkable ETSI B-B structure without claiming conformance."""
+
+    if sub_filter != "ETSI.CAdES.detached":
+        return "not_pades_subfilter", "Signature does not use ETSI.CAdES.detached"
+    issues: list[str] = []
+    if status != "cryptographically_valid_untrusted":
+        issues.append("CMS signature is not cryptographically valid")
+    if not filter_name:
+        issues.append("Filter is missing")
+    if _parse_iso_time(signature_date) is None:
+        issues.append("claimed signing time /M is missing or unparseable")
+    if cert_entry_present:
+        issues.append("forbidden Cert entry is present")
+    if len(signers) != 1:
+        issues.append("CMS does not contain exactly one signer")
+    else:
+        signer = signers[0]
+        expected_attributes = {
+            _OID_CONTENT_TYPE: 1,
+            _OID_MESSAGE_DIGEST: 1,
+            _OID_SIGNING_CERTIFICATE_V2: 1,
+        }
+        actual_attributes: dict[str, int] = {}
+        for oid in signer.signed_attribute_oids:
+            actual_attributes[oid] = actual_attributes.get(oid, 0) + 1
+        if actual_attributes != expected_attributes:
+            issues.append(
+                "signed attributes are not exactly content-type, "
+                "message-digest and signing-certificate-v2"
+            )
+        if signer.signing_time is not None:
+            issues.append("CMS signing-time attribute is present")
+        if signer.cms_content_type != _OID_DATA:
+            issues.append("CMS content type is not id-data")
+        if signer.signing_certificate_v2_valid is not True:
+            issues.append("ESS signing-certificate-v2 does not verify")
+        if signer.claimed_signing_time_source != "pdf_signature_dictionary_m":
+            issues.append("claimed signing time is not provided by /M")
+        if signer.digest_algorithm not in {"sha256", "sha384", "sha512"}:
+            issues.append("CMS digest is outside the supported B-B profile")
+    if issues:
+        return "bb_structure_incomplete", "; ".join(sorted(set(issues)))
+    return (
+        "bb_structure_verified",
+        (
+            "ETSI.CAdES.detached, /M claimed time, content-type, "
+            "message-digest and ESS signing-certificate-v2 structure verify; "
+            "external PAdES conformance was not evaluated"
+        ),
+    )
+
+
 def _verify_signer(
     signer: _DerNode,
     *,
     signed_bytes: bytes,
     encapsulated_content_type: str,
     certificates: tuple[x509.Certificate, ...],
+    parse_timestamp: bool = True,
+    claimed_pdf_time: datetime | None = None,
 ) -> PdfSignerSummary:
     _require(signer, 0, 16, "signer info")
     if len(signer.children) < 5:
@@ -678,18 +911,25 @@ def _verify_signer(
     digest_matches: bool | None = None
     signing_time: datetime | None = None
     details: list[str] = []
+    signed_attribute_oids: tuple[str, ...] = ()
+    signing_certificate_v2_present = False
+    signing_certificate_v2_valid: bool | None = None
+    signing_certificate_v2_hash_algorithm: str | None = None
 
     if signed_attrs is not None:
         attributes: dict[str, _DerNode] = {}
+        attribute_oids: list[str] = []
         for attribute in signed_attrs.children:
             _require(attribute, 0, 16, "signed attribute")
             if len(attribute.children) != 2:
                 raise _DerError("Malformed CMS signed attribute")
             oid = _oid_string(attribute.children[0])
+            attribute_oids.append(oid)
             values = attribute.children[1]
             _require(values, 0, 17, "signed attribute values")
-            if values.children:
+            if values.children and oid not in attributes:
                 attributes[oid] = values.children[0]
+        signed_attribute_oids = tuple(attribute_oids)
 
         content_type_node = attributes.get(_OID_CONTENT_TYPE)
         if content_type_node is not None:
@@ -714,6 +954,17 @@ def _verify_signer(
         time_node = attributes.get(_OID_SIGNING_TIME)
         if time_node is not None:
             signing_time = _parse_asn1_time(time_node)
+
+        ess_node = attributes.get(_OID_SIGNING_CERTIFICATE_V2)
+        signing_certificate_v2_present = ess_node is not None
+        if ess_node is not None:
+            (
+                signing_certificate_v2_valid,
+                signing_certificate_v2_hash_algorithm,
+                ess_detail,
+            ) = _validate_signing_certificate_v2(ess_node, certificate)
+            if signing_certificate_v2_valid is not True:
+                details.append(ess_detail)
         verification_data = (
             b"\x31" + _der_length_bytes(len(signed_attrs.value)) + signed_attrs.value
         )
@@ -736,15 +987,31 @@ def _verify_signer(
     if signature_valid is False:
         details.append("CMS signature does not verify with the signer certificate")
 
+    claimed_signing_time = signing_time or claimed_pdf_time
+    claimed_signing_time_source = (
+        "cms_signing_time"
+        if signing_time is not None
+        else "pdf_signature_dictionary_m"
+        if claimed_pdf_time is not None
+        else None
+    )
     valid_at_signing: bool | None = None
-    if certificate is not None and signing_time is not None:
+    if certificate is not None and claimed_signing_time is not None:
         valid_at_signing = (
             certificate.not_valid_before_utc
-            <= signing_time
+            <= claimed_signing_time
             <= certificate.not_valid_after_utc
         )
         if not valid_at_signing:
-            details.append("Signer certificate was not valid at the CMS signing time")
+            details.append(
+                "Signer certificate was not valid at the claimed signing time"
+            )
+
+    timestamp = None
+    if parse_timestamp and index + 2 < len(signer.children):
+        unsigned_attrs = signer.children[index + 2]
+        if _is(unsigned_attrs, 2, 1, constructed=True):
+            timestamp = _timestamp_from_unsigned_attrs(unsigned_attrs, signature)
 
     if not details:
         details.append("Digest and CMS signature verify; trust was not evaluated")
@@ -758,7 +1025,256 @@ def _verify_signer(
         certificate_valid_at_signing=valid_at_signing,
         certificate=certificate_summary,
         status_detail="; ".join(details),
+        timestamp=timestamp,
+        claimed_signing_time=(
+            claimed_signing_time.isoformat() if claimed_signing_time else None
+        ),
+        claimed_signing_time_source=claimed_signing_time_source,
+        cms_content_type=encapsulated_content_type,
+        signed_attribute_oids=signed_attribute_oids,
+        signing_certificate_v2_present=signing_certificate_v2_present,
+        signing_certificate_v2_valid=signing_certificate_v2_valid,
+        signing_certificate_v2_hash_algorithm=(
+            signing_certificate_v2_hash_algorithm
+        ),
     )
+
+
+def _malformed_timestamp(token_size: int, detail: str) -> PdfTimestampSummary:
+    return PdfTimestampSummary(
+        status="malformed",
+        status_detail=detail,
+        generation_time=None,
+        policy_oid=None,
+        serial_number=None,
+        hash_algorithm=None,
+        message_imprint_matches=None,
+        nonce=None,
+        token_size=token_size,
+        signer_certificate=None,
+        certificates=(),
+    )
+
+
+def _octet_bytes(node: _DerNode) -> bytes:
+    _require(node, 0, 4, "octet string")
+    if not node.constructed:
+        return node.value
+    return b"".join(_octet_bytes(child) for child in node.children)
+
+
+def _timestamp_eku_error(certificate: x509.Certificate | None) -> str | None:
+    if certificate is None:
+        return "timestamp signer certificate is not embedded"
+    try:
+        extension = certificate.extensions.get_extension_for_class(
+            x509.ExtendedKeyUsage
+        )
+    except x509.ExtensionNotFound:
+        return "timestamp signer certificate has no ExtendedKeyUsage"
+    except x509.DuplicateExtension:
+        return "timestamp signer certificate has duplicated ExtendedKeyUsage"
+    if not extension.critical:
+        return "timestamp signer ExtendedKeyUsage is not critical"
+    if list(extension.value) != [ExtendedKeyUsageOID.TIME_STAMPING]:
+        return "timestamp signer ExtendedKeyUsage is not exactly timeStamping"
+    return None
+
+
+def _parse_timestamp_token(
+    token_bytes: bytes, *, message_bytes: bytes
+) -> tuple[PdfTimestampSummary, tuple[x509.Certificate, ...]]:
+    certificates: tuple[x509.Certificate, ...] = ()
+    try:
+        root = _parse_der_root(token_bytes)
+        _require(root, 0, 16, "timestamp token")
+        if len(root.children) != 2 or _oid_string(root.children[0]) != _OID_SIGNED_DATA:
+            raise _DerError("Timestamp token is not CMS SignedData")
+        wrapper = _require(root.children[1], 2, 0, "timestamp signed data")
+        if len(wrapper.children) != 1:
+            raise _DerError("Malformed timestamp signed-data wrapper")
+        signed_data = _require(wrapper.children[0], 0, 16, "timestamp signed data")
+        if len(signed_data.children) < 4:
+            raise _DerError("Malformed timestamp signed data")
+        encapsulated = _require(
+            signed_data.children[2], 0, 16, "timestamp encapsulated content"
+        )
+        if len(encapsulated.children) != 2:
+            raise _DerError("Timestamp token has no encapsulated TSTInfo")
+        if _oid_string(encapsulated.children[0]) != _OID_TST_INFO:
+            raise _DerError("Timestamp token content type is not TSTInfo")
+        content_wrapper = _require(
+            encapsulated.children[1], 2, 0, "timestamp encapsulated content"
+        )
+        if len(content_wrapper.children) != 1:
+            raise _DerError("Malformed timestamp encapsulated content")
+        tst_bytes = _octet_bytes(content_wrapper.children[0])
+
+        certificates_node: _DerNode | None = None
+        signer_infos: _DerNode | None = None
+        for child in signed_data.children[3:]:
+            if _is(child, 2, 0, constructed=True):
+                certificates_node = child
+            elif _is(child, 0, 17, constructed=True):
+                signer_infos = child
+        if signer_infos is None or len(signer_infos.children) != 1:
+            raise _DerError("Timestamp token must contain exactly one signer")
+        certificates = _load_certificates(certificates_node)
+        token_signer = _verify_signer(
+            signer_infos.children[0],
+            signed_bytes=tst_bytes,
+            encapsulated_content_type=_OID_TST_INFO,
+            certificates=certificates,
+            parse_timestamp=False,
+        )
+
+        tst = _parse_der_root(tst_bytes)
+        _require(tst, 0, 16, "TSTInfo")
+        if len(tst.children) < 5:
+            raise _DerError("Malformed TSTInfo")
+        version = _integer(tst.children[0])
+        policy_oid = _oid_string(tst.children[1])
+        imprint = _require(tst.children[2], 0, 16, "timestamp message imprint")
+        if len(imprint.children) != 2:
+            raise _DerError("Malformed timestamp message imprint")
+        hash_algorithm = _digest_name_from_algorithm(imprint.children[0])
+        imprint_digest = _octet_bytes(imprint.children[1])
+        serial = _integer(tst.children[3])
+        generation_time = _parse_asn1_time(tst.children[4])
+        nonce: int | None = None
+        for child in tst.children[5:]:
+            if _is(child, 0, 2):
+                nonce = _integer(child)
+                break
+
+        details: list[str] = []
+        invalid = False
+        unsupported = False
+        if version != 1:
+            invalid = True
+            details.append("TSTInfo version is not 1")
+        if generation_time is None:
+            invalid = True
+            details.append("TSTInfo generation time is malformed")
+        if hash_algorithm is None:
+            unsupported = True
+            imprint_matches: bool | None = None
+            details.append("timestamp message-imprint hash is unsupported")
+        else:
+            imprint_matches = (
+                hashlib.new(hash_algorithm, message_bytes).digest() == imprint_digest
+            )
+            if not imprint_matches:
+                invalid = True
+                details.append("timestamp message imprint does not match")
+            if hash_algorithm in {"md5", "sha1"}:
+                unsupported = True
+                details.append("timestamp uses a weak MD5/SHA-1 imprint hash")
+        if token_signer.digest_matches is False or token_signer.signature_valid is False:
+            invalid = True
+            details.append("timestamp CMS digest or signature does not verify")
+        if token_signer.digest_matches is not True or token_signer.signature_valid is not True:
+            unsupported = True
+            details.append("timestamp CMS verification is incomplete")
+        if token_signer.digest_algorithm in {"md5", "sha1"}:
+            unsupported = True
+            details.append("timestamp CMS uses a weak MD5/SHA-1 digest")
+
+        tsa_certificate: x509.Certificate | None = None
+        if token_signer.certificate is not None:
+            tsa_certificate = next(
+                (
+                    cert
+                    for cert in certificates
+                    if cert.fingerprint(hashes.SHA256()).hex()
+                    == token_signer.certificate.sha256_fingerprint
+                ),
+                None,
+            )
+        if eku_error := _timestamp_eku_error(tsa_certificate):
+            invalid = True
+            details.append(eku_error)
+        if (
+            tsa_certificate is not None
+            and generation_time is not None
+            and not (
+                tsa_certificate.not_valid_before_utc
+                <= generation_time
+                <= tsa_certificate.not_valid_after_utc
+            )
+        ):
+            invalid = True
+            details.append("timestamp signer certificate was not valid at generation time")
+
+        if invalid:
+            status = "invalid"
+        elif unsupported:
+            status = "unsupported"
+        else:
+            status = "verified_untrusted"
+            details.append(
+                "TSTInfo imprint, CMS signature and TSA EKU verify; TSA trust was not evaluated"
+            )
+        summary = PdfTimestampSummary(
+            status=status,
+            status_detail="; ".join(details),
+            generation_time=generation_time.isoformat() if generation_time else None,
+            policy_oid=policy_oid,
+            serial_number=f"{serial:x}",
+            hash_algorithm=hash_algorithm,
+            message_imprint_matches=imprint_matches,
+            nonce=f"{nonce:x}" if nonce is not None else None,
+            token_size=len(token_bytes),
+            signer_certificate=token_signer.certificate,
+            certificates=tuple(_certificate_summary(cert) for cert in certificates),
+        )
+        return summary, certificates
+    except _DerError as exc:
+        return _malformed_timestamp(len(token_bytes), str(exc)), certificates
+    except (
+        ArithmeticError,
+        AttributeError,
+        IndexError,
+        KeyError,
+        TypeError,
+        UnicodeError,
+        UnsupportedAlgorithm,
+        ValueError,
+    ) as exc:
+        return (
+            _malformed_timestamp(
+                len(token_bytes),
+                f"Timestamp token inspection is unsupported: {type(exc).__name__}",
+            ),
+            certificates,
+        )
+
+
+def _timestamp_from_unsigned_attrs(
+    unsigned_attrs: _DerNode, signature_value: bytes
+) -> PdfTimestampSummary | None:
+    candidates: list[PdfTimestampSummary] = []
+    try:
+        for attribute in unsigned_attrs.children:
+            _require(attribute, 0, 16, "unsigned attribute")
+            if len(attribute.children) != 2:
+                raise _DerError("Malformed CMS unsigned attribute")
+            if _oid_string(attribute.children[0]) != _OID_TIMESTAMP_TOKEN:
+                continue
+            values = _require(
+                attribute.children[1], 0, 17, "unsigned attribute values"
+            )
+            for token in values.children[:3]:
+                summary, _certificates = _parse_timestamp_token(
+                    token.raw, message_bytes=signature_value
+                )
+                candidates.append(summary)
+    except _DerError as exc:
+        return _malformed_timestamp(0, str(exc))
+    for candidate in candidates:
+        if candidate.status == "verified_untrusted":
+            return candidate
+    return candidates[0] if candidates else None
 
 
 def _signature_algorithm_label(node: _DerNode, digest_name: str | None) -> str:
@@ -788,7 +1304,10 @@ def _signature_algorithm_label(node: _DerNode, digest_name: str | None) -> str:
 
 
 def _parse_cms(
-    cms_bytes: bytes, signed_bytes: bytes
+    cms_bytes: bytes,
+    signed_bytes: bytes,
+    *,
+    claimed_pdf_time: datetime | None = None,
 ) -> tuple[tuple[PdfSignerSummary, ...], tuple[x509.Certificate, ...]]:
     root = _parse_der_root(cms_bytes)
     _require(root, 0, 16, "content info")
@@ -829,6 +1348,7 @@ def _parse_cms(
             signed_bytes=signed_bytes,
             encapsulated_content_type=content_type,
             certificates=certificates,
+            claimed_pdf_time=claimed_pdf_time,
         )
         for signer in signer_infos.children
     )
@@ -933,6 +1453,7 @@ def _signature_status(
         signer.digest_matches is False
         or signer.signature_valid is False
         or signer.certificate_valid_at_signing is False
+        or signer.signing_certificate_v2_valid is False
         for signer in signers
     ):
         return "invalid", "At least one CMS signer failed verification"
@@ -991,6 +1512,8 @@ def _inspect_signature(
             docmdp_permission=None,
             signers=(),
             certificates=(),
+            pades_profile_status="not_evaluated",
+            pades_profile_detail="Unsigned signature field has no PAdES signature",
         )
 
     metadata = {
@@ -1008,6 +1531,18 @@ def _inspect_signature(
     contents = _contents_bytes(_get(signature, "/Contents"))
     contents_size = len(contents) if contents is not None else None
     permission = _docmdp_permission(signature)
+    cert_entry_present = _get(signature, "/Cert") is not None
+    claimed_pdf_time = _parse_iso_time(metadata["signature_date"])
+    default_pades_status = (
+        "bb_structure_incomplete"
+        if metadata["sub_filter"] == "ETSI.CAdES.detached"
+        else "not_pades_subfilter"
+    )
+    default_pades_detail = (
+        "PAdES B-B structure could not be verified"
+        if metadata["sub_filter"] == "ETSI.CAdES.detached"
+        else "Signature does not use ETSI.CAdES.detached"
+    )
 
     def result(
         status: str,
@@ -1016,6 +1551,9 @@ def _inspect_signature(
         signers: tuple[PdfSignerSummary, ...] = (),
         certificates: tuple[PdfCertificateSummary, ...] = (),
         cms_size: int | None = None,
+        document_timestamp: PdfTimestampSummary | None = None,
+        pades_profile_status: str | None = None,
+        pades_profile_detail: str | None = None,
     ) -> PdfSignatureSummary:
         return PdfSignatureSummary(
             field_name=field_name,
@@ -1032,6 +1570,9 @@ def _inspect_signature(
             docmdp_permission=permission,
             signers=signers,
             certificates=certificates,
+            document_timestamp=document_timestamp,
+            pades_profile_status=pades_profile_status or default_pades_status,
+            pades_profile_detail=pades_profile_detail or default_pades_detail,
             **metadata,
         )
 
@@ -1055,7 +1596,30 @@ def _inspect_signature(
     try:
         root = _parse_der_root(contents)
         cms_size = root.end
-        signers, certificates = _parse_cms(contents[:cms_size], signed_bytes)
+        if metadata["sub_filter"] == "ETSI.RFC3161":
+            document_timestamp, token_certificates = _parse_timestamp_token(
+                contents[:cms_size], message_bytes=signed_bytes
+            )
+            token_status = {
+                "verified_untrusted": "cryptographically_valid_untrusted",
+                "invalid": "invalid",
+                "malformed": "malformed",
+                "unsupported": "unsupported",
+            }.get(document_timestamp.status, "unsupported")
+            return result(
+                token_status,
+                f"Document timestamp: {document_timestamp.status_detail}",
+                certificates=tuple(
+                    _certificate_summary(cert) for cert in token_certificates
+                ),
+                cms_size=cms_size,
+                document_timestamp=document_timestamp,
+            )
+        signers, certificates = _parse_cms(
+            contents[:cms_size],
+            signed_bytes,
+            claimed_pdf_time=claimed_pdf_time,
+        )
     except _DerError as exc:
         return result("malformed", str(exc))
     except (
@@ -1078,12 +1642,22 @@ def _inspect_signature(
         detail += (
             f"; {parsed_range[3]} unsigned byte(s) follow the signed revision"
         )
+    pades_status, pades_detail = _pades_bb_assessment(
+        sub_filter=metadata["sub_filter"],
+        filter_name=metadata["filter_name"],
+        signature_date=metadata["signature_date"],
+        cert_entry_present=cert_entry_present,
+        status=status,
+        signers=signers,
+    )
     return result(
         status,
         detail,
         signers=signers,
         certificates=tuple(_certificate_summary(cert) for cert in certificates),
         cms_size=cms_size,
+        pades_profile_status=pades_status,
+        pades_profile_detail=pades_detail,
     )
 
 

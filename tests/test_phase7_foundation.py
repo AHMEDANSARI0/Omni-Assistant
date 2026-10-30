@@ -407,7 +407,7 @@ def test_cli_doctor_reports_phase7_memory(
 ) -> None:
     assert main(["--root", str(tmp_path), "doctor"]) == 0
     out = capsys.readouterr().out
-    assert "PHASE 27 PDF Signature Inspection" in out
+    assert "PHASE 39 Secure .env Key Cleanup" in out
     assert "schema v6" in out
     assert "Memory: preferences=0" in out
 

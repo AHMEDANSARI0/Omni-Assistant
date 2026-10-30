@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-healing-pc-agent"
-version = "0.29.0"
-description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file/Office operations + verified workflow reuse + multi-step planning + core self-repair + task budgets + portable production releases + direct Anthropic provider + PDF text/page transforms + scanned PDF OCR + PDF table extraction + explicit online signed update downloads + PDF form inspection/filling + direct-only PDF password protection + PDF digital-signature inspection)"
+version = "0.41.0"
+description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file/Office operations + verified workflow reuse + multi-step planning + core self-repair + task budgets + portable production releases + direct Anthropic provider + PDF text/page transforms + scanned PDF OCR + PDF table extraction + explicit online signed update downloads + PDF form inspection/filling + direct-only PDF password protection + PDF digital-signature inspection/creation + local PDF trust-chain/CRL validation + RFC 3161 PDF timestamping + opt-in online CRL/OCSP revocation + certificate-policy/name-constraint validation + opt-in system trust-store anchors + incremental multi-signature PDF signing + DocTimeStamp-only incremental revisions + LTV DSS embedding + PAdES Baseline B-B signature profile + Windows installer source packaging + secure .env provider-key cleanup)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }

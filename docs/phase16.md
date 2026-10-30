@@ -72,8 +72,21 @@ The migration command **does not edit `.env`**. Verify the route:
 pc-agent providers list
 ```
 
-Then manually remove the migrated `*_API_KEY` lines from `.env`. Run
-Doctor again:
+Since Phase 39, do not edit those secret lines by hand. First inspect the
+verified plan:
+
+```powershell
+pc-agent credentials remove-env-keys --dry-run
+```
+
+Then apply it after the exact approval prompt:
+
+```powershell
+pc-agent credentials remove-env-keys
+```
+
+Only `verified_match` lines are removed; mismatched or unstored keys stay in
+`.env`, and no plaintext backup is created. Run Doctor again:
 
 ```powershell
 pc-agent doctor

@@ -37,7 +37,7 @@ from pc_agent.storage.db import LATEST_SCHEMA_VERSION
 from pc_agent.tools import build_default_registry
 from pc_agent.updates import default_signature_path, list_updates
 
-_FUTURE = "0.30.0"
+_FUTURE = "0.42.0"
 _FEED_URL = "https://updates.example.com/self-healing-pc-agent/stable.json"
 _BUNDLE_NAME = f"release-{_FUTURE}.zip"
 _SIGNATURE_NAME = f"{_BUNDLE_NAME}.sig.json"
@@ -488,8 +488,8 @@ def test_online_cli_and_gui_controller_routes(
 
     summary = controller.doctor_summary()
     text = summary.to_text()
-    assert summary.version == __version__ == "0.29.0"
-    assert "PHASE 27 PDF Signature Inspection" in text
+    assert summary.version == __version__ == "0.41.0"
+    assert "PHASE 39 Secure .env Key Cleanup" in text
     assert "online=yes" in text
     assert "feed_host=updates.example.com" in text
     assert "channel=stable" in text
@@ -566,7 +566,7 @@ def test_phase24_scope_docs_schema_and_release_candidates() -> None:
     candidates = {path.as_posix() for path in release_candidate_files(project_root)}
     tool_ids = {item.spec.id for item in build_default_registry().list_tools()}
 
-    assert __version__ == "0.29.0"
+    assert __version__ == "0.41.0"
     assert LATEST_SCHEMA_VERSION == 6
     assert len(tool_ids) == 62
     assert not any(tool_id.startswith("update.") for tool_id in tool_ids)

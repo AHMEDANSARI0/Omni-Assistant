@@ -667,6 +667,33 @@ class PcAgentGuiApp:
         self.pdf_ocr_skip_text_var = tk.BooleanVar(value=True)
         self.pdf_table_min_rows_var = tk.StringVar(value="2")
         self.pdf_table_min_columns_var = tk.StringVar(value="2")
+        self.pdf_pkcs12_var = tk.StringVar()
+        self.pdf_signature_field_var = tk.StringVar()
+        self.pdf_signature_reason_var = tk.StringVar()
+        self.pdf_signature_location_var = tk.StringVar()
+        self.pdf_signature_contact_var = tk.StringVar()
+        self.pdf_signature_page_var = tk.StringVar(value="1")
+        self.pdf_signature_rect_var = tk.StringVar(value="36,36,200,40")
+        self.pdf_signature_certify_var = tk.StringVar(value="none")
+        self.pdf_signature_hash_var = tk.StringVar(value="sha256")
+        self.pdf_signature_profile_var = tk.StringVar(value="adbe")
+        self.pdf_signature_invisible_var = tk.BooleanVar(value=False)
+        self.pdf_trust_accept_unknown_var = tk.BooleanVar(value=False)
+        self.pdf_online_revocation_var = tk.BooleanVar(value=False)
+        self.pdf_revocation_timeout_var = tk.StringVar(value="10")
+        self.pdf_revocation_allow_private_var = tk.BooleanVar(value=False)
+        self.pdf_required_policies_var = tk.StringVar()
+        self.pdf_timestamp_required_policies_var = tk.StringVar()
+        self.pdf_explicit_policy_var = tk.BooleanVar(value=False)
+        self.pdf_inhibit_any_policy_var = tk.BooleanVar(value=False)
+        self.pdf_inhibit_policy_mapping_var = tk.BooleanVar(value=False)
+        self.pdf_system_trust_var = tk.BooleanVar(value=False)
+        self.pdf_timestamp_system_trust_var = tk.BooleanVar(value=False)
+        self.pdf_timestamp_url_var = tk.StringVar()
+        self.pdf_timestamp_hash_var = tk.StringVar(value="sha256")
+        self.pdf_timestamp_timeout_var = tk.StringVar(value="15")
+        self.pdf_timestamp_allow_private_var = tk.BooleanVar(value=False)
+        self.pdf_ltv_seal_timestamp_var = tk.BooleanVar(value=False)
         self.doc_find_var = tk.StringVar()
         self.doc_replace_var = tk.StringVar()
         self.doc_cell_ref_var = tk.StringVar(value="B2")
@@ -880,6 +907,31 @@ class PcAgentGuiApp:
             text="Inspect Signatures",
             command=self._pdf_inspect_signatures,
         ).grid(row=8, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            pdf_edit_buttons,
+            text="Sign PDF",
+            command=self._pdf_sign,
+        ).grid(row=9, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            pdf_edit_buttons,
+            text="Add DocTimeStamp",
+            command=self._pdf_document_timestamp,
+        ).grid(row=10, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            pdf_edit_buttons,
+            text="Validate Signature Trust",
+            command=self._pdf_validate_signatures,
+        ).grid(row=11, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            pdf_edit_buttons,
+            text="Inspect LTV DSS",
+            command=self._pdf_inspect_ltv,
+        ).grid(row=12, column=0, columnspan=2, sticky="ew", pady=2)
+        ttk.Button(
+            pdf_edit_buttons,
+            text="Add LTV DSS",
+            command=self._pdf_add_ltv,
+        ).grid(row=13, column=0, columnspan=2, sticky="ew", pady=2)
         self._labeled_entry(pdf_panel, "PDF OCR DPI (72-300)", self.pdf_ocr_dpi_var, 14)
         self._labeled_entry(
             pdf_panel, "PDF OCR language (optional)", self.pdf_ocr_language_var, 16
@@ -918,6 +970,261 @@ class PcAgentGuiApp:
         ).grid(row=24, column=0, sticky="w")
         self.pdf_form_values_text = self._make_text(pdf_panel, height=4, width=44)
         self.pdf_form_values_text.grid(row=25, column=0, sticky="ew", pady=(2, 4))
+        self._labeled_entry(
+            pdf_panel,
+            "PKCS#12 identity (.p12/.pfx in workspace)",
+            self.pdf_pkcs12_var,
+            26,
+        )
+        self._labeled_entry(
+            pdf_panel,
+            "Signature field (blank=auto; new names are created)",
+            self.pdf_signature_field_var,
+            28,
+        )
+        self._labeled_entry(
+            pdf_panel,
+            "Signature reason (optional)",
+            self.pdf_signature_reason_var,
+            30,
+        )
+        self._labeled_entry(
+            pdf_panel,
+            "Signature location (optional)",
+            self.pdf_signature_location_var,
+            32,
+        )
+        self._labeled_entry(
+            pdf_panel,
+            "Signature contact (optional)",
+            self.pdf_signature_contact_var,
+            34,
+        )
+        self._labeled_entry(
+            pdf_panel,
+            "Signature page",
+            self.pdf_signature_page_var,
+            36,
+        )
+        self._labeled_entry(
+            pdf_panel,
+            "Signature rectangle x,y,width,height (points)",
+            self.pdf_signature_rect_var,
+            38,
+        )
+        ttk.Label(pdf_panel, text="DocMDP certification").grid(
+            row=40, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            pdf_panel,
+            textvariable=self.pdf_signature_certify_var,
+            values=("none", "1", "2", "3"),
+            state="readonly",
+        ).grid(row=41, column=0, sticky="ew", pady=(2, 4))
+        ttk.Label(pdf_panel, text="Signature hash").grid(
+            row=42, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            pdf_panel,
+            textvariable=self.pdf_signature_hash_var,
+            values=("sha256", "sha384", "sha512"),
+            state="readonly",
+        ).grid(row=43, column=0, sticky="ew", pady=(2, 4))
+        signature_options = ttk.Frame(pdf_panel)
+        signature_options.grid(row=44, column=0, sticky="ew", pady=(2, 4))
+        ttk.Checkbutton(
+            signature_options,
+            text="Invisible",
+            variable=self.pdf_signature_invisible_var,
+        ).pack(side="left")
+        ttk.Label(signature_options, text="Profile").pack(
+            side="left", padx=(12, 4)
+        )
+        ttk.Combobox(
+            signature_options,
+            textvariable=self.pdf_signature_profile_var,
+            values=("adbe", "pades-bb"),
+            state="readonly",
+            width=12,
+        ).pack(side="left")
+        ttk.Label(
+            pdf_panel,
+            text=(
+                "Sign PDF asks for the PKCS#12 password only through a "
+                "masked dialog. It signs unencrypted PDFs into a new output; "
+                "already signed PDFs receive an incremental update only "
+                "after every existing signature verifies again. The pades-bb "
+                "profile uses ETSI.CAdES.detached with signing-certificate-v2; "
+                "certificate trust and external PAdES conformance are not evaluated."
+            ),
+            wraplength=380,
+        ).grid(row=45, column=0, sticky="w")
+        ttk.Label(
+            pdf_panel,
+            text="Trust anchors / LTV certificates (workspace .pem/.crt/.cer/.der or folder, one path per line)",
+            wraplength=380,
+        ).grid(row=46, column=0, sticky="w", pady=(8, 0))
+        self.pdf_trust_anchors_text = self._make_text(pdf_panel, height=3, width=44)
+        self.pdf_trust_anchors_text.grid(row=47, column=0, sticky="ew", pady=(2, 4))
+        ttk.Label(
+            pdf_panel,
+            text="CRLs (workspace .crl/.pem/.der or folder, one path per line)",
+            wraplength=380,
+        ).grid(row=48, column=0, sticky="w")
+        self.pdf_crls_text = self._make_text(pdf_panel, height=3, width=44)
+        self.pdf_crls_text.grid(row=49, column=0, sticky="ew", pady=(2, 4))
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Accept trusted chain when revocation status is unknown",
+            variable=self.pdf_trust_accept_unknown_var,
+        ).grid(row=50, column=0, sticky="w", pady=(2, 4))
+        ttk.Label(
+            pdf_panel,
+            text=(
+                "Validate Signature Trust is offline by default. It builds "
+                "a basic chain to your explicit local anchors and reads "
+                "the CRL files/folders listed here. If online revocation "
+                "is enabled, it may then query CRL/OCSP endpoints embedded "
+                "in certificates; returned evidence is signature-verified. "
+                "Certificate policies and name constraints are evaluated "
+                "with a bounded RFC 5280 subset. OS/Adobe trust stores, "
+                "PAdES/LTV and legal validity are not evaluated."
+            ),
+            wraplength=380,
+        ).grid(row=51, column=0, sticky="w")
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Enable online CRL/OCSP revocation fallback (network)",
+            variable=self.pdf_online_revocation_var,
+        ).grid(row=52, column=0, sticky="w", pady=(2, 4))
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Allow private/loopback CRL or OCSP endpoints (trusted local PKI only)",
+            variable=self.pdf_revocation_allow_private_var,
+        ).grid(row=53, column=0, sticky="w", pady=(2, 4))
+        self._labeled_entry(
+            pdf_panel,
+            "Online revocation timeout seconds (1-60)",
+            self.pdf_revocation_timeout_var,
+            54,
+        )
+        ttk.Label(
+            pdf_panel,
+            text="OCSP responses for LTV (workspace .ocsp/.pem/.der or folder, one path per line)",
+            wraplength=380,
+        ).grid(row=56, column=0, sticky="w")
+        self.pdf_ocsp_responses_text = self._make_text(pdf_panel, height=3, width=44)
+        self.pdf_ocsp_responses_text.grid(
+            row=57, column=0, sticky="ew", pady=(2, 4)
+        )
+        self._labeled_entry(
+            pdf_panel,
+            "RFC 3161 TSA HTTPS URL (Sign optional; DocTimeStamp/LTV seal required)",
+            self.pdf_timestamp_url_var,
+            58,
+        )
+        ttk.Label(pdf_panel, text="Timestamp hash").grid(
+            row=60, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            pdf_panel,
+            textvariable=self.pdf_timestamp_hash_var,
+            values=("sha256", "sha384", "sha512"),
+            state="readonly",
+        ).grid(row=61, column=0, sticky="ew", pady=(2, 4))
+        self._labeled_entry(
+            pdf_panel,
+            "Timestamp timeout seconds (1-60)",
+            self.pdf_timestamp_timeout_var,
+            62,
+        )
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Allow this exact TSA URL on a private/non-standard-port address",
+            variable=self.pdf_timestamp_allow_private_var,
+        ).grid(row=64, column=0, sticky="w", pady=(2, 4))
+        ttk.Label(
+            pdf_panel,
+            text="TSA trust anchors (optional; blank reuses Trust anchors above, one path per line)",
+            wraplength=380,
+        ).grid(row=65, column=0, sticky="w")
+        self.pdf_timestamp_anchors_text = self._make_text(
+            pdf_panel, height=3, width=44
+        )
+        self.pdf_timestamp_anchors_text.grid(
+            row=66, column=0, sticky="ew", pady=(2, 4)
+        )
+        ttk.Label(
+            pdf_panel,
+            text=(
+                "Timestamping sends only a hash (CMS signature value for "
+                "Sign PDF, or the new document revision for Add DocTimeStamp) "
+                "to the exact HTTPS TSA. It never sends the PDF, private key "
+                "or PKCS#12 password. TSA trust is not evaluated here."
+            ),
+            wraplength=380,
+        ).grid(row=67, column=0, sticky="w")
+        self._labeled_entry(
+            pdf_panel,
+            "Required signer policy OIDs (optional, comma-separated)",
+            self.pdf_required_policies_var,
+            68,
+        )
+        self._labeled_entry(
+            pdf_panel,
+            "Required TSA policy OIDs (optional, comma-separated)",
+            self.pdf_timestamp_required_policies_var,
+            70,
+        )
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Require an explicit valid certificate-policy graph",
+            variable=self.pdf_explicit_policy_var,
+        ).grid(row=72, column=0, sticky="w", pady=(2, 4))
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Inhibit anyPolicy wildcard processing",
+            variable=self.pdf_inhibit_any_policy_var,
+        ).grid(row=73, column=0, sticky="w", pady=(2, 4))
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Inhibit certificate policy mapping",
+            variable=self.pdf_inhibit_policy_mapping_var,
+        ).grid(row=74, column=0, sticky="w", pady=(2, 4))
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Also use system CA store for signer chains",
+            variable=self.pdf_system_trust_var,
+        ).grid(row=75, column=0, sticky="w", pady=(2, 4))
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Also use system CA store for TSA chains",
+            variable=self.pdf_timestamp_system_trust_var,
+        ).grid(row=76, column=0, sticky="w", pady=(2, 4))
+        ttk.Label(
+            pdf_panel,
+            text=(
+                "Name constraints are always checked. Leave policy OIDs "
+                "blank to accept any otherwise valid policy graph. System "
+                "roots are off by default and are not Adobe trust."
+            ),
+            wraplength=380,
+        ).grid(row=77, column=0, sticky="w")
+        ttk.Checkbutton(
+            pdf_panel,
+            text="Seal the new DSS with a DocTimeStamp using the TSA URL above",
+            variable=self.pdf_ltv_seal_timestamp_var,
+        ).grid(row=78, column=0, sticky="w", pady=(6, 4))
+        ttk.Label(
+            pdf_panel,
+            text=(
+                "Add LTV DSS embeds relevant local certificates, CRLs and "
+                "OCSP responses in an incremental revision. It evaluates "
+                "relevance and revocation evidence, but not certificate "
+                "trust, PAdES conformance or legal validity."
+            ),
+            wraplength=380,
+        ).grid(row=79, column=0, sticky="w")
 
         ttk.Label(
             files_panel,
@@ -2486,6 +2793,354 @@ class PcAgentGuiApp:
         self._doc_tool(
             "Inspect PDF signatures",
             lambda: self.controller.pdf_inspect_signatures(path),
+        )
+
+    def _pdf_validate_signatures(self) -> None:
+        path = self.doc_input_var.get()
+        anchors = self._get_text(self.pdf_trust_anchors_text)
+        crls = self._get_text(self.pdf_crls_text)
+        timestamp_anchors = self._get_text(self.pdf_timestamp_anchors_text)
+        accept_unknown = bool(self.pdf_trust_accept_unknown_var.get())
+        online_revocation = bool(self.pdf_online_revocation_var.get())
+        allow_private = bool(self.pdf_revocation_allow_private_var.get())
+        required_policies = self.pdf_required_policies_var.get()
+        timestamp_required_policies = (
+            self.pdf_timestamp_required_policies_var.get()
+        )
+        explicit_policy = bool(self.pdf_explicit_policy_var.get())
+        inhibit_any_policy = bool(self.pdf_inhibit_any_policy_var.get())
+        inhibit_policy_mapping = bool(
+            self.pdf_inhibit_policy_mapping_var.get()
+        )
+        system_trust = bool(self.pdf_system_trust_var.get())
+        timestamp_system_trust = bool(
+            self.pdf_timestamp_system_trust_var.get()
+        )
+        try:
+            revocation_timeout = int(self.pdf_revocation_timeout_var.get())
+            if not 1 <= revocation_timeout <= 60:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid revocation timeout",
+                "Online revocation timeout must be a whole number from 1 to 60.",
+                parent=self.root,
+            )
+            return
+        if online_revocation and not messagebox.askokcancel(
+            "Allow online revocation checks?",
+            (
+                "This may contact CRL distribution-point and OCSP HTTPS/HTTP "
+                "endpoints embedded in the PDF certificates. Only certificate "
+                "serial/issuer-hash data is sent; the PDF is not sent. Continue?"
+            ),
+            parent=self.root,
+        ):
+            return
+        self._doc_tool(
+            "Validate PDF signature trust",
+            lambda: self.controller.pdf_validate_signatures(
+                path,
+                anchors,
+                crls,
+                timestamp_anchors,
+                accept_revocation_unknown=accept_unknown,
+                online_revocation=online_revocation,
+                revocation_timeout_seconds=revocation_timeout,
+                revocation_allow_private_network=allow_private,
+                required_policy_oids=required_policies,
+                timestamp_required_policy_oids=timestamp_required_policies,
+                explicit_policy_required=explicit_policy,
+                inhibit_any_policy=inhibit_any_policy,
+                inhibit_policy_mapping=inhibit_policy_mapping,
+                system_trust_anchors=system_trust,
+                timestamp_system_trust_anchors=timestamp_system_trust,
+            ),
+        )
+
+    def _pdf_sign(self) -> None:
+        path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        pkcs12_path = self.pdf_pkcs12_var.get()
+        field_name = self.pdf_signature_field_var.get()
+        reason = self.pdf_signature_reason_var.get()
+        location = self.pdf_signature_location_var.get()
+        contact_info = self.pdf_signature_contact_var.get()
+        hash_algorithm = self.pdf_signature_hash_var.get()
+        signature_profile = self.pdf_signature_profile_var.get()
+        timestamp_url = self.pdf_timestamp_url_var.get()
+        timestamp_hash = self.pdf_timestamp_hash_var.get()
+        timestamp_allow_private = bool(
+            self.pdf_timestamp_allow_private_var.get()
+        )
+        invisible = bool(self.pdf_signature_invisible_var.get())
+        certify_value = self.pdf_signature_certify_var.get()
+        certify_permission = (
+            None if certify_value == "none" else int(certify_value)
+        )
+        try:
+            page = int(self.pdf_signature_page_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid signature page",
+                "Signature page must be a whole number.",
+                parent=self.root,
+            )
+            return
+        try:
+            timestamp_timeout = int(self.pdf_timestamp_timeout_var.get())
+            if not 1 <= timestamp_timeout <= 60:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid timestamp timeout",
+                "Timestamp timeout must be a whole number from 1 to 60 seconds.",
+                parent=self.root,
+            )
+            return
+        rectangle: tuple[float, float, float, float] | None = None
+        if not invisible:
+            try:
+                numbers = tuple(
+                    float(part.strip())
+                    for part in self.pdf_signature_rect_var.get().split(",")
+                )
+                if len(numbers) != 4:
+                    raise ValueError
+                rectangle = numbers  # type: ignore[assignment]
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid signature rectangle",
+                    "Use x,y,width,height in PDF points, for example: "
+                    "36,36,200,40",
+                    parent=self.root,
+                )
+                return
+        if not messagebox.askokcancel(
+            "Sign PDF",
+            (
+                "Sign this PDF into a new output file with the selected "
+                "PKCS#12 identity? The source PDF will not change. If it "
+                "already has valid signatures, the new output will be an "
+                "incremental update and the previous signed revision will "
+                "be preserved byte-for-byte.\n\n"
+                f"PDF: {path}\n"
+                f"Output: {output_path}\n"
+                f"Identity: {pkcs12_path}\n"
+                f"Field: {field_name or 'automatic'}\n"
+                f"Page: {page}\n"
+                f"Hash: {hash_algorithm}\n"
+                f"Profile: {signature_profile}\n"
+                f"RFC 3161 TSA: {timestamp_url.strip() or 'none'}\n"
+                "If a TSA is set, only a hash of the generated CMS signature "
+                "value is sent to that exact HTTPS URL; the PDF, private key "
+                "and PKCS#12 password are not sent.\n"
+                f"Certificate/TSA trust will not be evaluated."
+            ),
+            parent=self.root,
+        ):
+            return
+        password = self._ask_pdf_password("Sign PDF", "PKCS#12 password:")
+        if password is None:
+            return
+        self._doc_tool(
+            "Sign PDF",
+            lambda: self.controller.pdf_sign(
+                path,
+                output_path,
+                pkcs12_path,
+                password=password,
+                field_name=field_name,
+                create_field=True,
+                page=page,
+                rectangle=rectangle,
+                reason=reason,
+                location=location,
+                contact_info=contact_info,
+                certify_permission=certify_permission,
+                hash_algorithm=hash_algorithm,
+                signature_profile=signature_profile,
+                timestamp_url=timestamp_url,
+                timestamp_hash_algorithm=timestamp_hash,
+                timestamp_timeout_seconds=timestamp_timeout,
+                timestamp_allow_private_network=timestamp_allow_private,
+            ),
+        )
+
+    def _pdf_document_timestamp(self) -> None:
+        path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        field_name = self.pdf_signature_field_var.get()
+        timestamp_url = self.pdf_timestamp_url_var.get()
+        timestamp_hash = self.pdf_timestamp_hash_var.get()
+        timestamp_allow_private = bool(
+            self.pdf_timestamp_allow_private_var.get()
+        )
+        try:
+            page = int(self.pdf_signature_page_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid DocTimeStamp page",
+                "DocTimeStamp page must be a whole number.",
+                parent=self.root,
+            )
+            return
+        try:
+            timestamp_timeout = int(self.pdf_timestamp_timeout_var.get())
+            if not 1 <= timestamp_timeout <= 60:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid timestamp timeout",
+                "Timestamp timeout must be a whole number from 1 to 60 seconds.",
+                parent=self.root,
+            )
+            return
+        if not timestamp_url.strip():
+            messagebox.showerror(
+                "TSA URL required",
+                "Enter the exact RFC 3161 TSA HTTPS URL before adding a "
+                "DocTimeStamp.",
+                parent=self.root,
+            )
+            return
+        if not messagebox.askokcancel(
+            "Add DocTimeStamp",
+            (
+                "Append an RFC 3161 DocTimeStamp to this PDF in a new "
+                "output file? No signer signature or PKCS#12 identity will "
+                "be used. The source will remain an exact byte prefix and "
+                "every existing valid signature/timestamp must verify "
+                "again.\n\n"
+                f"PDF: {path}\n"
+                f"Output: {output_path}\n"
+                f"Field: {field_name or 'DocTimeStamp (automatic)'}\n"
+                f"Page for a new invisible field: {page}\n"
+                f"Hash: {timestamp_hash}\n"
+                f"RFC 3161 TSA: {timestamp_url.strip()}\n"
+                "Only a hash of the new document revision (excluding the "
+                "reserved token bytes) is sent to that exact HTTPS URL; "
+                "the PDF itself is not sent. TSA trust will not be evaluated."
+            ),
+            parent=self.root,
+        ):
+            return
+        self._doc_tool(
+            "Add PDF DocTimeStamp",
+            lambda: self.controller.pdf_document_timestamp(
+                path,
+                output_path,
+                timestamp_url,
+                field_name=field_name,
+                create_field=True,
+                page=page,
+                hash_algorithm=timestamp_hash,
+                timeout_seconds=timestamp_timeout,
+                allow_private_network=timestamp_allow_private,
+            ),
+        )
+
+    def _pdf_inspect_ltv(self) -> None:
+        path = self.doc_input_var.get()
+        self._doc_tool(
+            "Inspect PDF LTV DSS",
+            lambda: self.controller.pdf_inspect_ltv(path),
+        )
+
+    def _pdf_add_ltv(self) -> None:
+        path = self.doc_input_var.get()
+        output_path = self.doc_output_var.get()
+        certificates = self._get_text(self.pdf_trust_anchors_text)
+        crls = self._get_text(self.pdf_crls_text)
+        ocsps = self._get_text(self.pdf_ocsp_responses_text)
+        seal_timestamp = bool(self.pdf_ltv_seal_timestamp_var.get())
+        timestamp_url = self.pdf_timestamp_url_var.get() if seal_timestamp else ""
+        timestamp_field = self.pdf_signature_field_var.get()
+        timestamp_hash = self.pdf_timestamp_hash_var.get()
+        timestamp_allow_private = bool(
+            self.pdf_timestamp_allow_private_var.get()
+        )
+        page = 1
+        timestamp_timeout = 15
+        if seal_timestamp:
+            try:
+                page = int(self.pdf_signature_page_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid DocTimeStamp page",
+                    "DocTimeStamp page must be a whole number.",
+                    parent=self.root,
+                )
+                return
+            try:
+                timestamp_timeout = int(self.pdf_timestamp_timeout_var.get())
+                if not 1 <= timestamp_timeout <= 60:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid timestamp timeout",
+                    "Timestamp timeout must be a whole number from 1 to 60 seconds.",
+                    parent=self.root,
+                )
+                return
+            if not timestamp_url.strip():
+                messagebox.showerror(
+                    "TSA URL required",
+                    "Enter the exact RFC 3161 TSA HTTPS URL or clear the "
+                    "DSS sealing option.",
+                    parent=self.root,
+                )
+                return
+        certificate_count = len(
+            [line for line in certificates.splitlines() if line.strip()]
+        )
+        crl_count = len([line for line in crls.splitlines() if line.strip()])
+        ocsp_count = len([line for line in ocsps.splitlines() if line.strip()])
+        seal_text = (
+            "The DSS will then be sealed with a DocTimeStamp; only a hash "
+            "of the sealed revision is sent to the exact TSA URL."
+            if seal_timestamp
+            else "No DocTimeStamp seal will be added in this operation."
+        )
+        if not messagebox.askokcancel(
+            "Add LTV DSS",
+            (
+                "Append a Document Security Store to this signed PDF in a "
+                "new output file? Relevant embedded certificates plus the "
+                "explicit local materials below will be embedded. "
+                "Irrelevant, stale, unauthorized or revoked-at-signing "
+                "evidence will refuse publication. The source remains an "
+                "exact byte prefix and every existing signed field must "
+                "verify again.\n\n"
+                f"PDF: {path}\n"
+                f"Output: {output_path}\n"
+                f"Certificate paths: {certificate_count}\n"
+                f"CRL paths: {crl_count}\n"
+                f"OCSP response paths: {ocsp_count}\n"
+                f"Seal with DocTimeStamp: {seal_timestamp}\n"
+                f"{seal_text}\n"
+                "Certificate/TSA trust, PAdES conformance and legal validity "
+                "will not be evaluated."
+            ),
+            parent=self.root,
+        ):
+            return
+        self._doc_tool(
+            "Add PDF LTV DSS",
+            lambda: self.controller.pdf_add_ltv(
+                path,
+                output_path,
+                certificates,
+                crls,
+                ocsps,
+                timestamp_url=timestamp_url,
+                timestamp_field_name=timestamp_field,
+                timestamp_create_field=True,
+                timestamp_page=page,
+                timestamp_hash_algorithm=timestamp_hash,
+                timestamp_timeout_seconds=timestamp_timeout,
+                timestamp_allow_private_network=timestamp_allow_private,
+            ),
         )
 
     def _pdf_ocr(self) -> None:

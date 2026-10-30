@@ -355,9 +355,9 @@ def test_pdf_signature_gui_controller_direct_method(tmp_path: Path) -> None:
         controller.pdf_inspect_signatures("../outside.pdf")
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.29.0"
+    assert summary.version == __version__ == "0.41.0"
     assert summary.builtin_tools == 62
-    assert "PHASE 27 PDF Signature Inspection" in summary.to_text()
+    assert "PHASE 39 Secure .env Key Cleanup" in summary.to_text()
 
 
 def test_phase27_scope_docs_schema_and_release_candidates() -> None:
@@ -365,7 +365,7 @@ def test_phase27_scope_docs_schema_and_release_candidates() -> None:
     candidates = {path.as_posix() for path in release_candidate_files(project_root)}
     ids = {item.spec.id for item in build_default_registry().list_tools()}
 
-    assert __version__ == "0.29.0"
+    assert __version__ == "0.41.0"
     assert LATEST_SCHEMA_VERSION == 6
     assert len(ids) == 62
     assert "src/pc_agent/documents/pdf_signatures.py" in candidates

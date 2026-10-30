@@ -402,7 +402,7 @@ def test_cli_deeper_office_commands(
 
     assert main([*root, "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 27 PDF Signature Inspection" in doctor
+    assert "PHASE 39 Secure .env Key Cleanup" in doctor
     assert "built-ins=62" in doctor and "office=11" in doctor
 
 

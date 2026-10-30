@@ -1,4 +1,4 @@
-# Registered tools - through Phase 27
+# Registered tools - through Phase 39
 
 Built-in tools are reviewed source-code handlers. Phase 2 adds approved
 `custom.*` dynamic tools loaded from SQLite. Both kinds expose a stable id,
@@ -141,8 +141,75 @@ planner catalogs and dynamic tools. See `docs/phase26.md`.
 Phase 27 also adds **no registered tool**. PDF digital-signature inspection
 is a direct CLI/GUI operation that verifies ByteRange digests and embedded
 CMS signatures but labels certificate trust/revocation as not evaluated. It
-is absent from planner catalogs, task execution and dynamic tools, and it
-cannot create a signature. See `docs/phase27.md`.
+is absent from planner catalogs, task execution and dynamic tools. See
+`docs/phase27.md`.
+
+Phase 28 likewise adds **no registered tool**, keeping **62 built-ins**. PDF
+signature creation accepts a private key and PKCS#12 password, so it is a
+direct CLI/GUI operation only, with hidden password entry and no task,
+planner or dynamic-tool access. See `docs/phase28.md`.
+
+Phase 29 also adds **no registered tool**. Local PDF trust-chain/CRL
+validation is direct CLI/GUI only because the user must explicitly choose the
+workspace trust anchors and CRL evidence. It is absent from planner catalogs,
+task execution and dynamic tools, and makes no network call. See
+`docs/phase29.md`.
+
+Phase 30 also adds **no registered tool**, keeping **62 built-ins**. Its
+optional RFC 3161 TSA URL belongs only to the direct signing command/GUI;
+no planner, task or dynamic tool can choose a TSA or trigger that network
+call. See `docs/phase30.md`.
+
+Phase 31 likewise adds **no registered tool**. Online CRL/OCSP revocation is
+an explicit direct CLI/GUI option on PDF trust validation; it is off by
+default, bounded, and no planner, task or dynamic tool can enable it or choose
+its certificate-embedded endpoints. See `docs/phase31.md`.
+
+Phase 32 also adds **no registered tool**. Certificate-policy requirements,
+policy inhibition/mapping controls and always-on name-constraint checks belong
+only to direct PDF trust validation; no planner, task or dynamic tool can
+set required policy OIDs or bypass a constraint failure. See
+`docs/phase32.md`.
+
+Phase 33 likewise adds **no registered tool**. Windows ROOT/OpenSSL system
+anchors are off by default and can be enabled only by the direct CLI or GUI
+user, separately for signer and TSA chains; no planner, task or dynamic tool
+can turn machine roots into trust authority. See `docs/phase33.md`.
+
+Phase 34 also adds **no registered tool**. Incremental signing reuses the
+direct Phase 28 CLI/GUI operation and its hidden PKCS#12 password boundary;
+no planner, task or dynamic tool can access a private key or append a
+signature to a signed PDF. See `docs/phase34.md`.
+
+Phase 35 likewise adds **no registered tool**. `pc-agent pdf timestamp` and
+the GUI **Add DocTimeStamp** control are direct operations because only the
+user may select the exact HTTPS TSA whose endpoint receives the new PDF
+revision's digest. No planner, task or dynamic tool can choose a TSA, append a
+DocTimeStamp or trigger that network call. See `docs/phase35.md`.
+
+Phase 36 likewise adds **no registered tool**. `pc-agent pdf inspect-ltv` /
+`pdf add-ltv` and the GUI **Inspect/Add LTV DSS** controls are direct
+operations because only the user may select the workspace certificates, CRLs,
+OCSP responses and optional TSA used to seal a DSS. No planner, task or
+dynamic tool can inspect, merge or embed LTV validation material. See
+`docs/phase36.md`.
+
+Phase 37 likewise adds **no registered tool**. The `pades-bb` choice is only
+a profile inside the existing direct CLI/GUI signer; no planner, task or
+dynamic tool can access the PKCS#12 password/private key or select the
+`ETSI.CAdES.detached` container. See `docs/phase37.md`.
+
+Phase 38 likewise adds **no registered tool**. Windows installer source
+generation and verification are direct `pc-agent release installer-source` /
+`installer-verify` operations; no planner, task or dynamic tool can stage an
+installer payload, generate Inno Setup input, or invoke the Windows compile
+helper. See `docs/phase38.md`.
+
+Phase 39 likewise adds **no registered tool**. `.env` provider-key cleanup
+is a direct `pc-agent credentials remove-env-keys` operation guarded by an
+exact Credential Manager match and user approval; no planner, task or
+dynamic tool can read, compare, or remove provider secrets. See
+`docs/phase39.md`.
 
 ## Approved dynamic tools
 

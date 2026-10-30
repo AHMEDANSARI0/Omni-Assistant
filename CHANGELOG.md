@@ -1,5 +1,269 @@
 # Changelog
 
+## 0.41.0 - PHASE 39 Secure `.env` Provider-Key Cleanup
+
+- **Verified duplicate removal**: direct `pc-agent credentials
+  remove-env-keys [provider]` removes a project-root `.env` API-key line
+  only when the identical effective value is already present in the
+  configured OS credential store. `--dry-run`, approval/`--yes`, and
+  secret-free `--json` output are supported.
+- **Fail-closed statuses**: missing, empty, unstored, and mismatched keys are
+  reported and left untouched. Duplicate lines are removed together only
+  when the loader-effective last value matches; comments, other settings,
+  line endings, and a UTF-8 BOM are preserved.
+- **Atomic, revalidated apply**: the approved plan is checked again against
+  both `.env` and the credential store, written through a verified
+  same-directory temporary file, atomically replaced, and re-read before
+  success is reported. Symlinked, malformed, oversized, unavailable-store,
+  or concurrently changed inputs refuse.
+- **No plaintext backup**: a secret-free receipt under
+  `data/credential-cleanups/` records providers, statuses, line numbers and
+  file hashes without API-key values or fingerprints. No registered tool
+  (62 built-ins), schema change or dependency. Automated suite: 510 passed,
+  1 skipped; Ruff clean.
+
+## 0.40.0 - PHASE 38 Windows Installer Source Package (unsigned)
+
+- **Deterministic installer source**: direct `pc-agent release
+  installer-source` stages the runtime subset of the allow-listed release
+  tree and generates an explicit Inno Setup 6 script plus a SHA-256 manifest.
+  It excludes tests, the real `.env`, databases, user data, virtual
+  environments, caches, private keys and patcher artifacts; existing output
+  is never overwritten.
+- **Per-user Windows setup wiring**: the generated script uses stable AppId
+  `C80BA7A3-9651-46C2-9D45-D1DADF2AD063`, `PrivilegesRequired=lowest`, and
+  `{localappdata}\Programs\Self-Healing PC Agent`; it runs the existing
+  PowerShell venv installer, creates GUI/CLI Start Menu shortcuts, and
+  uninstall preserves non-empty `data`, `workspace`, `.env` and Credential
+  Manager entries.
+- **Fail-closed verification**: direct `installer-verify` rejects wrong
+  version/AppId, unsafe or duplicate paths, missing/extra files, hash/size
+  mismatches, symbolic links, forbidden payload entries, administrator
+  mode and incomplete Inno `[Files]` wiring. Compiled files under `output/`
+  are counted but do not invalidate the source.
+- **Guarded compile helper**: `scripts/build_windows_installer.ps1` runs
+  tests/Ruff, builds/verifies fresh source, finds a locally installed Inno
+  Setup 6 `ISCC.exe`, fails clearly without downloading anything if absent,
+  and reports the compiled setup EXE SHA-256 on Windows.
+- **Honest boundary**: this is a hash-verified **unsigned** installer source
+  package, not a live-compiled/signed installer; no Authenticode,
+  SmartScreen reputation, PyInstaller bundle, admin install or automatic
+  Python/Inno download is claimed. No registered tool (62 built-ins), schema
+  change or dependency. Automated suite: 505 passed, 1 skipped; Ruff clean.
+
+## 0.39.0 - PHASE 37 PAdES Baseline B-B Signature Profile
+
+- **Optional PAdES-oriented profile**: the existing direct CLI/GUI signer can
+  create `ETSI.CAdES.detached` signatures with `--profile pades-bb` or the GUI
+  Profile selector. The legacy `adbe.pkcs7.detached` profile remains the
+  default. Generated CMS signed attributes are exactly content-type,
+  message-digest and ESS signing-certificate-v2; there is no CMS signing-time,
+  and the Signature Dictionary `/M` value provides the claimed UTC time.
+- **Verified ESS binding and B-B structure**: inspection validates the
+  signing-certificate-v2 hash and issuer/serial reference, exposes signed
+  attribute OIDs and claimed-time source, and reports
+  `bb_structure_verified` or `bb_structure_incomplete` for
+  `ETSI.CAdES.detached` signatures. New PAdES output is published only after
+  structure, ByteRange/CMS and signer-fingerprint verification pass.
+- **Bounded algorithms and workflows**: RSA/ECDSA with SHA-256/384/512,
+  ESIC ExtensionLevel 2, existing incremental/DocMDP handling and optional
+  RFC 3161 signature timestamps are supported. DSA/EdDSA identities are
+  refused for this profile and can still use the legacy signer.
+- **Honest boundary**: `bb_structure_verified` is a local structural result,
+  not ETSI certification, Adobe AATL/Acrobat trust, qualified-signature or
+  legal validity; external PAdES conformance remains
+  `not_externally_evaluated`. No registered tool (62 built-ins), schema change
+  or dependency. Automated suite: 500 passed, 1 skipped; Ruff clean.
+
+## 0.38.0 - PHASE 36 LTV DSS Embedding
+
+- **Incremental DSS/VRI embedding**: direct `pc-agent pdf inspect-ltv` and
+  `pc-agent pdf add-ltv`, plus GUI **Inspect/Add LTV DSS** controls, inspect or
+  append a catalog Document Security Store containing DER certificates, CRLs
+  and OCSP responses. Existing DSS entries are merged, the source remains an
+  exact byte prefix, and every prior approval signature/DocTimeStamp must
+  verify again before publication.
+- **Relevant-material enforcement**: signer/TSA certificates embedded in CMS
+  or timestamp tokens are collected through cryptographically verified issuer
+  links. Explicit local certificates, fresh CRLs and fresh authorized OCSP
+  responses must be relevant to a signed field; unrelated, stale, malformed,
+  unauthorized or revoked-at-signing evidence refuses publication. VRI keys
+  use the prescribed SHA-1 identifier of the complete signature Contents
+  value, including padding.
+- **Optional timestamp seal**: the new DSS can immediately be sealed with the
+  Phase 35 DocTimeStamp workflow, which sends only the sealed revision hash
+  to the exact user-selected HTTPS TSA and never sends the PDF. DSS embedding
+  itself is allowed for DocMDP P=1/P=2/P=3; the optional seal retains the
+  Phase 35 P=1 refusal.
+- **Honest boundary**: certificate/TSA trust and PAdES status remain
+  `not_evaluated`; DSS embedding is not a claim of PAdES B-LT/B-LTA, Adobe
+  LTV-enabled status or legal validity. No registered tool (62 built-ins),
+  schema change or dependency. Automated suite: 495 passed, 1 skipped; Ruff
+  clean.
+
+## 0.37.0 - PHASE 35 DocTimeStamp Incremental Revisions
+
+- **DocTimeStamp-only append**: direct `pc-agent pdf timestamp` and the GUI
+  **Add DocTimeStamp** control append one ETSI.RFC3161 `/DocTimeStamp`
+  dictionary as a true incremental revision, without a signer CMS signature,
+  PKCS#12 identity, password or local `/M` signing time.
+- **Whole-revision RFC 3161 imprint**: only the digest of the new field's
+  ByteRange bytes is sent to the exact user-selected HTTPS TSA. The source
+  remains an exact byte prefix, prior approval signatures and document
+  timestamps must verify again, and repeated operations support renewal.
+- **Fail-closed DocMDP handling**: P=1 refuses, P=2 permits only an existing
+  blank signature field, and P=3/no DocMDP permits a dedicated invisible
+  field. Invalid or unsupported existing fields never publish output; signer
+  signing after a DocTimeStamp remains refused.
+- **Honest boundary**: TSA trust remains `not_evaluated`, and this is not
+  PAdES/LTV, Adobe trust-program or legal validation. No registered tool
+  (62 built-ins), schema change or dependency. Automated suite: 489 passed,
+  1 skipped; Ruff clean.
+
+## 0.36.0 - PHASE 34 Incremental Multi-Signature Signing
+
+- **True incremental signing**: the existing direct CLI/GUI PDF signing
+  workflow can now add one detached CMS signature to an already signed PDF
+  without rewriting earlier revisions. The complete source file remains an
+  exact byte prefix of the new output, and the previous XRef-stream object
+  number is reserved to avoid reader/cache collisions on later revisions.
+- **Preservation verification**: publication requires every existing
+  signature to verify again with its original ByteRange, CMS/Contents sizes,
+  DocMDP permission and signer fingerprints, while the new signature covers
+  the whole output and matches the selected PKCS#12 certificate. Results
+  report existing, preserved and total signature counts.
+- **Fail-closed DocMDP handling**: P=1 blocks all changes, P=2 permits only
+  an existing blank signature field, P=3 also permits creating a signature
+  field, and a new certification signature is refused after any existing
+  signature. Invalid, malformed, unsupported and document-timestamp fields
+  also stop incremental signing without publishing output.
+- **Honest boundary**: no registered tool (62 built-ins), schema change,
+  dependency, trust/PAdES-LTV/legal evaluation or DocTimeStamp-only
+  incremental revision. Automated suite: 483 passed, 1 skipped; Ruff clean.
+
+## 0.35.0 - PHASE 33 System Trust Store
+
+- **Opt-in system anchors**: direct PDF signature-trust validation can merge
+  bounded CA certificates from the Windows ROOT certificate store or
+  OpenSSL's default certificate store with explicit workspace anchors.
+  Separate `--system-trust-anchors` and
+  `--timestamp-system-trust-anchors` CLI flags/GUI checkboxes keep signer and
+  TSA trust choices independent; both remain off by default.
+- **Transparent effective trust**: output reports local, system-added and
+  effective signer/TSA anchor counts plus store source and skipped entries.
+  Duplicates are removed by SHA-256 fingerprint, malformed/non-CA/wrong-
+  KeyUsage entries are skipped, and an unavailable/empty store fails closed.
+- **Security boundary**: system roots only add candidate anchors; existing
+  chain, validity, revocation, certificate-policy and name-constraint checks
+  still decide trust. Store loading makes no network/provider call and never
+  exports the full root list or certificate bytes.
+- **Honest boundary**: this is not Adobe trust-program validation
+  (`adobe_trust_status=not_evaluated`) or a complete WebPKI/PAdES/LTV/legal
+  evaluator. No OS-store modification, registered tool (62 built-ins),
+  schema change or new dependency. Automated suite: 478 passed, 1 skipped;
+  Ruff clean.
+
+## 0.34.0 - PHASE 32 Certificate Policies & Name Constraints
+
+- **Bounded certificate-policy graph**: direct signer and TSA trust chains
+  process certificate policies, required policy OIDs, explicit-policy and
+  any-policy inhibition, `PolicyConstraints`, and DER `PolicyMappings`.
+  CLI/GUI controls expose separate signer/TSA required policies; no
+  registered tool is added (62 built-ins).
+- **Always-on name constraints**: DNS, email, URI-host, IP, directory-name,
+  registered-OID and exact otherName permitted/excluded subtrees are checked
+  below each constraining CA. Unsupported candidate name forms fail closed
+  when they cannot be proven to satisfy an active constraint.
+- **Fail-closed overall statuses**: policy and name-constraint violations
+  produce `trusted_chain_policy_invalid` or
+  `trusted_chain_name_constraints_invalid`; accepting unknown revocation never
+  bypasses either failure.
+- **Honest boundary**: policy qualifiers are ignored, and this remains a
+  bounded RFC 5280 subset—not a complete WebPKI, Adobe, qualified-policy,
+  PAdES/LTV or legal validator. No OS trust store, schema change or new
+  dependency. Automated suite: 474 passed, 1 skipped; Ruff clean.
+
+## 0.33.0 - PHASE 31 Online Revocation
+
+- **Opt-in online revocation**: direct PDF signature-trust validation remains
+  offline by default and checks explicit local CRLs first. With
+  `--online-revocation` (CLI) or the GUI network checkbox/confirmation, it may
+  use certificate CRL distribution points and OCSP responders only when local
+  evidence is unknown. No registered tool is added (62 built-ins).
+- **Verified CRL/OCSP evidence**: downloaded CRLs pass the same issuer,
+  signature, key-usage, freshness and serial checks as local files. OCSP
+  responses must match the certificate/issuer hashes and freshness window and
+  be signed by the issuer or a directly delegated `OCSPSigning` responder.
+- **Bounded and fail-closed transport**: at most 3 endpoints per certificate,
+  50 requests, 5,000,000-byte CRLs, 262,144-byte OCSP responses and a 1–60
+  second timeout. Private endpoints require a separate explicit option.
+  Network, signature, freshness or authorization failures remain `unknown`.
+- **Honest boundary**: no OS/Adobe trust store, certificate-policy or
+  name-constraint engine, PAdES/LTV or legal evaluation. RSA-PSS OCSP
+  responses remain unknown because their PSS parameters are not exposed by
+  the OCSP API. Schema stays v6 and no dependency is added. Automated suite:
+  468 passed, 1 skipped; Ruff clean.
+
+## 0.32.0 - PHASE 30 RFC 3161 Timestamping
+
+- **Optional direct timestamping**: `pc-agent pdf sign --timestamp-url` and
+  GUI TSA fields request an RFC 3161 token for the newly generated CMS
+  signature value. Only its hash and a nonce are sent to the exact HTTPS TSA;
+  the PDF, private key and PKCS#12 password are never sent. No registered
+  tool is added (62 built-ins), and no TSA is contacted unless a URL is set.
+- **Verified token attachment**: granted responses must echo the nonce and
+  requested hash; TSTInfo imprint, token CMS signature, TSA validity and
+  exact critical `timeStamping` EKU are verified before the token is inserted
+  as a CMS unsigned attribute and the signed PDF is re-verified/published.
+- **Inspection and trust**: signature timestamps and `ETSI.RFC3161`
+  document timestamps are reported independently. Phase 29 accepts separate
+  TSA trust anchors (or reuses signer anchors) and uses token time only when
+  the TSA chain/CRL state is locally trusted.
+- **Honest boundary**: no default TSA, OS/Adobe trust program, OCSP/online
+  CRL fetching, incremental DocTimeStamp creation, qualified-policy,
+  PAdES/LTV or legal evaluation. Schema stays v6 and no dependency is added.
+  Automated suite: 462 passed, 1 skipped; Ruff clean.
+
+## 0.31.0 - PHASE 29 PDF Trust Validation
+
+- **Direct-only offline trust validation**: `pc-agent pdf validate-signatures`
+  and a GUI **Validate Signature Trust** control evaluate signatures that
+  pass Phase 27. No registered tool is added (62 built-ins), and no network,
+  operating-system trust store, OCSP responder or CRL download is used.
+- **Basic X.509 chain building**: embedded signer certificates are linked to
+  explicit workspace trust anchors with issuer-signature, validity-at-signing,
+  CA BasicConstraints/path-length and relevant KeyUsage checks. A self-signed
+  certificate is trusted only when supplied exactly as an anchor.
+- **Local CRL evaluation**: fresh CRLs must be signed by the selected issuer;
+  revocation is judged against CMS signing time, with later revocations
+  reported separately. `trusted_valid` requires complete passing CRL state,
+  while trusted-chain/unknown-CRL requires an explicit acceptance option.
+- **Honest boundary**: certificate policies, name constraints, OS/Adobe root
+  programs, OCSP, online CRL fetching, RFC 3161 trust, PAdES/LTV and legal
+  validity remain not evaluated. Raw certificate/CRL bytes are not reported;
+  schema stays v6 and no dependency is added. Automated suite: 457 passed,
+  1 skipped; Ruff clean.
+
+## 0.30.0 - PHASE 28 PDF Signature Creation
+
+- **Direct-only signature creation**: `pc-agent pdf sign` and a GUI
+  **Sign PDF** control sign an unencrypted unsigned PDF into a new file with a
+  workspace `.p12`/`.pfx` identity. No registered tool is added (62 built-ins),
+  so neither the planner nor a task can request a signing key or password.
+- **CMS signing**: SHA-256/384/512 detached `adbe.pkcs7.detached` signatures
+  use a selected blank Sig field or a newly created visible/invisible field;
+  optional reason, location, contact and DocMDP P1-P3 certification are
+  supported. Additional PKCS#12 certificates are embedded in the CMS.
+- **Secrets and verification**: the PKCS#12 password is hidden-prompt or
+  masked-dialog only and is never persisted or reported. The source stays
+  byte-identical, output is never overwritten, and the temporary signed PDF is
+  published only after Phase 27 verification confirms the ByteRange digest,
+  CMS signature and expected certificate fingerprint.
+- **Honest boundary**: encrypted or already signed PDFs are refused; trusted
+  roots, revocation, RFC 3161 timestamps, PAdES/LTV and legal validity remain
+  not evaluated. Schema stays v6 and no dependency is added. Automated suite:
+  453 passed, 1 skipped; Ruff clean.
+
 ## 0.29.0 - PHASE 27 PDF Signature Inspection
 
 - **Direct-only signature inspection**: `pc-agent pdf inspect-signatures`

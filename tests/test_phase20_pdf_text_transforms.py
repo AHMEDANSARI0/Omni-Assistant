@@ -547,9 +547,9 @@ def test_phase20_direct_cli_and_gui_controller(
     )
     assert gui_extract.success, gui_extract.error
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.29.0"
+    assert summary.version == __version__ == "0.41.0"
     assert summary.builtin_tools == 62
-    assert "PHASE 27 PDF Signature Inspection" in summary.to_text()
+    assert "PHASE 39 Secure .env Key Cleanup" in summary.to_text()
 
 
 def test_phase20_scope_schema_and_release_candidates() -> None:
@@ -559,7 +559,7 @@ def test_phase20_scope_schema_and_release_candidates() -> None:
         item.spec.id for item in build_default_registry().list_tools()
     }
 
-    assert __version__ == "0.29.0"
+    assert __version__ == "0.41.0"
     assert LATEST_SCHEMA_VERSION == 6
     assert len(tool_ids) == 62
     assert {

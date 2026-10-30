@@ -28,6 +28,8 @@ from ..credentials import CredentialStore, build_credential_store
 from ..desktop_automation import probe_desktop_automation
 from ..documents.office import DemoOfficeData, create_demo_office_files
 from ..documents.pdf import DemoPdfData, create_demo_pdfs
+from ..documents.pdf_document_timestamps import add_pdf_document_timestamp
+from ..documents.pdf_ltv import add_pdf_ltv_material, inspect_pdf_dss
 from ..documents.pdf_security import (
     DEFAULT_PDF_PERMISSIONS,
     inspect_pdf_security,
@@ -35,6 +37,8 @@ from ..documents.pdf_security import (
     unprotect_pdf,
 )
 from ..documents.pdf_signatures import inspect_pdf_signatures
+from ..documents.pdf_signing import sign_pdf
+from ..documents.pdf_trust import validate_pdf_signature_trust
 from ..domain.task import Task, TaskStatus
 from ..errors import ApprovalUnavailableError, PcAgentError, ToolError
 from ..http_tls import tls_trust_info
@@ -180,7 +184,7 @@ class DoctorSummary:
             [
                 (
                     f"Self-Healing PC Agent {self.version} "
-                    "(PHASE 27 PDF Signature Inspection)"
+                    "(PHASE 39 Secure .env Key Cleanup)"
                 ),
                 f"Python: {self.python_version}",
                 f"Environment: {self.environment}",
@@ -1460,6 +1464,358 @@ class GuiController:
             },
         )
 
+    def pdf_sign(
+        self,
+        path: str,
+        output_path: str,
+        pkcs12_path: str,
+        password: str,
+        *,
+        field_name: str = "",
+        create_field: bool = True,
+        page: int = 1,
+        rectangle: tuple[float, float, float, float] | None = (
+            36.0,
+            36.0,
+            200.0,
+            40.0,
+        ),
+        reason: str = "",
+        location: str = "",
+        contact_info: str = "",
+        certify_permission: int | None = None,
+        hash_algorithm: str = "sha256",
+        signature_profile: str = "adbe",
+        timestamp_url: str = "",
+        timestamp_hash_algorithm: str = "sha256",
+        timestamp_timeout_seconds: int = 15,
+        timestamp_allow_private_network: bool = False,
+        timestamp_opener: object | None = None,
+    ) -> ToolResult:
+        """Direct GUI-only signing; private key/password never enter a task."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        output = self._workspace_pdf_path(
+            _require(output_path, "signed PDF output file"),
+            must_exist=False,
+        )
+        identity = self._workspace_identity_path(
+            _require(pkcs12_path, "PKCS#12 identity file")
+        )
+        try:
+            result = sign_pdf(
+                source,
+                output,
+                pkcs12_path=identity,
+                pkcs12_password=password,
+                field_name=field_name.strip() or None,
+                create_field=create_field,
+                page=page,
+                rectangle=rectangle,
+                reason=reason.strip() or None,
+                location=location.strip() or None,
+                contact_info=contact_info.strip() or None,
+                certify_permission=certify_permission,
+                hash_algorithm=hash_algorithm,
+                signature_profile=signature_profile,
+                timestamp_url=timestamp_url.strip() or None,
+                timestamp_hash_algorithm=timestamp_hash_algorithm,
+                timestamp_timeout_seconds=timestamp_timeout_seconds,
+                timestamp_allow_private_network=(
+                    timestamp_allow_private_network
+                ),
+                timestamp_opener=timestamp_opener,
+            )
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_sign",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        return ToolResult(
+            tool_id="direct.pdf_sign",
+            version="1.0.0",
+            success=True,
+            output={
+                "path": self._relative_workspace_path(source),
+                "output_path": self._relative_workspace_path(output),
+                **result.summary(),
+            },
+        )
+
+    def pdf_document_timestamp(
+        self,
+        path: str,
+        output_path: str,
+        timestamp_url: str,
+        *,
+        field_name: str = "",
+        create_field: bool = True,
+        page: int = 1,
+        hash_algorithm: str = "sha256",
+        timeout_seconds: int = 15,
+        allow_private_network: bool = False,
+        timestamp_opener: object | None = None,
+    ) -> ToolResult:
+        """Direct GUI-only DocTimeStamp append; no signing identity is used."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        output = self._workspace_pdf_path(
+            _require(output_path, "timestamped PDF output file"),
+            must_exist=False,
+        )
+        try:
+            result = add_pdf_document_timestamp(
+                source,
+                output,
+                timestamp_url=_require(
+                    timestamp_url, "RFC 3161 TSA HTTPS URL"
+                ),
+                field_name=field_name.strip() or None,
+                create_field=create_field,
+                page=page,
+                hash_algorithm=hash_algorithm,
+                timeout_seconds=timeout_seconds,
+                allow_private_network=allow_private_network,
+                timestamp_opener=timestamp_opener,
+            )
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_document_timestamp",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        return ToolResult(
+            tool_id="direct.pdf_document_timestamp",
+            version="1.0.0",
+            success=True,
+            output={
+                "path": self._relative_workspace_path(source),
+                "output_path": self._relative_workspace_path(output),
+                **result.summary(),
+            },
+        )
+
+    def pdf_inspect_ltv(self, path: str) -> ToolResult:
+        """Direct GUI-only DSS inspection; no trust decision is made."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        try:
+            inspection = inspect_pdf_dss(source)
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_inspect_ltv",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        return ToolResult(
+            tool_id="direct.pdf_inspect_ltv",
+            version="1.0.0",
+            success=True,
+            output={
+                "path": self._relative_workspace_path(source),
+                **inspection.summary(),
+            },
+        )
+
+    def pdf_add_ltv(
+        self,
+        path: str,
+        output_path: str,
+        certificate_paths: str = "",
+        crl_paths: str = "",
+        ocsp_response_paths: str = "",
+        *,
+        timestamp_url: str = "",
+        timestamp_field_name: str = "",
+        timestamp_create_field: bool = True,
+        timestamp_page: int = 1,
+        timestamp_hash_algorithm: str = "sha256",
+        timestamp_timeout_seconds: int = 15,
+        timestamp_allow_private_network: bool = False,
+        timestamp_opener: object | None = None,
+    ) -> ToolResult:
+        """Direct GUI-only DSS embedding from explicit local material."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        output = self._workspace_pdf_path(
+            _require(output_path, "LTV PDF output file"),
+            must_exist=False,
+        )
+        certificates = [
+            self._workspace_validation_path(
+                value,
+                label="LTV certificate",
+                suffixes={".cer", ".crt", ".der", ".pem"},
+            )
+            for value in parse_line_list(certificate_paths)
+        ]
+        crls = [
+            self._workspace_validation_path(
+                value,
+                label="CRL",
+                suffixes={".crl", ".der", ".pem"},
+            )
+            for value in parse_line_list(crl_paths)
+        ]
+        ocsps = [
+            self._workspace_validation_path(
+                value,
+                label="OCSP response",
+                suffixes={".der", ".ocsp", ".pem"},
+            )
+            for value in parse_line_list(ocsp_response_paths)
+        ]
+        try:
+            result = add_pdf_ltv_material(
+                source,
+                output,
+                certificate_paths=certificates,
+                crl_paths=crls,
+                ocsp_response_paths=ocsps,
+                timestamp_url=timestamp_url.strip() or None,
+                timestamp_field_name=timestamp_field_name.strip() or None,
+                timestamp_create_field=timestamp_create_field,
+                timestamp_page=timestamp_page,
+                timestamp_hash_algorithm=timestamp_hash_algorithm,
+                timestamp_timeout_seconds=timestamp_timeout_seconds,
+                timestamp_allow_private_network=(
+                    timestamp_allow_private_network
+                ),
+                timestamp_opener=timestamp_opener,
+            )
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_add_ltv",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        return ToolResult(
+            tool_id="direct.pdf_add_ltv",
+            version="1.0.0",
+            success=True,
+            output={
+                "path": self._relative_workspace_path(source),
+                "output_path": self._relative_workspace_path(output),
+                **result.summary(),
+            },
+        )
+
+    def pdf_validate_signatures(
+        self,
+        path: str,
+        trust_anchor_paths: str = "",
+        crl_paths: str = "",
+        timestamp_trust_anchor_paths: str = "",
+        *,
+        accept_revocation_unknown: bool = False,
+        online_revocation: bool = False,
+        revocation_timeout_seconds: int = 10,
+        revocation_allow_private_network: bool = False,
+        required_policy_oids: str = "",
+        timestamp_required_policy_oids: str = "",
+        explicit_policy_required: bool = False,
+        inhibit_any_policy: bool = False,
+        inhibit_policy_mapping: bool = False,
+        system_trust_anchors: bool = False,
+        timestamp_system_trust_anchors: bool = False,
+    ) -> ToolResult:
+        """Direct GUI-only trust validation; offline unless explicitly enabled."""
+
+        self._require_license(FEATURE_DOCUMENTS)
+        source = self._workspace_pdf_path(
+            _require(path, "PDF file"), must_exist=True
+        )
+        anchors = [
+            self._workspace_validation_path(
+                value,
+                label="trust-anchor",
+                suffixes={".cer", ".crt", ".der", ".pem"},
+            )
+            for value in parse_line_list(trust_anchor_paths)
+        ]
+        timestamp_anchors = [
+            self._workspace_validation_path(
+                value,
+                label="timestamp-trust-anchor",
+                suffixes={".cer", ".crt", ".der", ".pem"},
+            )
+            for value in parse_line_list(timestamp_trust_anchor_paths)
+        ]
+        crls = [
+            self._workspace_validation_path(
+                value,
+                label="CRL",
+                suffixes={".crl", ".der", ".pem"},
+            )
+            for value in parse_line_list(crl_paths)
+        ]
+        try:
+            validation = validate_pdf_signature_trust(
+                source,
+                trust_anchor_paths=anchors,
+                crl_paths=crls,
+                timestamp_trust_anchor_paths=timestamp_anchors,
+                online_revocation=online_revocation,
+                revocation_timeout_seconds=revocation_timeout_seconds,
+                revocation_allow_private_network=revocation_allow_private_network,
+                required_policy_oids=required_policy_oids,
+                timestamp_required_policy_oids=timestamp_required_policy_oids,
+                explicit_policy_required=explicit_policy_required,
+                inhibit_any_policy=inhibit_any_policy,
+                inhibit_policy_mapping=inhibit_policy_mapping,
+                system_trust_anchors=system_trust_anchors,
+                timestamp_system_trust_anchors=timestamp_system_trust_anchors,
+            )
+        except PcAgentError as exc:
+            return ToolResult(
+                tool_id="direct.pdf_validate_signatures",
+                version="1.0.0",
+                success=False,
+                error=str(exc),
+            )
+        signed = [
+            item
+            for item in validation.signatures
+            if item.overall_status != "unsigned"
+        ]
+        accepted = {"trusted_valid"}
+        if accept_revocation_unknown:
+            accepted.add("trusted_chain_revocation_unknown")
+        success = bool(signed) and all(
+            item.overall_status in accepted for item in signed
+        )
+        return ToolResult(
+            tool_id="direct.pdf_validate_signatures",
+            version="1.0.0",
+            success=success,
+            output={
+                "path": self._relative_workspace_path(source),
+                **validation.summary(),
+            },
+            error=(
+                None
+                if success
+                else "One or more signed signatures did not reach trusted_valid."
+            ),
+        )
+
     def pdf_inspect_signatures(self, path: str) -> ToolResult:
         """Direct GUI-only signature inspection; not a registered tool."""
 
@@ -1775,6 +2131,45 @@ class GuiController:
             raise PcAgentError("PDF password paths must end with .pdf.")
         if must_exist and not resolved.is_file():
             raise PcAgentError(f"PDF file not found: {raw_path}")
+        return resolved
+
+    def _workspace_identity_path(self, raw_path: str) -> Path:
+        self.settings.ensure_directories()
+        candidate = Path(raw_path.strip()).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.settings.workspace_dir / candidate
+        resolved = candidate.resolve()
+        workspace = self.settings.workspace_dir.resolve()
+        if not resolved.is_relative_to(workspace):
+            raise PcAgentError("The PKCS#12 path must stay inside the workspace.")
+        if resolved.suffix.lower() not in {".p12", ".pfx"}:
+            raise PcAgentError("The signing identity must be a .p12 or .pfx file.")
+        if not resolved.is_file():
+            raise PcAgentError(f"PKCS#12 identity file not found: {raw_path}")
+        return resolved
+
+    def _workspace_validation_path(
+        self,
+        raw_path: str,
+        *,
+        label: str,
+        suffixes: set[str],
+    ) -> Path:
+        self.settings.ensure_directories()
+        candidate = Path(raw_path.strip()).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.settings.workspace_dir / candidate
+        resolved = candidate.resolve()
+        workspace = self.settings.workspace_dir.resolve()
+        if not resolved.is_relative_to(workspace):
+            raise PcAgentError(f"The {label} path must stay inside the workspace.")
+        if resolved.is_dir():
+            return resolved
+        if not resolved.is_file():
+            raise PcAgentError(f"{label} file or folder not found: {raw_path}")
+        if resolved.suffix.lower() not in suffixes:
+            allowed = ", ".join(sorted(suffixes))
+            raise PcAgentError(f"The {label} file must use one of: {allowed}.")
         return resolved
 
     def _relative_workspace_path(self, path: Path) -> str:

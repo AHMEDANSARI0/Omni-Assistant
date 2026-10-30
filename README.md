@@ -5,7 +5,7 @@ secure, lightweight, extensible agent that plans and executes user tasks with
 explicit permissions, verifies results deterministically, and reports honestly
 what it did.
 
-## Current status: PHASE 24 - Online signed update download (this build)
+## Current status: PHASE 39 - Secure `.env` provider-key cleanup (this build)
 
 | Status | Capability |
 |---|---|
@@ -42,7 +42,19 @@ what it did.
 | Implemented + tested (Phase 25) | PDF form workflows — `pdf.inspect_form` and `pdf.fill_form` (62 built-ins) inspect/fill interactive fields already present in a bounded AcroForm. Text, single/multi-select choice, checkbox and radio/button states are validated; unknown, read-only, signature and pushbutton fields are refused for filling. The source is never modified and the output is never overwritten; temporary output is reopened to verify changed and untouched values, orchestrated tasks repeat source/output inspection, and output-collision recovery preserves existing files. Direct CLI, deterministic task flags and GUI Documents controls are included. No form creation/design, password flow, OCR, flattening, digital signing, schema migration or new runtime dependency |
 | Implemented + tested (Phase 26) | Direct-only PDF password security: `pc-agent pdf security|protect|unprotect` and GUI masked dialogs inspect encryption, write new AES-256 protected copies, change user/owner passwords, and write new unencrypted copies after the current password is verified. Passwords are collected only through hidden prompts and are never tool/task/CLI arguments or persisted results; no registered tool is added (62 built-ins). Sources/outputs are never overwritten, digitally signed PDFs are refused because rewriting can invalidate signatures, and temporary outputs are verified with right/wrong passwords, permissions and page counts before publication. No password recovery/cracking, digital signing or schema migration; `pypdf[crypto]` supplies AES |
 | Implemented + tested (Phase 27) | Direct-only PDF digital-signature inspection: `pc-agent pdf inspect-signatures` and a GUI Documents control report signature fields, ByteRange coverage, DocMDP permissions, CMS digest/CMS-signature verification, signing time and embedded X.509 certificate details. A locally consistent signature is labelled `cryptographically_valid_untrusted`; trusted-root, revocation, RFC 3161 timestamp and legal-policy checks are explicitly not evaluated. No registered tool (62 built-ins), signature creation, network access, schema migration or new dependency |
-| Later | Signed Windows installer/Authenticode, optional true background auto-update service, macOS/Linux packaging, PDF signature creation/trusted validation workflows |
+| Implemented + tested (Phase 28) | Direct-only PDF digital-signature creation: `pc-agent pdf sign` and a GUI **Sign PDF** control sign an unencrypted unsigned PDF into a new file with a workspace PKCS#12 identity. The PKCS#12 password is collected only through a hidden prompt/masked dialog; no registered tool or planner surface exists. SHA-256/384/512 detached CMS, existing or newly created visible/invisible fields and optional DocMDP P1-P3 are supported. The source is unchanged, output is never overwritten, and publication requires the Phase 27 verifier to confirm the CMS/ByteRange and expected certificate fingerprint. Trust/revocation remains not evaluated; no schema migration or new dependency |
+| Implemented + tested (Phase 29) | Direct-only offline PDF signature trust validation: `pc-agent pdf validate-signatures` and a GUI **Validate Signature Trust** control build a bounded basic X.509 chain from each cryptographically valid signer to explicit workspace trust anchors and evaluate explicit local CRL files. Validity at CMS signing time, CA/path-length/key-usage basics, exact issuer signatures, fresh CRL signatures and revocation at signing time are checked. `trusted_valid` requires a trusted chain plus passing CRL state; no OS/browser trust store, network, OCSP, RFC 3161, policy/PAdES-LTV/legal evaluation, registered tool (62 built-ins), schema migration or new dependency |
+| Implemented + tested (Phase 30) | Optional direct RFC 3161 timestamping for new PDF signatures: an exact user-supplied HTTPS TSA receives only the generated CMS signature-value hash (never PDF/key/password), the nonce-bound token is verified for TSTInfo imprint/CMS signature/TSA EKU and inserted as a CMS unsigned attribute, and publication re-verifies it. Inspection also recognizes `ETSI.RFC3161` document timestamps. Phase 29 can chain the TSA to explicit local anchors/CRLs and use a trusted token time instead of local CMS time. No default TSA, OS/Adobe trust program, OCSP/online CRL, incremental DocTimeStamp creation, PAdES/LTV/legal evaluation, registered tool (62), schema migration or new dependency |
+| Implemented + tested (Phase 31) | Opt-in online revocation for direct PDF signature-trust validation: local CRLs remain first and offline is the default. When explicitly enabled, bounded CRL distribution-point downloads are verified like local CRLs, then OCSP responses are checked for issuer hashes/serial, freshness, signature and issuer-or-delegated `OCSPSigning` responder authority. Network or authorization failures remain `unknown`, never trusted. CLI/GUI expose timeout and private-PKI endpoint controls; no OS/Adobe trust store, certificate-policy/name-constraint engine, PAdES/LTV/legal evaluation, registered tool (62), schema migration or new dependency |
+| Implemented + tested (Phase 32) | Bounded certificate-policy and name-constraint validation for direct PDF signer/TSA chains: required signer/TSA policy OIDs, explicit-policy and any-policy/mapping inhibition, PolicyConstraints and DER PolicyMappings are processed, and DNS/email/URI/IP/directory/registered-OID/otherName constraints are always checked. Violations produce dedicated non-trusted statuses and cannot be bypassed by accepting unknown revocation. CLI/GUI controls are included; policy qualifiers, full WebPKI/qualified policy programs, OS/Adobe trust stores, PAdES/LTV/legal evaluation, registered tool (62), schema migration and new dependencies remain out of scope |
+| Implemented + tested (Phase 33) | Opt-in system trust-store anchors for direct PDF signature validation: separate signer/TSA CLI/GUI switches merge bounded CA certificates from the Windows ROOT store or OpenSSL default certificate store with explicit workspace anchors, deduplicate by fingerprint and report source/local/system/effective counts. Store loading failures fail closed and make no network call; all chain, policy/name-constraint and revocation checks still apply. Adobe trust remains explicitly not evaluated; no OS-store modification, registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 34) | Incremental multi-signature PDF signing in the existing direct CLI/GUI workflow: an already signed PDF receives one more CMS signature as a true incremental update, preserving the complete source revision as an exact byte prefix and re-verifying every previous signature, ByteRange and signer fingerprint before publication. Existing blank fields or new fields are supported subject to DocMDP P1/P2/P3 rules; invalid/unsupported existing signatures and document timestamps are refused. No registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 35) | Direct-only DocTimeStamp incremental revisions: `pc-agent pdf timestamp` and a GUI **Add DocTimeStamp** control append one ETSI.RFC3161 `/DocTimeStamp` dictionary without a signer signature or PKCS#12 identity. The exact source remains a byte prefix, only the new revision's ByteRange digest is sent to the user-selected HTTPS TSA, and publication re-verifies every prior approval/timestamp plus the whole-file token. DocMDP P1/P2/P3 is enforced, renewal by repeated operations is supported, and signing after a DocTimeStamp remains refused. TSA trust/PAdES-LTV/legal validity remains not evaluated; no registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 36) | Direct-only LTV DSS embedding: `pc-agent pdf inspect-ltv` / `pdf add-ltv` and GUI **Inspect/Add LTV DSS** controls append or inspect an incremental catalog Document Security Store with DER signer/TSA certificates, explicit local CRLs/OCSP responses and VRI entries keyed by the complete signature Contents value. Existing DSS material is merged, irrelevant/stale/unauthorized or revoked-at-signing evidence refuses publication, the source remains an exact byte prefix, and an optional Phase 35 DocTimeStamp can seal the new DSS. It verifies material relevance but does not evaluate certificate/TSA trust or claim PAdES B-LT/B-LTA, Adobe LTV-enabled or legal status; no registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 37) | Optional direct PAdES Baseline B-B-oriented signature profile in the existing CLI/GUI signer: `--profile pades-bb` creates an `ETSI.CAdES.detached` CMS with exactly content-type, message-digest and ESS signing-certificate-v2 signed attributes, no CMS signing-time, `/M` as the claimed UTC signing time, ESIC ExtensionLevel 2 and whole-file ByteRange coverage. RSA/ECDSA with SHA-256/384/512, incremental signing and optional RFC 3161 signature timestamps are supported. Inspection verifies the ESS certificate binding and reports `bb_structure_verified` or `bb_structure_incomplete`; trust and external PAdES/Adobe/legal conformance remain not evaluated. The legacy `adbe` profile stays the default; no registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 38) | Deterministic unsigned Windows installer source package: `pc-agent release installer-source` stages the runtime release subset (no tests, real `.env`, data or private keys), generates an explicit per-user Inno Setup 6 script and SHA-256 manifest, and `installer-verify` fails closed on tamper/unsafe wiring. A guarded PowerShell helper can compile it with locally installed ISCC on Windows. The installer runs the existing venv setup, creates GUI/CLI shortcuts, and uninstall preserves user data/workspace/`.env`/credentials. No compiled EXE, Authenticode, SmartScreen reputation, registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 39) | Secure direct-only `.env` provider-key cleanup: `pc-agent credentials remove-env-keys` plans or removes a provider line only when its identical effective value is already verified in the OS credential store. Mismatched, missing, empty or unavailable-store keys stay untouched; approved changes are revalidated and atomically applied without a plaintext backup, with a secret-free receipt. No registered tool (62), schema migration or dependency |
+| Later | Authenticode signing, real vendor HTTPS update-feed hosting/configuration, optional true background auto-update service, macOS/Linux packaging, Adobe trust-program integration and externally verified full WebPKI/qualified-policy or PAdES workflows |
 
 This build **does not** claim arbitrary computer control, arbitrary generated
 programs, full browser automation, password/coordinate UI control, AI
@@ -66,13 +78,13 @@ server, or cloud account yet.
 New installs apply the patchers in order: 1A, 1B, 1C, Phase 2, Phase 3,
 Phase 4, the Phase 4.1 hotfix, Phase 5, Phase 6, Phase 7, Phase 8, Phase 9,
 Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15, Phase 16,
-the Phase 16.1 hotfix, Phase 17, Phase 18, Phase 19, Phase 20, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, Phase 26, then Phase 27. The
-Phase 27 patcher is cumulative: it upgrades an existing Phase 9 (0.11.0)
-through Phase 26 (0.28.0) install:
+the Phase 16.1 hotfix, Phase 17, Phase 18, Phase 19, Phase 20, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, Phase 26, Phase 27, Phase 28, Phase 29, Phase 30, Phase 31, Phase 32, Phase 33, Phase 34, Phase 35, Phase 36, Phase 37, Phase 38, then Phase 39. The
+Phase 39 patcher is cumulative: it upgrades an existing Phase 9 (0.11.0)
+through Phase 38 (0.40.0) install:
 
 ```powershell
 cd D:\omni-assistant   # your project folder
-node PHASE_27_PDF_SIGNATURE_INSPECTION.mjs
+node PHASE_39_SECURE_ENV_KEY_CLEANUP.mjs
 
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -86,15 +98,28 @@ pc-agent workflow list
 pc-agent gui --check
 ```
 
-Phase 27 adds direct-only PDF signature inspection without a registered
-tool, so the count stays 62 built-ins and the database schema stays **v6**.
-Reinstalling refreshes the editable package metadata to 0.29.0; no new
+Phase 39 adds secure `.env` provider-key cleanup without a registered tool,
+so the count stays 62 built-ins and the database schema stays **v6**.
+Reinstalling refreshes the editable package metadata to 0.41.0; no new
 dependency is added beyond Phase 26's `pypdf[crypto]`. Your current `.env`
 keys keep taking precedence. Run `pc-agent credentials migrate` only when
-you want to copy them into Windows Credential Manager; the command does not
-edit `.env`, so remove migrated `*_API_KEY` lines yourself only after
-verifying the route. See `docs/phase27.md` for signature inspection and
-remaining work, `docs/phase26.md` for PDF password workflows,
+you want to copy them into Windows Credential Manager; that command still
+does not edit `.env`. Afterwards, `pc-agent credentials remove-env-keys`
+can remove only lines whose identical value is verified in Credential
+Manager. See `docs/phase39.md` for secure cleanup,
+`docs/phase38.md` for the Windows installer source
+package, `docs/phase37.md` for the PAdES B-B signature
+profile, `docs/phase36.md` for LTV DSS embedding,
+`docs/phase35.md` for DocTimeStamp incremental
+revisions, `docs/phase34.md` for incremental multi-signature
+signing, `docs/phase33.md` for system trust-store anchors,
+`docs/phase32.md` for certificate policies/name constraints and remaining
+work, `docs/phase31.md` for online CRL/OCSP
+revocation, `docs/phase30.md` for RFC 3161 timestamping,
+`docs/phase29.md` for local trust-chain/CRL validation,
+`docs/phase28.md` for signature creation,
+`docs/phase27.md` for signature inspection,
+`docs/phase26.md` for PDF password workflows,
 `docs/phase25.md` for PDF form workflows,
 `docs/phase24.md` for the online update trust model,
 `docs/phase23.md` for PDF table extraction,
@@ -492,7 +517,9 @@ virtual environments and caches:
 ```powershell
 pc-agent release audit
 pc-agent release build
-pc-agent release verify workspace\self-healing-pc-agent-v0.29.0-portable.zip
+pc-agent release verify workspace\self-healing-pc-agent-v0.41.0-portable.zip
+pc-agent release installer-source
+pc-agent release installer-verify workspace\windows-installer-v0.41.0
 ```
 
 Use `pc-agent maintenance backup|list|verify|restore` for verified local
@@ -502,6 +529,29 @@ redacted support file with counts and statuses but no keys, task
 instructions, memory values or document contents. Plain-text Windows
 install, uninstall and release-build scripts live in `scripts\`. See
 `docs/phase18.md` for the exact safety boundaries and limitations.
+
+## Windows installer source package (Phase 38, unsigned)
+
+`pc-agent release installer-source` creates a hash-manifested runtime payload
+and an explicit per-user Inno Setup 6 script; `installer-verify` re-checks it
+without compiling. On Windows, `scripts\build_windows_installer.ps1` rebuilds
+and verifies that source, then uses a locally installed `ISCC.exe` to create
+an unsigned setup EXE and prints its SHA-256. Inno Setup is never downloaded
+automatically. The compiled installer still uses the existing
+`install_windows.ps1` Python environment flow and uninstall preserves
+non-empty `data`, `workspace`, `.env` and Credential Manager entries. There
+is no Authenticode certificate or SmartScreen reputation claim yet. See
+`docs/phase38.md`.
+
+## Secure `.env` provider-key cleanup (Phase 39)
+
+After `pc-agent credentials migrate`, run
+`pc-agent credentials remove-env-keys --dry-run` to see which duplicated
+provider values are exactly verified in secure OS storage. Applying the
+command requires approval (or `--yes`), removes only `verified_match`
+lines, revalidates against concurrent changes, and writes a secret-free
+receipt under `data\credential-cleanups\`. It never makes a plaintext backup.
+Mismatched or unstored keys remain in `.env`. See `docs/phase39.md`.
 
 ## Direct Anthropic provider (Phase 19)
 

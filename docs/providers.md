@@ -1,4 +1,4 @@
-# AI providers - through Phase 27
+# AI providers - through Phase 39
 
 ## Implemented adapters
 
@@ -75,10 +75,45 @@ makes no provider call; AI planning cannot propose either form tool. Phase
 prompts and PDF bytes are never sent to a provider, and no AI planner can
 request or receive a PDF password. Phase 27 PDF signature inspection is
 also local direct-only CMS/certificate analysis; signed PDF bytes and
-certificate material are never sent to a provider. See
-`docs/phase18.md`, `docs/phase19.md`, `docs/phase20.md`, `docs/phase21.md`,
-`docs/phase22.md`, `docs/phase23.md`, `docs/phase24.md`,
-`docs/phase25.md`, `docs/phase26.md` and `docs/phase27.md`.
+certificate material are never sent to a provider. Phase 28 PDF signature
+creation is likewise local and direct-only: PKCS#12 bytes, private keys,
+passwords and PDF bytes never enter a provider request or an AI plan. Phase
+29 trust validation is also local and offline: explicit trust-anchor/CRL
+material and signed-PDF bytes are never sent to a provider or network
+endpoint. Phase 30's optional TSA contact is not an AI-provider call: only
+the direct user-selected HTTPS TSA receives a CMS signature-value hash and
+nonce; PDF bytes, private keys and passwords are never sent. Phase 31's
+optional CRL/OCSP contact is also not an AI-provider call: only after a
+direct user enables it, certificate-embedded revocation endpoints receive a
+bounded CRL GET or an OCSP request containing certificate serial/issuer-hash
+data; signed-PDF bytes are never sent. Phase 32 certificate-policy and
+name-constraint evaluation is local/direct-only and makes no provider call.
+Phase 33 reads CA anchors from the local Windows ROOT or OpenSSL store only
+after a direct user opts in; it sends no data to a provider or network.
+Phase 34 incremental PDF signing is local direct-only processing; signed PDF
+bytes, PKCS#12 material, private keys and passwords are never sent to a
+provider. Phase 35's DocTimeStamp TSA contact is also not an AI-provider
+call: only the direct user-selected HTTPS TSA receives a digest of the new
+PDF revision's ByteRange bytes and a nonce; the PDF itself is never sent.
+Phase 36's DSS inspection and local material embedding make no provider call;
+its optional DocTimeStamp seal uses the same digest-only direct TSA boundary.
+Phase 37's PAdES B-B CMS generation and ESS inspection are local direct-only
+processing; its optional signature timestamp retains the Phase 30
+digest-only TSA boundary and sends no PDF, key or password to a provider.
+Phase 38's Windows installer source build and verification are also local
+direct-only operations: they send no files, provider keys or user data to a
+provider or network endpoint, and the separately invoked Inno compiler is a
+local Windows build tool rather than an AI-provider call. Phase 39's `.env`
+cleanup compares local secret copies only to decide whether a duplicated
+line may be removed; it prints no key, creates no plaintext backup, and
+makes no provider or network call. See
+`docs/phase18.md`, `docs/phase19.md`, `docs/phase20.md`,
+`docs/phase21.md`, `docs/phase22.md`, `docs/phase23.md`, `docs/phase24.md`,
+`docs/phase25.md`, `docs/phase26.md`, `docs/phase27.md`,
+`docs/phase28.md`, `docs/phase29.md`, `docs/phase30.md`,
+`docs/phase31.md`, `docs/phase32.md`, `docs/phase33.md`,
+`docs/phase34.md`, `docs/phase35.md`, `docs/phase36.md`,
+`docs/phase37.md`, `docs/phase38.md` and `docs/phase39.md`.
 
 ## Routing and retries
 

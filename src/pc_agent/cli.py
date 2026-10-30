@@ -40,6 +40,8 @@ from .desktop_automation import probe_desktop_automation
 from .diagnostics import build_diagnostics, export_diagnostics
 from .documents.office import create_demo_office_files
 from .documents.pdf import create_demo_pdfs
+from .documents.pdf_document_timestamps import add_pdf_document_timestamp
+from .documents.pdf_ltv import add_pdf_ltv_material, inspect_pdf_dss
 from .documents.pdf_security import (
     DEFAULT_PDF_PERMISSIONS,
     PDF_PERMISSION_NAMES,
@@ -48,7 +50,18 @@ from .documents.pdf_security import (
     unprotect_pdf,
 )
 from .documents.pdf_signatures import inspect_pdf_signatures
+from .documents.pdf_signing import (
+    SUPPORTED_SIGNATURE_HASHES,
+    SUPPORTED_SIGNATURE_PROFILES,
+    sign_pdf,
+)
+from .documents.pdf_trust import validate_pdf_signature_trust
 from .domain.task import Task, TaskStatus
+from .env_cleanup import (
+    PROVIDER_API_KEY_ENV_NAMES,
+    apply_env_key_cleanup,
+    plan_env_key_cleanup,
+)
 from .errors import ApprovalUnavailableError, PcAgentError, ToolBuilderError
 from .http_tls import tls_trust_info
 from .licensing import (
@@ -99,6 +112,10 @@ from .updates import (
     list_updates,
     rollback_update,
     stage_update,
+)
+from .windows_installer import (
+    build_windows_installer_source,
+    verify_windows_installer_source,
 )
 
 
@@ -392,7 +409,7 @@ def _add_desktop_element_selector_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent",
-        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 27)",
+        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 39)",
     )
     parser.add_argument("--version", action="version", version=f"pc-agent {__version__}")
     parser.add_argument(
@@ -754,6 +771,23 @@ def build_parser() -> argparse.ArgumentParser:
         "provider", nargs="?", default=None, choices=credential_provider_choices
     )
     credential_migrate_parser.add_argument("--yes", action="store_true")
+    credential_remove_env_parser = credentials_subparsers.add_parser(
+        "remove-env-keys",
+        help=(
+            "Remove .env provider keys only when the identical key is "
+            "already verified in secure OS storage"
+        ),
+    )
+    credential_remove_env_parser.add_argument(
+        "provider", nargs="?", default=None, choices=credential_provider_choices
+    )
+    credential_remove_env_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the verified cleanup plan without changing .env",
+    )
+    credential_remove_env_parser.add_argument("--yes", action="store_true")
+    credential_remove_env_parser.add_argument("--json", action="store_true")
 
     self_repair_parser = subparsers.add_parser(
         "self-repair",
@@ -843,6 +877,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--files", action="store_true", help="Also list every bundled file"
     )
     release_info_parser.add_argument("--json", action="store_true")
+    release_installer_source_parser = release_subparsers.add_parser(
+        "installer-source",
+        help="Build a hash-verified unsigned Inno Setup source package (no EXE/signing)",
+    )
+    release_installer_source_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Installer source directory (must not exist)",
+    )
+    release_installer_source_parser.add_argument("--json", action="store_true")
+    release_installer_verify_parser = release_subparsers.add_parser(
+        "installer-verify",
+        help="Verify an Inno Setup source package without compiling it",
+    )
+    release_installer_verify_parser.add_argument("source", type=Path)
+    release_installer_verify_parser.add_argument("--json", action="store_true")
 
     update_parser = subparsers.add_parser(
         "update",
@@ -1512,6 +1563,278 @@ def build_parser() -> argparse.ArgumentParser:
     signatures_parser.add_argument("path", help="PDF path relative to the workspace")
     signatures_parser.add_argument("--json", action="store_true")
 
+    validate_signatures_parser = pdf_subparsers.add_parser(
+        "validate-signatures",
+        help=(
+            "Local trust-chain/CRL validation using explicit workspace trust "
+            "anchors (optional online CRL/OCSP fallback)"
+        ),
+    )
+    validate_signatures_parser.add_argument(
+        "path", help="PDF path relative to the workspace"
+    )
+    validate_signatures_parser.add_argument(
+        "--trust-anchor",
+        action="append",
+        default=[],
+        help="Workspace .pem/.crt/.cer/.der file or folder; repeat as needed",
+    )
+    validate_signatures_parser.add_argument(
+        "--timestamp-trust-anchor",
+        action="append",
+        default=[],
+        help=(
+            "Workspace TSA trust-anchor file or folder; repeat as needed. "
+            "Defaults to --trust-anchor values when omitted"
+        ),
+    )
+    validate_signatures_parser.add_argument(
+        "--crl",
+        action="append",
+        default=[],
+        help="Workspace .crl/.pem/.der file or folder; repeat as needed",
+    )
+    validate_signatures_parser.add_argument(
+        "--accept-revocation-unknown",
+        action="store_true",
+        help="Treat a trusted chain with unknown revocation status as a passing result",
+    )
+    validate_signatures_parser.add_argument(
+        "--online-revocation",
+        action="store_true",
+        help=(
+            "Explicitly allow bounded CRL distribution-point and OCSP "
+            "requests embedded in certificates when local CRL status is unknown"
+        ),
+    )
+    validate_signatures_parser.add_argument(
+        "--revocation-timeout",
+        type=int,
+        default=10,
+        metavar="SECONDS",
+        help="Per-request online-revocation timeout, 1-60 seconds (default: 10)",
+    )
+    validate_signatures_parser.add_argument(
+        "--allow-private-revocation-network",
+        action="store_true",
+        help=(
+            "Allow private/loopback CRL or OCSP endpoints; use only for a "
+            "trusted local/intranet PKI (downloaded evidence remains signed)"
+        ),
+    )
+    validate_signatures_parser.add_argument(
+        "--required-policy",
+        action="append",
+        default=[],
+        metavar="OID",
+        help=(
+            "Required signer certificate-policy OID; repeat or comma-separate. "
+            "Name constraints are always evaluated"
+        ),
+    )
+    validate_signatures_parser.add_argument(
+        "--timestamp-required-policy",
+        action="append",
+        default=[],
+        metavar="OID",
+        help="Required TSA certificate-policy OID; repeat or comma-separate",
+    )
+    validate_signatures_parser.add_argument(
+        "--explicit-policy",
+        action="store_true",
+        help="Require a non-empty valid certificate-policy graph",
+    )
+    validate_signatures_parser.add_argument(
+        "--inhibit-any-policy",
+        action="store_true",
+        help="Do not let anyPolicy act as a wildcard below the leaf",
+    )
+    validate_signatures_parser.add_argument(
+        "--inhibit-policy-mapping",
+        action="store_true",
+        help="Disable certificate PolicyMappings processing",
+    )
+    validate_signatures_parser.add_argument(
+        "--system-trust-anchors",
+        action="store_true",
+        help=(
+            "Also trust CA certificates from the Windows ROOT store or "
+            "OpenSSL default certificate store for signer chains"
+        ),
+    )
+    validate_signatures_parser.add_argument(
+        "--timestamp-system-trust-anchors",
+        action="store_true",
+        help="Also use system CA certificates for RFC 3161 TSA chains",
+    )
+    validate_signatures_parser.add_argument("--json", action="store_true")
+
+    sign_parser = pdf_subparsers.add_parser(
+        "sign",
+        help=(
+            "Sign an unencrypted PDF with a .p12/.pfx identity, using an "
+            "incremental update when valid signatures already exist "
+            "(PKCS#12 password is always prompted hidden)"
+        ),
+    )
+    sign_parser.add_argument("path", help="PDF path relative to the workspace")
+    sign_parser.add_argument("--output", required=True)
+    sign_parser.add_argument("--pkcs12", required=True)
+    sign_parser.add_argument("--field", default=None)
+    sign_parser.add_argument("--create-field", action="store_true")
+    sign_parser.add_argument("--page", type=int, default=1)
+    sign_parser.add_argument("--rect", default="36,36,200,40")
+    sign_parser.add_argument("--invisible", action="store_true")
+    sign_parser.add_argument("--reason", default=None)
+    sign_parser.add_argument("--location", default=None)
+    sign_parser.add_argument("--contact", default=None)
+    sign_parser.add_argument(
+        "--certify",
+        type=int,
+        choices=(1, 2, 3),
+        default=None,
+        help="Optional DocMDP permission 1, 2 or 3",
+    )
+    sign_parser.add_argument(
+        "--hash",
+        choices=SUPPORTED_SIGNATURE_HASHES,
+        default="sha256",
+        dest="hash_algorithm",
+    )
+    sign_parser.add_argument(
+        "--profile",
+        choices=SUPPORTED_SIGNATURE_PROFILES,
+        default="adbe",
+        dest="signature_profile",
+        help=(
+            "Signature container: legacy adbe.pkcs7.detached or "
+            "PAdES-oriented pades-bb (ETSI.CAdES.detached)"
+        ),
+    )
+    sign_parser.add_argument(
+        "--timestamp-url",
+        default=None,
+        help="Optional exact HTTPS RFC 3161 TSA URL; only the CMS signature hash is sent",
+    )
+    sign_parser.add_argument(
+        "--timestamp-hash",
+        choices=SUPPORTED_SIGNATURE_HASHES,
+        default="sha256",
+        dest="timestamp_hash_algorithm",
+    )
+    sign_parser.add_argument("--timestamp-timeout", type=int, default=15)
+    sign_parser.add_argument(
+        "--timestamp-allow-private",
+        action="store_true",
+        help="Allow this exact TSA URL to resolve to a private/non-standard-port address",
+    )
+    sign_parser.add_argument("--json", action="store_true")
+
+    document_timestamp_parser = pdf_subparsers.add_parser(
+        "timestamp",
+        help=(
+            "Append an ETSI.RFC3161 DocTimeStamp incremental revision; "
+            "the exact HTTPS TSA receives only a hash of the new revision"
+        ),
+    )
+    document_timestamp_parser.add_argument(
+        "path", help="PDF path relative to the workspace"
+    )
+    document_timestamp_parser.add_argument("--output", required=True)
+    document_timestamp_parser.add_argument(
+        "--timestamp-url",
+        required=True,
+        help="Exact HTTPS RFC 3161 TSA URL; the PDF itself is never sent",
+    )
+    document_timestamp_parser.add_argument("--field", default=None)
+    document_timestamp_parser.add_argument(
+        "--create-field", action="store_true"
+    )
+    document_timestamp_parser.add_argument("--page", type=int, default=1)
+    document_timestamp_parser.add_argument(
+        "--timestamp-hash",
+        choices=SUPPORTED_SIGNATURE_HASHES,
+        default="sha256",
+        dest="timestamp_hash_algorithm",
+    )
+    document_timestamp_parser.add_argument(
+        "--timestamp-timeout", type=int, default=15
+    )
+    document_timestamp_parser.add_argument(
+        "--timestamp-allow-private",
+        action="store_true",
+        help="Allow this exact TSA URL to resolve to a private/non-standard-port address",
+    )
+    document_timestamp_parser.add_argument("--json", action="store_true")
+
+    inspect_ltv_parser = pdf_subparsers.add_parser(
+        "inspect-ltv",
+        help="Inspect a PDF Document Security Store (DSS/VRI); trust is not evaluated",
+    )
+    inspect_ltv_parser.add_argument(
+        "path", help="PDF path relative to the workspace"
+    )
+    inspect_ltv_parser.add_argument("--json", action="store_true")
+
+    add_ltv_parser = pdf_subparsers.add_parser(
+        "add-ltv",
+        help=(
+            "Append an incremental DSS/VRI revision using embedded and "
+            "explicit local certificate/CRL/OCSP material"
+        ),
+    )
+    add_ltv_parser.add_argument("path", help="PDF path relative to the workspace")
+    add_ltv_parser.add_argument("--output", required=True)
+    add_ltv_parser.add_argument(
+        "--certificate",
+        action="append",
+        default=[],
+        dest="certificate_paths",
+        help="Workspace certificate .pem/.crt/.cer/.der file or folder; repeat",
+    )
+    add_ltv_parser.add_argument(
+        "--crl",
+        action="append",
+        default=[],
+        dest="crl_paths",
+        help="Workspace CRL .crl/.pem/.der file or folder; repeat",
+    )
+    add_ltv_parser.add_argument(
+        "--ocsp-response",
+        action="append",
+        default=[],
+        dest="ocsp_response_paths",
+        help="Workspace OCSP response .ocsp/.pem/.der file or folder; repeat",
+    )
+    add_ltv_parser.add_argument(
+        "--timestamp-url",
+        default=None,
+        help=(
+            "Optional exact HTTPS RFC 3161 TSA URL to seal the DSS with a "
+            "new DocTimeStamp; only a revision hash is sent"
+        ),
+    )
+    add_ltv_parser.add_argument(
+        "--timestamp-field", default=None, dest="timestamp_field"
+    )
+    add_ltv_parser.add_argument(
+        "--timestamp-create-field", action="store_true"
+    )
+    add_ltv_parser.add_argument("--timestamp-page", type=int, default=1)
+    add_ltv_parser.add_argument(
+        "--timestamp-hash",
+        choices=SUPPORTED_SIGNATURE_HASHES,
+        default="sha256",
+        dest="timestamp_hash_algorithm",
+    )
+    add_ltv_parser.add_argument("--timestamp-timeout", type=int, default=15)
+    add_ltv_parser.add_argument(
+        "--timestamp-allow-private",
+        action="store_true",
+        help="Allow this exact TSA URL to resolve to a private/non-standard-port address",
+    )
+    add_ltv_parser.add_argument("--json", action="store_true")
+
     ocr_parser = pdf_subparsers.add_parser(
         "ocr",
         help="OCR up to 10 scanned PDF pages with gated vision (approval required)",
@@ -1924,7 +2247,7 @@ def _run_doctor(settings: Settings, *, as_json: bool = False) -> int:
     )
     print(
         f"Self-Healing PC Agent {__version__} "
-        "(PHASE 27 PDF Signature Inspection)"
+        "(PHASE 39 Secure .env Key Cleanup)"
     )
     print(f"Python: {platform.python_version()}")
     print(f"Environment: {summary['environment']}")
@@ -2966,6 +3289,63 @@ def _workspace_pdf_path(
     return resolved
 
 
+def _workspace_identity_path(settings: Settings, raw_path: str) -> Path:
+    settings.ensure_directories()
+    candidate = Path(raw_path.strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = settings.workspace_dir / candidate
+    resolved = candidate.resolve()
+    workspace = settings.workspace_dir.resolve()
+    if not resolved.is_relative_to(workspace):
+        raise PcAgentError("The PKCS#12 path must stay inside the workspace.")
+    if resolved.suffix.lower() not in {".p12", ".pfx"}:
+        raise PcAgentError("The signing identity must be a .p12 or .pfx file.")
+    if not resolved.is_file():
+        raise PcAgentError(f"PKCS#12 identity file not found: {raw_path}")
+    return resolved
+
+
+def _parse_signature_rectangle(value: str) -> tuple[float, float, float, float]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 4:
+        raise PcAgentError(
+            "The signature rectangle must be x,y,width,height; for example: "
+            "36,36,200,40"
+        )
+    try:
+        numbers = tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise PcAgentError("The signature rectangle contains an invalid number.") from exc
+    if len(numbers) != 4:
+        raise PcAgentError("The signature rectangle must contain four numbers.")
+    return numbers  # type: ignore[return-value]
+
+
+def _workspace_validation_path(
+    settings: Settings,
+    raw_path: str,
+    *,
+    label: str,
+    suffixes: set[str],
+) -> Path:
+    settings.ensure_directories()
+    candidate = Path(raw_path.strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = settings.workspace_dir / candidate
+    resolved = candidate.resolve()
+    workspace = settings.workspace_dir.resolve()
+    if not resolved.is_relative_to(workspace):
+        raise PcAgentError(f"The {label} path must stay inside the workspace.")
+    if resolved.is_dir():
+        return resolved
+    if not resolved.is_file():
+        raise PcAgentError(f"{label} file or folder not found: {raw_path}")
+    if resolved.suffix.lower() not in suffixes:
+        allowed = ", ".join(sorted(suffixes))
+        raise PcAgentError(f"The {label} file must use one of: {allowed}.")
+    return resolved
+
+
 def _relative_workspace_path(settings: Settings, path: Path) -> str:
     return path.resolve().relative_to(settings.workspace_dir.resolve()).as_posix()
 
@@ -3131,6 +3511,253 @@ def _run_pdf_security_command(settings: Settings, args: argparse.Namespace) -> i
         return _pdf_security_failure(exc, as_json=as_json)
 
 
+def _run_pdf_sign_command(settings: Settings, args: argparse.Namespace) -> int:
+    """Run Phase 28 direct-only signing without a tool/task/password argument."""
+
+    as_json = bool(getattr(args, "json", False))
+    try:
+        source = _workspace_pdf_path(settings, args.path, must_exist=True)
+        output = _workspace_pdf_path(settings, args.output, must_exist=False)
+        identity = _workspace_identity_path(settings, args.pkcs12)
+        rectangle = (
+            None if args.invisible else _parse_signature_rectangle(args.rect)
+        )
+        password = _prompt_pdf_password("PKCS#12 password")
+        result = sign_pdf(
+            source,
+            output,
+            pkcs12_path=identity,
+            pkcs12_password=password,
+            field_name=args.field,
+            create_field=args.create_field,
+            page=args.page,
+            rectangle=rectangle,
+            reason=args.reason,
+            location=args.location,
+            contact_info=args.contact,
+            certify_permission=args.certify,
+            hash_algorithm=args.hash_algorithm,
+            signature_profile=args.signature_profile,
+            timestamp_url=args.timestamp_url,
+            timestamp_hash_algorithm=args.timestamp_hash_algorithm,
+            timestamp_timeout_seconds=args.timestamp_timeout,
+            timestamp_allow_private_network=args.timestamp_allow_private,
+        )
+    except PcAgentError as exc:
+        return _pdf_security_failure(exc, as_json=as_json)
+
+    payload = {
+        "path": _relative_workspace_path(settings, source),
+        "output_path": _relative_workspace_path(settings, output),
+        **result.summary(),
+    }
+    if as_json:
+        print(
+            json.dumps(
+                {"success": True, "output": payload, "error": None},
+                indent=2,
+            )
+        )
+    else:
+        print(f"PDF signed: {output.name}")
+        print(f"Signer: {result.signer_subject}")
+        print(f"Field: {result.field_name} | status: {result.status}")
+        print(
+            f"Profile: {result.signature_profile} | SubFilter: "
+            f"{result.signature_sub_filter} | PAdES structure: "
+            f"{result.pades_profile_status}"
+        )
+        print(
+            "Mode: "
+            f"{'incremental update' if result.incremental_update else 'new signature'} "
+            f"| preserved valid signatures: "
+            f"{result.preserved_valid_signature_count} | total signed: "
+            f"{result.total_signature_count}"
+        )
+        print(f"Certificate SHA-256: {result.certificate_sha256}")
+        if result.timestamp_status is not None:
+            print(
+                f"RFC 3161 timestamp: {result.timestamp_status} | "
+                f"time: {result.timestamp_time} | TSA: {result.tsa_subject}"
+            )
+        print(
+            "Local cryptographic verification passed. Certificate/TSA trust, "
+            "revocation and legal validity were not evaluated."
+        )
+    return 0
+
+
+def _run_pdf_document_timestamp_command(
+    settings: Settings, args: argparse.Namespace
+) -> int:
+    """Run direct-only DocTimeStamp append without any signing key."""
+
+    as_json = bool(getattr(args, "json", False))
+    try:
+        source = _workspace_pdf_path(settings, args.path, must_exist=True)
+        output = _workspace_pdf_path(settings, args.output, must_exist=False)
+        result = add_pdf_document_timestamp(
+            source,
+            output,
+            timestamp_url=args.timestamp_url,
+            field_name=args.field,
+            create_field=args.create_field,
+            page=args.page,
+            hash_algorithm=args.timestamp_hash_algorithm,
+            timeout_seconds=args.timestamp_timeout,
+            allow_private_network=args.timestamp_allow_private,
+        )
+    except PcAgentError as exc:
+        return _pdf_security_failure(exc, as_json=as_json)
+
+    payload = {
+        "path": _relative_workspace_path(settings, source),
+        "output_path": _relative_workspace_path(settings, output),
+        **result.summary(),
+    }
+    if as_json:
+        print(
+            json.dumps(
+                {"success": True, "output": payload, "error": None},
+                indent=2,
+            )
+        )
+    else:
+        print(f"PDF document timestamp appended: {output.name}")
+        print(f"Field: {result.field_name} | status: {result.status}")
+        print(
+            f"RFC 3161 DocTimeStamp: {result.timestamp_status} | time: "
+            f"{result.timestamp_time} | TSA: {result.tsa_subject}"
+        )
+        print(
+            "Mode: incremental update | preserved valid fields: "
+            f"{result.preserved_valid_count} | total signed fields: "
+            f"{result.total_signed_field_count}"
+        )
+        print(
+            "Local cryptographic verification passed. TSA trust, revocation "
+            "and legal validity were not evaluated."
+        )
+    return 0
+
+
+def _run_pdf_ltv_command(settings: Settings, args: argparse.Namespace) -> int:
+    """Run direct-only DSS inspection or LTV material embedding."""
+
+    as_json = bool(getattr(args, "json", False))
+    try:
+        source = _workspace_pdf_path(settings, args.path, must_exist=True)
+        source_label = _relative_workspace_path(settings, source)
+        if args.pdf_command == "inspect-ltv":
+            inspection = inspect_pdf_dss(source)
+            payload = {"path": source_label, **inspection.summary()}
+            if as_json:
+                print(
+                    json.dumps(
+                        {"success": True, "output": payload, "error": None},
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"PDF LTV DSS: {source_label}")
+                print(
+                    f"Present: {inspection.present} | certificates: "
+                    f"{inspection.certificate_count} | CRLs: "
+                    f"{inspection.crl_count} | OCSP responses: "
+                    f"{inspection.ocsp_count} | VRI entries: "
+                    f"{inspection.vri_count}"
+                )
+                for item in inspection.vri:
+                    fields = ", ".join(item.field_names) or "unmapped"
+                    print(f"  VRI {item.identifier}: {fields}")
+                print(
+                    "DSS structure was parsed locally. Certificate/TSA "
+                    "trust, PAdES conformance and legal validity were not "
+                    "evaluated."
+                )
+            return 0
+
+        output = _workspace_pdf_path(settings, args.output, must_exist=False)
+        certificates = [
+            _workspace_validation_path(
+                settings,
+                value,
+                label="LTV certificate",
+                suffixes={".cer", ".crt", ".der", ".pem"},
+            )
+            for value in args.certificate_paths
+        ]
+        crls = [
+            _workspace_validation_path(
+                settings,
+                value,
+                label="CRL",
+                suffixes={".crl", ".der", ".pem"},
+            )
+            for value in args.crl_paths
+        ]
+        ocsps = [
+            _workspace_validation_path(
+                settings,
+                value,
+                label="OCSP response",
+                suffixes={".der", ".ocsp", ".pem"},
+            )
+            for value in args.ocsp_response_paths
+        ]
+        result = add_pdf_ltv_material(
+            source,
+            output,
+            certificate_paths=certificates,
+            crl_paths=crls,
+            ocsp_response_paths=ocsps,
+            timestamp_url=args.timestamp_url,
+            timestamp_field_name=args.timestamp_field,
+            timestamp_create_field=args.timestamp_create_field,
+            timestamp_page=args.timestamp_page,
+            timestamp_hash_algorithm=args.timestamp_hash_algorithm,
+            timestamp_timeout_seconds=args.timestamp_timeout,
+            timestamp_allow_private_network=args.timestamp_allow_private,
+        )
+    except PcAgentError as exc:
+        return _pdf_security_failure(exc, as_json=as_json)
+
+    payload = {
+        "path": source_label,
+        "output_path": _relative_workspace_path(settings, output),
+        **result.summary(),
+    }
+    if as_json:
+        print(
+            json.dumps(
+                {"success": True, "output": payload, "error": None},
+                indent=2,
+            )
+        )
+    else:
+        print(f"PDF LTV DSS appended: {output.name}")
+        print(
+            f"Certificates: {result.certificate_count} | CRLs: "
+            f"{result.crl_count} | OCSP responses: {result.ocsp_count} | "
+            f"VRI entries: {result.vri_count}"
+        )
+        print(
+            "Mode: incremental update | preserved valid fields: "
+            f"{result.preserved_valid_count} | total signed fields: "
+            f"{result.total_signed_field_count}"
+        )
+        if result.timestamp_requested:
+            print(
+                f"DocTimeStamp seal: {result.timestamp_status} | field: "
+                f"{result.timestamp_field_name} | time: {result.timestamp_time}"
+            )
+        print(
+            "Embedded material was verified as relevant. Certificate/TSA "
+            "trust, PAdES conformance and legal validity were not evaluated."
+        )
+    return 0
+
+
 def _run_pdf_signature_command(
     settings: Settings, args: argparse.Namespace
 ) -> int:
@@ -3210,6 +3837,21 @@ def _run_pdf_signature_command(
             )
             if signer.signing_time:
                 print(f"    CMS signing time: {signer.signing_time}")
+            if signer.timestamp is not None:
+                print(
+                    "    RFC 3161 timestamp: "
+                    f"{signer.timestamp.status} | time="
+                    f"{signer.timestamp.generation_time} | imprint="
+                    f"{signer.timestamp.message_imprint_matches} | policy="
+                    f"{signer.timestamp.policy_oid}"
+                )
+        if signature.document_timestamp is not None:
+            print(
+                "    RFC 3161 document timestamp: "
+                f"{signature.document_timestamp.status} | time="
+                f"{signature.document_timestamp.generation_time} | imprint="
+                f"{signature.document_timestamp.message_imprint_matches}"
+            )
         for certificate in signature.certificates:
             print(
                 "    Certificate: "
@@ -3221,12 +3863,174 @@ def _run_pdf_signature_command(
     return 0 if success else 1
 
 
+def _run_pdf_trust_command(settings: Settings, args: argparse.Namespace) -> int:
+    """Run direct-only chain/revocation validation (offline by default)."""
+
+    as_json = bool(getattr(args, "json", False))
+    try:
+        source = _workspace_pdf_path(settings, args.path, must_exist=True)
+        source_label = _relative_workspace_path(settings, source)
+        anchors = [
+            _workspace_validation_path(
+                settings,
+                value,
+                label="trust-anchor",
+                suffixes={".cer", ".crt", ".der", ".pem"},
+            )
+            for value in args.trust_anchor
+        ]
+        timestamp_anchors = [
+            _workspace_validation_path(
+                settings,
+                value,
+                label="timestamp-trust-anchor",
+                suffixes={".cer", ".crt", ".der", ".pem"},
+            )
+            for value in args.timestamp_trust_anchor
+        ]
+        crls = [
+            _workspace_validation_path(
+                settings,
+                value,
+                label="CRL",
+                suffixes={".crl", ".der", ".pem"},
+            )
+            for value in args.crl
+        ]
+        validation = validate_pdf_signature_trust(
+            source,
+            trust_anchor_paths=anchors,
+            crl_paths=crls,
+            timestamp_trust_anchor_paths=timestamp_anchors,
+            online_revocation=bool(getattr(args, "online_revocation", False)),
+            revocation_timeout_seconds=getattr(args, "revocation_timeout", 10),
+            revocation_allow_private_network=bool(
+                getattr(args, "allow_private_revocation_network", False)
+            ),
+            required_policy_oids=getattr(args, "required_policy", []),
+            timestamp_required_policy_oids=getattr(
+                args, "timestamp_required_policy", []
+            ),
+            explicit_policy_required=bool(getattr(args, "explicit_policy", False)),
+            inhibit_any_policy=bool(getattr(args, "inhibit_any_policy", False)),
+            inhibit_policy_mapping=bool(
+                getattr(args, "inhibit_policy_mapping", False)
+            ),
+            system_trust_anchors=bool(
+                getattr(args, "system_trust_anchors", False)
+            ),
+            timestamp_system_trust_anchors=bool(
+                getattr(args, "timestamp_system_trust_anchors", False)
+            ),
+        )
+    except PcAgentError as exc:
+        return _pdf_security_failure(exc, as_json=as_json)
+
+    signed = [
+        item for item in validation.signatures if item.overall_status != "unsigned"
+    ]
+    accepted = {"trusted_valid"}
+    if args.accept_revocation_unknown:
+        accepted.add("trusted_chain_revocation_unknown")
+    success = bool(signed) and all(item.overall_status in accepted for item in signed)
+    payload = {"path": source_label, **validation.summary()}
+    error = (
+        None
+        if success
+        else "One or more signed signatures did not reach trusted_valid."
+    )
+    if as_json:
+        print(
+            json.dumps(
+                {"success": success, "output": payload, "error": error},
+                indent=2,
+            )
+        )
+        return 0 if success else 1
+
+    print(f"PDF signature trust: {source_label}")
+    print(
+        f"Signed: {validation.inspection.signed_count} | trusted valid: "
+        f"{validation.trusted_valid_count} | trusted chain/revocation unknown: "
+        f"{validation.trusted_chain_revocation_unknown_count} | revoked: "
+        f"{validation.revoked_count} | policy invalid: "
+        f"{validation.policy_invalid_count} | name-constraints invalid: "
+        f"{validation.name_constraints_invalid_count} | untrusted valid: "
+        f"{validation.untrusted_valid_count}"
+    )
+    trusted_timestamps = sum(
+        1
+        for item in validation.signatures
+        for signer in item.signers
+        if signer.timestamp_trusted
+    )
+    print(
+        f"Trust anchors: {validation.effective_trust_anchor_count} "
+        f"({len(validation.trust_anchors)} local, "
+        f"{validation.system_trust_anchor_count} system) | TSA anchors: "
+        f"{validation.effective_timestamp_trust_anchor_count} "
+        f"({len(validation.timestamp_trust_anchors)} local, "
+        f"{validation.timestamp_system_trust_anchor_count} system) | CRLs: "
+        f"{len(validation.crls)} ({validation.online_crl_count} online) | "
+        f"trusted RFC 3161 timestamps: {trusted_timestamps} | "
+        f"online revocation: {validation.online_revocation_enabled} | "
+        f"network used: {validation.revocation_network_used} | OCSP responses: "
+        f"{validation.ocsp_response_count}"
+    )
+    if validation.system_trust_source:
+        print(
+            "System trust store: "
+            f"{validation.system_trust_source} | skipped/non-CA entries: "
+            f"{validation.system_trust_skipped_count} | Adobe trust: "
+            "not evaluated"
+        )
+    for network_error in validation.revocation_network_errors:
+        print(f"  Revocation network note: {network_error}")
+    for signature in validation.signatures:
+        page_text = str(signature.page) if signature.page is not None else "?"
+        print(
+            f"  {signature.field_name} (page {page_text}): "
+            f"{signature.overall_status} | crypto="
+            f"{signature.cryptographic_status} | chain="
+            f"{signature.chain_status} | revocation="
+            f"{signature.revocation_status} | policy="
+            f"{signature.policy_status} | name-constraints="
+            f"{signature.name_constraints_status} | policy OIDs="
+            f"{','.join(signature.policy_oids) or 'none'}"
+        )
+        print(f"    {signature.status_detail}")
+        for signer in signature.signers:
+            print(
+                f"    Signer: {signer.signer_subject or 'not embedded'} | "
+                f"verification time: {signer.verification_time} "
+                f"({signer.verification_time_source})"
+            )
+            if signer.timestamp_status is not None:
+                print(
+                    "    RFC 3161: "
+                    f"{signer.timestamp_status} | chain="
+                    f"{signer.timestamp_chain_status} | trusted="
+                    f"{signer.timestamp_trusted} | time={signer.timestamp_time}"
+                )
+            for certificate in signer.chain:
+                print(
+                    f"      {certificate.role}: {certificate.subject} | "
+                    f"{certificate.sha256_fingerprint}"
+                )
+    print(
+        "Bounded basic chain, revocation, certificate-policy and "
+        "name-constraint validation only; system roots are anchors only, "
+        "Adobe trust, PAdES/LTV and legal validity were not evaluated."
+    )
+    return 0 if success else 1
+
+
 def _run_pdf_command(settings: Settings, args: argparse.Namespace) -> int:
     if args.pdf_command is None:
         print(
             "Usage: pc-agent pdf inspect|verify|merge|merge-folders|extract|split|"
             "extract-text|extract-tables|ocr|search|reorder|rotate|inspect-form|"
-            "fill-form|security|protect|unprotect|inspect-signatures ...",
+            "fill-form|security|protect|unprotect|inspect-signatures|validate-signatures|sign|timestamp|inspect-ltv|add-ltv ...",
             file=sys.stderr,
         )
         return 2
@@ -3235,6 +4039,14 @@ def _run_pdf_command(settings: Settings, args: argparse.Namespace) -> int:
         return _run_pdf_security_command(settings, args)
     if args.pdf_command == "inspect-signatures":
         return _run_pdf_signature_command(settings, args)
+    if args.pdf_command == "validate-signatures":
+        return _run_pdf_trust_command(settings, args)
+    if args.pdf_command == "sign":
+        return _run_pdf_sign_command(settings, args)
+    if args.pdf_command == "timestamp":
+        return _run_pdf_document_timestamp_command(settings, args)
+    if args.pdf_command in {"inspect-ltv", "add-ltv"}:
+        return _run_pdf_ltv_command(settings, args)
     if args.pdf_command == "ocr":
         _require_license(settings, FEATURE_PROVIDERS)
 
@@ -5651,7 +6463,8 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
     command = getattr(args, "release_command", None)
     if command is None:
         print(
-            "Usage: pc-agent release audit|build|verify|info ...",
+            "Usage: pc-agent release audit|build|verify|info|installer-source|"
+            "installer-verify ...",
             file=sys.stderr,
         )
         return 2
@@ -5672,6 +6485,21 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
         info = build_release_bundle(settings.root_dir, output)
         _print_release_bundle(info, as_json=bool(args.json), built=True)
         return 0
+    if command == "installer-source":
+        settings.ensure_directories()
+        output = (
+            _resolve_cli_path(settings, args.output)
+            if args.output is not None
+            else settings.workspace_dir / f"windows-installer-v{__version__}"
+        )
+        info = build_windows_installer_source(settings.root_dir, output)
+        _print_windows_installer_source(info, as_json=bool(args.json), built=True)
+        return 0
+    if command == "installer-verify":
+        source = _resolve_cli_path(settings, args.source, existing=True)
+        info = verify_windows_installer_source(source)
+        _print_windows_installer_source(info, as_json=bool(args.json))
+        return 0
     if command in {"verify", "info"}:
         bundle = _resolve_cli_path(settings, args.bundle, existing=True)
         info = verify_release_bundle(bundle)
@@ -5682,6 +6510,23 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
         )
         return 0
     raise PcAgentError(f"Unknown release command: {command}")
+
+
+def _print_windows_installer_source(
+    info: Any, *, as_json: bool, built: bool = False
+) -> None:
+    if as_json:
+        print(json.dumps(info.to_dict(), indent=2))
+        return
+    action = "Built and verified" if built else "Verified"
+    print(f"{action} Windows installer source: {info.summary()}")
+    print(f"Location: {info.path}")
+    print(f"AppId: {info.app_id}")
+    print(f"Script SHA-256: {info.script_sha256}")
+    print(f"Manifest SHA-256: {info.manifest_sha256}")
+    if info.compiled_output_count:
+        print(f"Ignored compiled output files: {info.compiled_output_count}")
+    print("Authenticode signing: not performed (unsigned installer source)")
 
 
 def _confirm_update_action(summary: str, *, assume_yes: bool) -> bool:
@@ -6006,7 +6851,8 @@ def _run_credentials_command(settings: Settings, args: argparse.Namespace) -> in
     command = args.credentials_command
     if command is None:
         print(
-            "Usage: pc-agent credentials status|list|set|delete|migrate ...",
+            "Usage: pc-agent credentials status|list|set|delete|migrate|"
+            "remove-env-keys ...",
             file=sys.stderr,
         )
         return 2
@@ -6138,12 +6984,125 @@ def _run_credentials_command(settings: Settings, args: argparse.Namespace) -> in
             print(f"Migrated {provider} API key.")
         print(
             "Your .env was not changed. After verifying the provider route, "
-            "remove the migrated *_API_KEY lines from .env yourself."
+            "run pc-agent credentials remove-env-keys to remove only lines "
+            "whose identical value is verified in secure OS storage."
         )
         print("Credential values were not printed.")
         return 0
 
+    if command == "remove-env-keys":
+        selected = (
+            (canonical_credential_provider(args.provider),)
+            if args.provider
+            else SUPPORTED_CREDENTIAL_PROVIDERS
+        )
+        env_path = settings.root_dir / ".env"
+        if not env_path.exists() and not env_path.is_symlink():
+            payload = {
+                "path": str(env_path),
+                "action": "no-op",
+                "selected_providers": list(selected),
+                "removable_providers": [],
+                "statuses": {
+                    provider: "not_in_dotenv" for provider in selected
+                },
+                "secret_values_included": False,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"No .env file was found at {env_path}; nothing was removed.")
+            return 0
+
+        plan = plan_env_key_cleanup(env_path, store, providers=selected)
+        if args.dry_run:
+            _print_env_cleanup_plan(plan, as_json=bool(args.json), action="dry-run")
+            return 0
+        if not plan.removable_providers:
+            _print_env_cleanup_plan(plan, as_json=bool(args.json), action="no-op")
+            return 0
+
+        retry_hint = "pc-agent credentials remove-env-keys"
+        if args.provider:
+            retry_hint += f" {selected[0]}"
+        retry_hint += " --yes"
+        if not args.json:
+            _print_env_cleanup_plan(plan, as_json=False, action="planned")
+        approved = bool(args.json and args.yes) or _confirm_direct_write(
+            "Remove verified duplicated .env API-key lines for "
+            + ", ".join(plan.removable_providers)
+            + f" ({len(plan.removed_line_numbers)} line(s)); the identical keys "
+            + f"remain in {store.backend_name}, and no plaintext backup will be created",
+            preapproved=bool(args.yes),
+            retry_hint=retry_hint,
+            heading="Approval required to remove these duplicated .env API keys:",
+        )
+        if not approved:
+            if args.json:
+                payload = plan.to_dict()
+                payload["action"] = "cancelled"
+                print(json.dumps(payload, indent=2))
+            else:
+                print("Nothing was removed.")
+            return 4
+
+        settings.ensure_directories()
+        result = apply_env_key_cleanup(
+            plan,
+            store,
+            receipt_dir=settings.data_dir / "credential-cleanups",
+        )
+        _print_env_cleanup_result(result, as_json=bool(args.json))
+        return 0
+
     return 2
+
+
+def _print_env_cleanup_plan(plan: Any, *, as_json: bool, action: str) -> None:
+    if as_json:
+        payload = plan.to_dict()
+        payload["action"] = action
+        print(json.dumps(payload, indent=2))
+        return
+    print(f".env provider-key cleanup ({action}): {plan.summary()}")
+    print(f"File: {plan.path}")
+    print(f"Credential backend: {plan.backend}")
+    for provider, status in plan.statuses:
+        print(
+            f"{provider} [{PROVIDER_API_KEY_ENV_NAMES[provider]}]: {status}"
+        )
+    if plan.process_environment_providers:
+        print(
+            "Note: API-key variables are also set in the current process "
+            "environment for "
+            + ", ".join(plan.process_environment_providers)
+            + "; removing .env lines does not change that process value."
+        )
+    print("Credential values were not printed; no plaintext backup will be created.")
+
+
+def _print_env_cleanup_result(result: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result.to_dict(), indent=2))
+        return
+    print(f".env provider-key cleanup complete: {result.summary()}")
+    print(f"File: {result.path}")
+    for provider, status in result.statuses:
+        print(f"{provider}: {status}")
+    if result.receipt_path:
+        print(f"Secret-free receipt: {result.receipt_path}")
+    if result.receipt_error:
+        print(result.receipt_error, file=sys.stderr)
+    if result.process_environment_providers:
+        print(
+            "Note: current process-level API-key variables remain set for "
+            + ", ".join(result.process_environment_providers)
+            + "."
+        )
+    print(
+        "Start a new pc-agent command or GUI session so settings reload "
+        "from secure OS storage."
+    )
 
 
 def _run_providers_command(settings: Settings, args: argparse.Namespace) -> int:
