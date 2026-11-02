@@ -1,4 +1,4 @@
-# AI providers - through Phase 39
+# AI providers - through Phase 53
 
 ## Implemented adapters
 
@@ -14,29 +14,38 @@
 
 Run `pc-agent providers list` to see the exact route on a machine. It never
 prints keys and makes no network call. Phase 16 also shows each key's
-non-secret source: `environment`, `windows-credential-manager` or
-`missing`. Phase 19 adds the direct Anthropic Messages API adapter. System
+non-secret source: `environment`, `windows-credential-manager`,
+`linux-secret-service`, `macos-keychain` or `missing`. Phase 19 adds the direct Anthropic
+Messages API adapter. System
 text is sent as top-level blocks, `max_tokens` is always bounded, and the
 adapter never emits `temperature`, `top_p` or `top_k` because API version
 `2026-10-21` removed those fields. It supports the same inline-image path as
 the other vision providers and returns Anthropic usage to the Phase 17
 budget tracker. See `docs/phase19.md`.
 
-## Credential storage (Phase 16)
+Phase 53 adds **Live Anthropic Verification**: the explicitly invoked
+`pc-agent providers verify-anthropic` command calls this adapter directly
+once with a fixed public prompt and a 32-token ceiling, bypassing router
+fallback/retries and recording only secret-safe report metadata. Use
+`pc-agent providers verify-anthropic-report` to revalidate the retained
+report offline. See `docs/phase53.md`.
+
+## Credential storage (Phase 16/44/45)
 
 Provider keys resolve in this order:
 
 1. environment variable or local `.env`;
-2. Windows Credential Manager when no environment value exists;
+2. Windows Credential Manager on Windows, Linux Secret Service on Linux, or
+   macOS Keychain on macOS when no environment value exists;
 3. missing.
 
 Use `pc-agent credentials status|list|set|delete|migrate` to manage the
-Windows generic credentials. `credentials set` reads the key twice through
-a hidden prompt and deliberately has no command-line key argument. Set
-`PC_AGENT_CREDENTIAL_STORE=env` to disable OS lookup, `windows` to select
-the Windows backend explicitly, or leave the default `auto`. See
-`docs/phase16.md` for the migration sequence and the same-Windows-user
-security boundary.
+platform OS credentials. `credentials set` reads the key twice through a
+hidden prompt and deliberately has no command-line key argument. Set
+`PC_AGENT_CREDENTIAL_STORE=env` to disable OS lookup, `windows`, `linux` or
+`macos` to select a backend explicitly, or leave the default `auto`. See
+`docs/phase16.md`, `docs/phase44.md` and `docs/phase45.md` for the migration
+sequence and same-OS-user security boundary.
 
 ## Task budgets (Phase 17)
 
@@ -106,14 +115,33 @@ provider or network endpoint, and the separately invoked Inno compiler is a
 local Windows build tool rather than an AI-provider call. Phase 39's `.env`
 cleanup compares local secret copies only to decide whether a duplicated
 line may be removed; it prints no key, creates no plaintext backup, and
-makes no provider or network call. See
+makes no provider or network call. Phase 40's vendor update-feed publisher
+is also offline: it signs and inventories local release files, excludes the
+private key from output, and sends no provider key, user data, feed, or
+bundle to an AI provider or network endpoint. Phase 41's POSIX package
+build and verification are likewise local direct-only operations and send
+no files or provider keys to a provider or network endpoint. Phase 42 is a
+test-only Windows symlink-privilege hotfix and changes no provider,
+credential, or network behavior. Phase 43 is likewise a test-only
+Windows-host POSIX compatibility hotfix with no provider or network change.
+Phase 44's Linux Secret Service calls are local desktop-session operations;
+they send provider keys only to the user's local Secret Service through
+`secret-tool` stdin and make no AI-provider or network call. Phase 45's
+macOS Keychain calls are likewise local: provider keys go only to Apple's
+local `/usr/bin/security` process, writes travel on stdin rather than argv,
+and no AI-provider or network call is made. Phase 53 is the exception by
+design only for its explicit **Live Anthropic Verification** command: it
+sends a fixed public prompt directly to Anthropic once, with no file,
+image, user prompt, router fallback or router retry. See
 `docs/phase18.md`, `docs/phase19.md`, `docs/phase20.md`,
 `docs/phase21.md`, `docs/phase22.md`, `docs/phase23.md`, `docs/phase24.md`,
 `docs/phase25.md`, `docs/phase26.md`, `docs/phase27.md`,
 `docs/phase28.md`, `docs/phase29.md`, `docs/phase30.md`,
 `docs/phase31.md`, `docs/phase32.md`, `docs/phase33.md`,
 `docs/phase34.md`, `docs/phase35.md`, `docs/phase36.md`,
-`docs/phase37.md`, `docs/phase38.md` and `docs/phase39.md`.
+`docs/phase37.md`, `docs/phase38.md`, `docs/phase39.md`,
+`docs/phase40.md`, `docs/phase41.md`, `docs/phase42.md`,
+`docs/phase43.md`, `docs/phase44.md`, `docs/phase45.md` and `docs/phase53.md`.
 
 ## Routing and retries
 
@@ -133,7 +161,8 @@ makes no provider or network call. See
 
 | Command | External provider call? |
 |---|---|
-| `providers list`, `credentials status/list`, `doctor`, GUI Dashboard/Providers refresh | No |
+| `providers list`, `providers verify-anthropic-report`, `credentials status/list`, `doctor`, GUI Dashboard/Providers refresh | No |
+| `providers verify-anthropic` | Yes — one explicit direct Anthropic text request; no fallback/retry and no vision test |
 | Supported deterministic `run` task (CLI or GUI Tasks tab) | No |
 | Direct `office`, `web fetch` or `desktop` command, or the matching GUI tab | No provider call; web fetch contacts only the exact requested site |
 | Automatic recovery retry | No; local deterministic rules only |

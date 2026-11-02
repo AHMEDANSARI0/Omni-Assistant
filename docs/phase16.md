@@ -168,3 +168,20 @@ Phase 15 Images tab.
 The stored `anthropic` credential is now consumed by the direct Anthropic
 Messages API adapter. The Phase 16 resolution order and non-secret output
 rules are unchanged. See `docs/phase19.md`.
+
+## Phase 44 note
+
+Linux now uses the same credential-store boundary through the freedesktop
+Secret Service and system `secret-tool`. `auto` selects it on Linux and
+`PC_AGENT_CREDENTIAL_STORE=linux` selects it explicitly; effective stored
+keys are labelled `linux-secret-service`. The Phase 16 Windows behavior and
+resolution order are unchanged. See `docs/phase44.md`.
+
+## Phase 45 note
+
+macOS now uses the same credential-store boundary through the user's
+Keychain and Apple's system `/usr/bin/security`. `auto` selects it on macOS
+and `PC_AGENT_CREDENTIAL_STORE=macos` selects it explicitly; effective stored
+keys are labelled `macos-keychain`. Writes use interactive stdin rather than
+argv. The Phase 16/44 Windows and Linux behavior and resolution order are
+unchanged. See `docs/phase45.md`.

@@ -208,10 +208,22 @@ def test_phase39_cleanup_fails_closed_without_touching_env(
     with pytest.raises(CredentialError, match="Invalid .env entry"):
         plan_env_key_cleanup(malformed, store, environ={})
 
+
+def test_phase39_cleanup_rejects_symlink_env_file(tmp_path: Path) -> None:
+    store, _backend = _store({"gemini": "vault-secret"})
+    env_path = tmp_path / ".env"
+    original = "GEMINI_API_KEY=vault-secret\nOTHER=keep\n"
+    _write(env_path, original)
+
     symlink = tmp_path / "linked.env"
-    symlink.symlink_to(env_path)
+    try:
+        symlink.symlink_to(env_path)
+    except OSError as exc:  # Windows may require Developer Mode/privilege.
+        pytest.skip(f"Cannot create a symlink on this machine: {exc}")
+
     with pytest.raises(CredentialError, match="not found"):
         plan_env_key_cleanup(symlink, store, environ={})
+    assert env_path.read_text(encoding="utf-8") == original
 
 
 def test_phase39_direct_cli_dry_run_denial_apply_and_json(
@@ -297,7 +309,7 @@ def test_phase39_direct_cli_dry_run_denial_apply_and_json(
 
 
 def test_phase39_scope_inventory_and_counts() -> None:
-    assert __version__ == "0.41.0"
+    assert __version__ == "0.55.0"
     assert len(build_default_registry().list_tools()) == 62
     assert LATEST_SCHEMA_VERSION == 6
     assert PROVIDER_API_KEY_ENV_NAMES == {

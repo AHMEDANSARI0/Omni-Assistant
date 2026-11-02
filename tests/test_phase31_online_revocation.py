@@ -534,7 +534,7 @@ def test_phase31_direct_cli_gui_scope_docs_and_registry() -> None:
     )
     assert "online_revocation=online_revocation" in controller_source
 
-    assert __version__ == "0.41.0"
+    assert __version__ == "0.55.0"
     assert LATEST_SCHEMA_VERSION == 6
     registry = build_default_registry()
     assert len(registry.list_tools()) == 62

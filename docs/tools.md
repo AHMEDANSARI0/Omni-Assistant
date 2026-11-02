@@ -1,4 +1,4 @@
-# Registered tools - through Phase 39
+# Registered tools - through Phase 53
 
 Built-in tools are reviewed source-code handlers. Phase 2 adds approved
 `custom.*` dynamic tools loaded from SQLite. Both kinds expose a stable id,
@@ -210,6 +210,88 @@ is a direct `pc-agent credentials remove-env-keys` operation guarded by an
 exact Credential Manager match and user approval; no planner, task or
 dynamic tool can read, compare, or remove provider secrets. See
 `docs/phase39.md`.
+
+Phase 40 likewise adds **no registered tool**. Signed update-feed
+publishing and verification live only in the separate vendor
+`pc-agent-release-admin` executable because they use the release private
+key; no planner, task or dynamic tool can sign a bundle, select a feed host,
+or publish update metadata. See `docs/phase40.md`.
+
+Phase 41 likewise adds **no registered tool**. POSIX package generation
+and verification are direct `pc-agent release posix-source` /
+`posix-verify` operations; no planner, task or dynamic tool can stage a
+Linux/macOS payload or execute its shell installer. See
+`docs/phase41.md`.
+
+Phase 42 likewise adds **no registered tool**. It is a Windows test-only
+hotfix for unprivileged symlink creation (`WinError 1314`); the 62 built-in
+tools and all runtime tool behavior are unchanged. See
+`docs/phase42.md`.
+
+Phase 43 likewise adds **no registered tool**. It is a Windows test-only
+hotfix for POSIX execute-bit/`sh` assumptions in the Phase 41 package tests;
+the 62 built-in tools and all runtime tool behavior are unchanged. See
+`docs/phase43.md`.
+
+Phase 44 likewise adds **no registered tool**. Linux Secret Service access
+is confined to the direct credential-store boundary and existing
+`pc-agent credentials` commands; no planner, task or dynamic tool can read,
+store, delete, or enumerate provider secrets beyond non-secret status. See
+`docs/phase44.md`.
+
+Phase 45 likewise adds **no registered tool**. macOS Keychain access through
+`/usr/bin/security` is confined to the same direct credential-store boundary
+and existing `pc-agent credentials` commands; effective keys are labelled
+`macos-keychain`, and no planner, task or dynamic tool gains a secret-access
+capability. See `docs/phase45.md`.
+
+Phase 46 likewise adds **no registered tool**. The
+**Windows Inno Acceptance Harness** is confined to the direct
+`pc-agent release installer-acceptance` and `installer-acceptance-verify`
+commands; no planner, task or dynamic tool can compile, install, uninstall,
+or inspect the acceptance evidence as a model-callable capability. See
+`docs/phase46.md`.
+
+Phase 47 likewise adds **no registered tool**. The
+**Native Debian Package** is confined to the direct
+`pc-agent release debian-package` and `debian-verify` commands; no planner,
+task or dynamic tool can build, install, remove, or inspect a Debian package
+as a model-callable capability. See `docs/phase47.md`.
+
+Phase 48 likewise adds **no registered tool**. The
+**Native RPM Package** is confined to the direct
+`pc-agent release rpm-package` and `rpm-verify` commands; no planner,
+task or dynamic tool can build, install, remove, or inspect an RPM package
+as a model-callable capability. See `docs/phase48.md`.
+
+Phase 49 likewise adds **no registered tool**. The
+**Windows UTF-8 Test Hotfix** changes only locale-dependent test text
+reads/writes and their regression guard; no planner, task or dynamic tool
+gains any capability. See `docs/phase49.md`.
+
+Phase 50 likewise adds **no registered tool**. The
+**Debian APT Repository** is confined to the direct
+`pc-agent release debian-repository` and `debian-repository-verify`
+commands; no planner, task or dynamic tool can publish, sign, host, install,
+or inspect an APT repository as a model-callable capability. See
+`docs/phase50.md`.
+
+Phase 51 likewise adds **no registered tool**. The
+**RPM Repository** is confined to the direct
+`pc-agent release rpm-repository` and `rpm-repository-verify` commands; no
+planner, task or dynamic tool can publish, sign, host, install, or inspect
+an RPM repository as a model-callable capability. See `docs/phase51.md`.
+
+Phase 52 likewise adds **no registered tool**. The
+**Windows Repository Timestamp Hotfix** changes only the Phase 50/51
+repository builders' cross-platform timestamp normalization; no planner,
+task or dynamic tool gains any capability. See `docs/phase52.md`.
+
+Phase 53 likewise adds **no registered tool**. 
+**Live Anthropic Verification** is confined to the direct `pc-agent providers
+verify-anthropic` and `verify-anthropic-report` commands; no planner,
+task or dynamic tool can trigger the live request or approve a report as
+a model-callable capability. See `docs/phase53.md`.
 
 ## Approved dynamic tools
 

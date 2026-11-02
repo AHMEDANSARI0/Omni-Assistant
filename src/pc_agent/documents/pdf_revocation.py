@@ -206,7 +206,7 @@ class OnlineRevocationClient:
             )
             if validated.scheme not in {"http", "https"}:
                 raise ToolError("Revocation endpoint is not HTTP(S).")
-            headers = {"User-Agent": "Self-Healing-PC-Agent/0.41 (+PDF revocation)"}
+            headers = {"User-Agent": "Self-Healing-PC-Agent/0.43 (+PDF revocation)"}
             if content_type:
                 headers["Content-Type"] = content_type
             if accept:

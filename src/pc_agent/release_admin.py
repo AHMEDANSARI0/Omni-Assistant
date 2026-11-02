@@ -13,10 +13,15 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from .errors import PcAgentError
 from .licensing.ed25519 import generate_seed, public_key_from_seed, sign
 from .release import verify_release_bundle
+from .update_feed_publisher import (
+    build_update_feed_package,
+    verify_update_feed_package,
+)
 from .updates import (
     b64url_decode,
     b64url_encode,
@@ -100,6 +105,31 @@ def _read_private_seed(path: Path) -> bytes:
     raise PcAgentError("Release private key file contains no key value.")
 
 
+def _read_public_key(path: Path) -> bytes:
+    key_file = path.expanduser().resolve()
+    if not key_file.is_file() or key_file.is_symlink():
+        raise PcAgentError(f"Release public key file was not found: {key_file}.")
+    for raw_line in key_file.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            name, value = line.split("=", 1)
+            if name.strip() != "PC_AGENT_RELEASE_PUBLIC_KEY":
+                continue
+            return b64url_decode(
+                value.strip(),
+                expected_length=32,
+                label="Release public key",
+            )
+        return b64url_decode(
+            line,
+            expected_length=32,
+            label="Release public key",
+        )
+    raise PcAgentError("Release public key file contains no key value.")
+
+
 def _sign(args: argparse.Namespace) -> int:
     key_id = validate_key_id(args.key_id)
     bundle = verify_release_bundle(args.bundle.expanduser())
@@ -129,10 +159,64 @@ def _sign(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_feed_package(info: Any, *, action: str) -> None:
+    print(f"{action} signed update feed package: {info.summary()}")
+    print(f"Location: {info.path}")
+    print(f"Feed URL: {info.feed_url}")
+    print(f"Bundle: releases/{info.bundle_name}")
+    print(f"Signature: releases/{info.signature_name}")
+    print(f"Bundle SHA-256: {info.bundle_sha256}")
+    print(f"Feed SHA-256: {info.feed_sha256}")
+    print(f"Publisher manifest SHA-256: {info.manifest_sha256}")
+    print("Customer .env public values:")
+    print("PC_AGENT_ONLINE_UPDATES=1")
+    print(f"PC_AGENT_UPDATE_FEED_URL={info.feed_url}")
+    print(f"PC_AGENT_UPDATE_CHANNEL={info.channel}")
+    print(f"PC_AGENT_RELEASE_PUBLIC_KEY={info.public_key}")
+    print(f"PC_AGENT_RELEASE_KEY_ID={info.key_id}")
+    print("PC_AGENT_REQUIRE_SIGNED_UPDATES=1")
+    print("Private key included: no")
+    print("Uploaded: no (upload this verified static directory yourself)")
+
+
+def _publish_feed(args: argparse.Namespace) -> int:
+    info = build_update_feed_package(
+        args.bundle,
+        args.output,
+        seed=_read_private_seed(args.private_key),
+        key_id=args.key_id,
+        base_url=args.base_url,
+        channel=args.channel,
+        published_at=args.published_at,
+    )
+    _print_feed_package(info, action="Built and verified")
+    return 0
+
+
+def _verify_feed(args: argparse.Namespace) -> int:
+    public_key: str | bytes = (
+        _read_public_key(args.public_key_file)
+        if args.public_key_file is not None
+        else args.public_key
+    )
+    info = verify_update_feed_package(
+        args.package,
+        public_key=public_key,
+        key_id=args.key_id,
+        expected_base_url=args.base_url,
+        expected_channel=args.channel,
+    )
+    _print_feed_package(info, action="Verified")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent-release-admin",
-        description="Vendor-only signing for Self-Healing PC Agent portable bundles",
+        description=(
+            "Vendor-only signing and static update-feed publishing for "
+            "Self-Healing PC Agent portable bundles"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -153,6 +237,40 @@ def build_parser() -> argparse.ArgumentParser:
     sign_parser.add_argument("--output", type=Path, default=None)
     sign_parser.add_argument("--force", action="store_true")
     sign_parser.set_defaults(handler=_sign)
+
+    publish_parser = subparsers.add_parser(
+        "publish-feed",
+        help="Build a verified static signed update-feed directory",
+    )
+    publish_parser.add_argument("bundle", type=Path)
+    publish_parser.add_argument("--private-key", type=Path, required=True)
+    publish_parser.add_argument("--key-id", default="release-1")
+    publish_parser.add_argument(
+        "--base-url",
+        required=True,
+        help="Static HTTPS directory URL where this package will be hosted",
+    )
+    publish_parser.add_argument("--channel", default="stable")
+    publish_parser.add_argument("--output", type=Path, required=True)
+    publish_parser.add_argument(
+        "--published-at",
+        default=None,
+        help="Optional timezone-aware ISO timestamp; defaults to current UTC",
+    )
+    publish_parser.set_defaults(handler=_publish_feed)
+
+    verify_parser = subparsers.add_parser(
+        "verify-feed",
+        help="Verify a static signed update-feed directory without network access",
+    )
+    verify_parser.add_argument("package", type=Path)
+    key_group = verify_parser.add_mutually_exclusive_group(required=True)
+    key_group.add_argument("--public-key")
+    key_group.add_argument("--public-key-file", type=Path)
+    verify_parser.add_argument("--key-id", default="release-1")
+    verify_parser.add_argument("--base-url", default=None)
+    verify_parser.add_argument("--channel", default=None)
+    verify_parser.set_defaults(handler=_verify_feed)
     return parser
 
 

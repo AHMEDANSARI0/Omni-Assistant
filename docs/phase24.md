@@ -139,6 +139,7 @@ does not poll for updates when opened.
   automation parity remain future platform work.
 - PDF password, form and digital-signature workflows remain separate.
 - Live Anthropic verification still needs a user-provided Anthropic key.
-- A real public vendor update feed still requires hosting the portable ZIP,
-  its detached `.sig.json`, and a format-1 feed on one HTTPS origin, plus
-  configuring the matching public key locally.
+- Phase 40 later added the vendor publisher for this exact static tree and
+  its customer public-key configuration. The vendor must still upload that
+  verified package to its own real HTTPS origin; no public host was created
+  or proven live by the software.

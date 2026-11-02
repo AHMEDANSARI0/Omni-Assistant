@@ -102,3 +102,11 @@ registered tools or approve an action.
   Phase 18.
 - Commercial SaaS, subscriptions, online billing and multi-tenancy remain
   outside the personal-use scope unless explicitly requested later.
+
+## Phase 53 follow-up — **Live Anthropic Verification**
+
+Phase 53 supplies the explicit evidence path anticipated above:
+`pc-agent providers verify-anthropic` makes one direct bounded Messages
+API request without router fallback/retry and retains a secret-safe report
+that `providers verify-anthropic-report` can validate offline. See
+`docs/phase53.md`.

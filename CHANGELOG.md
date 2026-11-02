@@ -1,5 +1,279 @@
 # Changelog
 
+## 0.55.0 - PHASE 53 Live Anthropic Verification
+
+- **Direct live Anthropic check**: new `pc-agent providers verify-anthropic`
+  command makes one bounded 32-token Anthropic Messages API request using
+  the already-configured credential, bypassing router fallback and retries.
+  It sends only a fixed public connectivity prompt and requires the exact
+  `PC_AGENT_ANTHROPIC_OK` response plus provider, model and usage evidence.
+- **Secret-safe retained report**: passed and failed runs write a JSON report
+  without the API key or response text; the report stores the credential
+  source, endpoint origin, models, token usage, timing, response SHA-256,
+  ordered checks and a report self-hash. Existing reports are not overwritten.
+- **Offline report verifier**: `pc-agent providers verify-anthropic-report`
+  strictly validates a passed current-version report and its self-hash with
+  no network call. Vision remains explicitly `not_tested`; no registered
+  tool (62 built-ins), schema, provider route or Python dependency change.
+
+## 0.54.0 - PHASE 52 Windows Repository Timestamp Hotfix
+
+- **Windows repository builder fix**: Phase 50 failed on Windows when the
+  Debian APT repository builder called `os.utime(...,
+  follow_symlinks=False)`, which CPython does not implement there. Both
+  Debian and RPM repository builders now use a shared capability-checked
+  helper that rejects symlinks before using the portable Windows timestamp
+  call.
+- **Regression coverage**: tests simulate a platform without
+  `os.utime` follow-symlink support, verify zero file/directory timestamps,
+  prove symlink targets are not modified, and build/verify both repository
+  formats under the reduced capability set.
+- **Boundaries preserved**: no repository format, package bytes, signing,
+  CLI, registered tool (62 built-ins), schema, or Python dependency change.
+
+## 0.53.0 - PHASE 51 RPM Repository
+
+- **Deterministic RPM repository builder**: new direct
+  `pc-agent release rpm-repository` command publishes a verified Phase 48
+  `.rpm` under `Packages/`, derives standard primary/filelists/other XML
+  from the real RPM header and payload, compresses it deterministically,
+  and writes content-addressed `repodata` files plus a SHA-256-complete
+  `repomd.xml` and strict JSON repository manifest.
+- **Optional OpenPGP metadata signing**: `--signing-key` uses the
+  operator's existing system GnuPG key to create `repomd.xml.asc` and an
+  exported public key. The application does not generate, import, store,
+  or accept a private key or passphrase; unsigned repositories and the
+  unsigned RPM package itself are reported explicitly.
+- **Strict offline verifier**: `pc-agent release rpm-repository-verify`
+  rejects extra/missing files and symbolic links, revalidates the manifest,
+  repomd and XML hashes/content, embedded `.rpm`, and—when present—the
+  exported public key and repomd signature without invoking dnf/yum/rpm.
+- **Honest boundary**: the builder creates static files only; it does not
+  sign the RPM package itself, host/configure/install/upgrade from the
+  repository, or claim live Fedora/RHEL evidence. No registered tool
+  (62 built-ins), schema change, or Python dependency.
+
+## 0.52.0 - PHASE 50 Debian APT Repository
+
+- **Deterministic APT repository builder**: new direct
+  `pc-agent release debian-repository` command publishes a verified
+  Phase 47 `.deb` under `pool/`, generates identical `Packages` and
+  `Packages.gz` indexes for the `all` and `amd64` views, and writes a
+  `Release` file with MD5Sum, SHA1, SHA256, and SHA512 index hashes plus a
+  strict JSON repository manifest.
+- **Optional OpenPGP repository signing**: `--signing-key` uses the
+  operator's existing system GnuPG key to create `Release.gpg`, `InRelease`,
+  and an exported public keyring. The application does not generate, import,
+  store, or accept a private key or passphrase; unsigned repositories are
+  reported explicitly as unsigned.
+- **Strict offline verifier**: `pc-agent release debian-repository-verify`
+  rejects extra/missing files and symbolic links, revalidates the manifest,
+  Release hashes, package indexes, embedded `.deb`, and—when present—the
+  exported public key and both OpenPGP signature forms without invoking apt
+  or dpkg.
+- **Honest boundary**: the builder creates static files only; it does not
+  host/configure/install/upgrade from the repository or claim live
+  Debian/Ubuntu evidence. No registered tool (62 built-ins), schema change,
+  or Python dependency.
+
+## 0.51.0 - PHASE 49 Windows UTF-8 Test Hotfix
+
+- **Windows test encoding fix**: the Phase 45 scope test failed on Windows
+  because it read UTF-8 project documentation with Python's cp1252 locale
+  default. All locale-dependent test `.read_text()` calls from Phases
+  45-48, two Phase 40 JSON writes, and generated credential-helper state
+  reads/writes now specify `encoding="utf-8"` explicitly.
+- **Regression guard**: a new AST test scans checked Python under `src/`
+  and `tests/` and fails if any `Path.read_text`/`Path.write_text` call
+  lacks an explicit UTF-8-family encoding. The original failure was
+  reproduced and then verified fixed under a forced non-UTF-8 locale.
+- **Boundaries preserved**: tests/docs only; no runtime behavior,
+  registered tool (62 built-ins), schema change, Python dependency,
+  Administrator/Developer Mode requirement, or `PYTHONUTF8`/locale setting
+  is needed.
+
+## 0.50.0 - PHASE 48 Native RPM Package
+
+- **Deterministic native `.rpm` builder**: new direct
+  `pc-agent release rpm-package` command creates a standard RPM v4 binary
+  package (Lead, signature header, main header, gzip `newc` cpio payload)
+  with sealed immutable header regions, header SHA1/SHA256 and MD5
+  signature digests, and per-file SHA-256 metadata. It packages the
+  verified Phase 41 POSIX installer under `/usr/share/self-healing-pc-agent`,
+  plus `/usr/bin` launchers and a desktop entry, with no scriptlets.
+- **Strict offline verifier**: `pc-agent release rpm-verify` validates the
+  lead, canonical header layout and region trailers, signature digests and
+  sizes, provides/requires, header file metadata against the cpio payload,
+  launcher/desktop wiring, and the embedded POSIX package without invoking
+  rpm or shell code. The generated package was also checked with real
+  RPM 4.20.1 tools: all header and MD5 digests verify OK.
+- **Honest installation boundary**: rpm installation places only the
+  system payload; first launch runs the existing per-user POSIX setup and
+  may need network access for Python dependencies because wheels are not
+  bundled. No PKG/DMG, OpenPGP signing, repository metadata or signing,
+  registered tool (62 built-ins), schema change or Python dependency.
+
+## 0.49.0 - PHASE 47 Native Debian Package
+
+- **Deterministic native `.deb` builder**: new direct
+  `pc-agent release debian-package` command creates a standard Debian `ar`
+  archive with `debian-binary`, `control.tar.gz`, and `data.tar.gz`, strict
+  control metadata, calculated Installed-Size, complete `md5sums`, and an
+  embedded SHA-256 manifest. It packages the verified Phase 41 POSIX
+  installer under `/usr/share/self-healing-pc-agent`, plus `/usr/bin`
+  launchers and a desktop entry, with no maintainer scripts.
+- **Strict offline verifier**: `pc-agent release debian-verify` validates
+  archive order and bounds, tar paths/modes, control fields, package hashes,
+  launcher/desktop wiring, and the embedded POSIX package without invoking
+  dpkg or shell code. Automated tests also use host `dpkg-deb` when available
+  and execute the system launcher against a fake per-user installer.
+- **Honest installation boundary**: dpkg installation places only the
+  system payload; first launch runs the existing per-user POSIX setup and
+  may need network access for Python dependencies because wheels are not
+  bundled. No RPM/PKG/DMG, apt repository, repository/package signing,
+  registered tool (62 built-ins), schema change or Python dependency.
+
+## 0.48.0 - PHASE 46 Windows Inno Acceptance Harness
+
+- **Guarded live-Windows installer acceptance**: new direct
+  `pc-agent release installer-acceptance` command builds a fresh Phase 38
+  source package, compiles it with a locally installed Inno Setup 6
+  `ISCC.exe`, silently installs it into an isolated acceptance directory,
+  and silently uninstalls it after verification. It never downloads Inno
+  Setup and never targets the product's default install directory.
+- **Evidence and safety checks**: the harness refuses an existing stable
+  AppId registry entry or Start Menu group, verifies every installed payload
+  hash, shortcuts, uninstall registry state, installed CLI/GUI commands,
+  and post-uninstall removal. Synthetic `.env`, `data`, and `workspace`
+  sentinel hashes must survive byte-for-byte. Process/Inno logs and a JSON
+  report are retained; `installer-acceptance-verify` revalidates a passed
+  report, retained setup/source hashes, and sentinels.
+- **Boundaries preserved**: the compiled setup remains unsigned;
+  Authenticode, trusted timestamping, SmartScreen reputation, interactive
+  wizard appearance, and a live Windows transcript are not claimed until
+  the harness is run in a signed-in Windows session. No registered tool
+  (62 built-ins), schema change or Python dependency. Automated suite: 541
+  passed, 1 skipped; Ruff clean.
+
+## 0.47.0 - PHASE 45 macOS Keychain Credentials
+
+- **macOS OS credential backend**: `PC_AGENT_CREDENTIAL_STORE=auto` now
+  selects the current user's macOS Keychain on Darwin, and the new explicit
+  `macos` mode is available beside `auto`, `windows`, `linux`, and `env`.
+  Provider keys use one fixed Keychain service with the canonical provider
+  name as the account through Apple's system `/usr/bin/security`.
+- **Secret-safe interactive writes**: stored keys are sent to
+  `security -q -i` as one bounded hexadecimal command on stdin, never in
+  argv. A versioned value prefix makes raw/hex lookup output unambiguous,
+  writes are read back, deletes are confirmed, stderr is not echoed, and
+  locked/denied/malformed/timeout cases fail closed. Effective macOS keys
+  are labelled `macos-keychain` in Doctor/provider status.
+- **Compatibility preserved**: environment/`.env` precedence, hidden direct
+  credential prompts, Windows/Linux credential behavior, and Phase 39
+  verified `.env` cleanup are unchanged. The backend is fake-tested without
+  claiming a live macOS Keychain transcript. No registered tool (62
+  built-ins), schema change or Python dependency. Automated suite: 536
+  passed, 1 skipped; Ruff clean.
+
+## 0.46.0 - PHASE 44 Linux Secret Service Credentials
+
+- **Linux OS credential backend**: `PC_AGENT_CREDENTIAL_STORE=auto` now
+  selects the freedesktop Secret Service on Linux, and the new explicit
+  `linux` mode is available beside `auto`, `windows`, and `env`. Provider
+  keys use stable application/provider/purpose attributes through the
+  system `secret-tool` argv interface.
+- **Secret-safe subprocess boundary**: stored keys are sent only on stdin,
+  never as command-line arguments; service reachability is probed without
+  reading a real key, writes are read back, deletes are confirmed, external
+  stderr is not echoed, and errors/timeouts fail closed. Effective Linux
+  keys are labelled `linux-secret-service` in Doctor/provider status.
+- **Compatibility preserved**: environment/`.env` precedence, hidden direct
+  credential prompts, Windows Credential Manager behavior, and Phase 39
+  verified `.env` cleanup are unchanged. A Linux desktop Secret Service
+  provider and `secret-tool` are prerequisites; live keyring evidence and
+  macOS Keychain are not claimed. No registered tool (62 built-ins), schema
+  change or Python dependency. Automated suite: 530 passed, 1 skipped;
+  Ruff clean.
+
+## 0.45.0 - PHASE 43 Windows POSIX Test Hotfix
+
+- **Windows/NTFS execute-bit failure fixed**: the deterministic Phase 41
+  POSIX package test still verifies hashes, inventory, payload list, and
+  script contents on Windows, but asserts the POSIX `S_IXUSR` filesystem bit
+  only on a POSIX host, matching production package verification.
+- **Missing `sh` failure fixed**: POSIX `sh -n` checks run only when a POSIX
+  `sh` is available, and the shell install/uninstall execution test skips on
+  a non-POSIX host or missing `sh` instead of raising `WinError 2`. On a
+  POSIX host it still executes install/reinstall/uninstall and proves user
+  `.env`, workspace, and data files are preserved.
+- **Runtime behavior unchanged**: generated POSIX packages are still started
+  with `sh ./install.sh`, and the installer continues to normalize installed
+  script permissions with `chmod +x`. No registered tool (62 built-ins),
+  schema change or dependency. Automated suite on the Linux build host:
+  525 passed, 1 skipped; Ruff clean.
+
+## 0.44.0 - PHASE 42 Windows Symlink Test Hotfix
+
+- **Windows `WinError 1314` fixed**: the Phase 39 `.env` symlink-rejection
+  scenario is now a separate test. If an unprivileged Windows account cannot
+  create a symbolic link without Developer Mode or the required privilege,
+  only that dedicated test skips with the OS reason; it no longer fails the
+  whole suite or hides the other fail-closed cleanup checks.
+- **Security behavior unchanged**: when symlink creation succeeds, the test
+  still proves that cleanup planning rejects a symlink `.env` and leaves its
+  target unchanged. Production credential cleanup, providers, tools, GUI,
+  PDF, installer, and update behavior are unchanged.
+- No registered tool (62 built-ins), schema change or dependency.
+  Automated suite on the Linux build host: 523 passed, 1 skipped; Ruff
+  clean.
+
+## 0.43.0 - PHASE 41 POSIX Installer Source Package
+
+- **Deterministic POSIX package**: direct `pc-agent release posix-source`
+  stages the runtime release subset with root/payload shell scripts, an
+  exact payload file list, POSIX README, and SHA-256 manifest. It excludes
+  tests, the real `.env`, user data, virtual environments, caches, private
+  keys, and patcher artifacts; existing output is never overwritten.
+- **Per-user Linux/macOS install**: `install.sh` requires Python 3.11+,
+  creates `.venv`, installs the local package, runs doctor/GUI checks, and
+  creates CLI/GUI wrappers plus a Linux desktop entry or macOS `.command`.
+  It uses no administrator elevation and preserves `.env`, data, and
+  workspace files during overlay reinstall.
+- **Conservative uninstall**: default removal covers launchers and `.venv`;
+  `--remove-app --yes` deletes only exact publisher-listed payload paths
+  after unsafe-path rejection. User `.env`, data/workspace files, and OS
+  credentials remain preserved.
+- **Fail-closed verification and Linux execution tests**: `posix-verify`
+  rejects inventory/hash/script-safety failures without executing shell
+  code, while automated Linux tests run install/uninstall in an isolated
+  fake home. This is not a native DEB/RPM/PKG/DMG, signed/notarized
+  package, live macOS proof, Keychain/Secret Service support, or desktop
+  automation parity. No registered tool (62 built-ins), schema change or
+  dependency. Automated suite: 520 passed, 1 skipped; Ruff clean.
+
+## 0.42.0 - PHASE 40 Signed Update Feed Publisher
+
+- **Complete static feed package**: vendor-only
+  `pc-agent-release-admin publish-feed` signs one verified portable bundle
+  and creates `stable.json`, the versioned ZIP/signature, customer
+  public-key configuration, hosting notes, and a SHA-256 publisher
+  manifest in one new directory.
+- **Offline package verification**: `pc-agent-release-admin verify-feed`
+  rejects missing/extra/unsafe files and hash mismatches, parses the feed
+  with the Phase 24 customer rules, verifies the portable bundle, and
+  requires the detached Ed25519 signature to match the expected public key
+  and key ID.
+- **Private-key boundary**: publication refuses existing output, builds in
+  a temporary sibling and verifies before publishing, scans output for the
+  raw/base64url private seed, and never copies or prints it. Feed base URLs
+  are HTTPS outside loopback and cannot contain credentials, queries, or
+  fragments.
+- **Honest hosting boundary**: the verified tree is upload-ready for a
+  vendor's own static HTTPS host, but this phase does not create an
+  account, configure DNS/TLS, upload files, prove a public host live, or add
+  background/silent updating. No registered tool (62 built-ins), schema
+  change or dependency. Automated suite: 514 passed, 1 skipped; Ruff clean.
+
 ## 0.41.0 - PHASE 39 Secure `.env` Provider-Key Cleanup
 
 - **Verified duplicate removal**: direct `pc-agent credentials

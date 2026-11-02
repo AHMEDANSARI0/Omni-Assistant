@@ -320,7 +320,7 @@ def request_timestamp_token(
         headers={
             "Accept": "application/timestamp-reply",
             "Content-Type": "application/timestamp-query",
-            "User-Agent": "Self-Healing-PC-Agent/0.41 (+local PDF timestamping)",
+            "User-Agent": "Self-Healing-PC-Agent/0.43 (+local PDF timestamping)",
         },
         method="POST",
     )

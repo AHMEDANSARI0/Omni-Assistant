@@ -184,7 +184,7 @@ class DoctorSummary:
             [
                 (
                     f"Self-Healing PC Agent {self.version} "
-                    "(PHASE 39 Secure .env Key Cleanup)"
+                    "(PHASE 53 Live Anthropic Verification)"
                 ),
                 f"Python: {self.python_version}",
                 f"Environment: {self.environment}",
@@ -265,7 +265,7 @@ class DoctorSummary:
                     "Built-in tools: "
                     f"built-ins={self.builtin_tools}, office={self.office_tools}, "
                     f"files={self.file_tools}, "
-                    "web.fetch=public-only by default, desktop=open/info plus gated Windows UIA, images=local Pillow tools plus gated provider vision, provider keys=environment first, then Windows Credential Manager"
+                    "web.fetch=public-only by default, desktop=open/info plus gated Windows UIA, images=local Pillow tools plus gated provider vision, provider keys=environment first, then secure OS storage"
                 ),
                 (
                     "Web limits: "

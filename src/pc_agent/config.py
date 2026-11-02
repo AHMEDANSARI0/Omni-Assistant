@@ -29,7 +29,7 @@ from .errors import ConfigError, CredentialError
 _ALLOWED_ENVIRONMENTS = frozenset({"development", "test", "production"})
 _ALLOWED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _ALLOWED_LICENSE_ENFORCEMENT = frozenset({"off", "warn", "enforce"})
-_ALLOWED_CREDENTIAL_STORES = frozenset({"auto", "windows", "env"})
+_ALLOWED_CREDENTIAL_STORES = frozenset({"auto", "windows", "linux", "macos", "env"})
 # Provider slots understood by the replaceable provider-abstraction layer.
 # `providers list` says which slots have a direct adapter in this build.
 _ALLOWED_PROVIDERS = frozenset(
@@ -131,9 +131,9 @@ class Settings:
     # sending one selected image to a model is opt-in and separately approved.
     allow_vision: bool = False
     vision_max_image_bytes: int = 10_000_000
-    # Phase 16 secure credential storage. Environment/.env values remain
-    # authoritative when present; otherwise Windows Credential Manager is
-    # consulted in production loads. Explicit test environ mappings never
+    # Phase 16/44 secure credential storage. Environment/.env values remain
+    # authoritative when present; otherwise the platform OS credential store
+    # is consulted in production loads. Explicit test environ mappings never
     # silently read the developer's real OS vault.
     credential_store: str = "auto"
     credential_store_backend: str = "environment-only"
@@ -511,9 +511,8 @@ class Settings:
                     raise ConfigError(str(exc)) from exc
             api_keys[provider] = value
             if value:
-                credential_sources.append(
-                    (provider, "windows-credential-manager")
-                )
+                assert lookup_store is not None  # value came from OS storage
+                credential_sources.append((provider, lookup_store.source_name))
 
         return cls(
             root_dir=root,
@@ -780,7 +779,7 @@ def _parse_credential_store(raw: str) -> str:
     value = raw.strip().lower() or "auto"
     if value not in _ALLOWED_CREDENTIAL_STORES:
         raise ConfigError(
-            "PC_AGENT_CREDENTIAL_STORE must be one of: auto, windows, env."
+            "PC_AGENT_CREDENTIAL_STORE must be one of: auto, windows, linux, macos, env."
         )
     return value
 

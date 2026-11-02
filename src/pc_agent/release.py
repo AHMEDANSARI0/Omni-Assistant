@@ -585,22 +585,30 @@ def audit_install(settings: Settings) -> ReleaseAudit:
         for name, source in settings.credential_sources
         if source == "environment"
     ]
-    if settings.credential_store == "windows" and not settings.credential_store_available:
+    if (
+        settings.credential_store in {"windows", "linux", "macos"}
+        and not settings.credential_store_available
+    ):
         checks.append(
             AuditCheck(
                 "credentials",
                 "fail",
-                "Windows Credential Manager was explicitly selected but is unavailable.",
+                "An OS credential store was explicitly selected but is unavailable: "
+                f"{settings.credential_store_backend}.",
             )
         )
-    elif environment_providers and sys.platform == "win32":
+    elif environment_providers and (
+        sys.platform == "win32"
+        or settings.credential_store_backend
+        in {"linux-secret-service", "macos-keychain"}
+    ):
         checks.append(
             AuditCheck(
                 "credentials",
                 "warn",
                 "Provider keys still come from environment/.env for: "
                 + ", ".join(environment_providers)
-                + ". If copies are already stored, remove those .env lines to use Credential Manager.",
+                + ". If copies are already stored, remove those .env lines to use secure OS storage.",
             )
         )
     else:

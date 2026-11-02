@@ -5,7 +5,7 @@ secure, lightweight, extensible agent that plans and executes user tasks with
 explicit permissions, verifies results deterministically, and reports honestly
 what it did.
 
-## Current status: PHASE 39 - Secure `.env` provider-key cleanup (this build)
+## Current status: PHASE 44 - Linux Secret Service credentials (this build)
 
 | Status | Capability |
 |---|---|
@@ -54,7 +54,21 @@ what it did.
 | Implemented + tested (Phase 37) | Optional direct PAdES Baseline B-B-oriented signature profile in the existing CLI/GUI signer: `--profile pades-bb` creates an `ETSI.CAdES.detached` CMS with exactly content-type, message-digest and ESS signing-certificate-v2 signed attributes, no CMS signing-time, `/M` as the claimed UTC signing time, ESIC ExtensionLevel 2 and whole-file ByteRange coverage. RSA/ECDSA with SHA-256/384/512, incremental signing and optional RFC 3161 signature timestamps are supported. Inspection verifies the ESS certificate binding and reports `bb_structure_verified` or `bb_structure_incomplete`; trust and external PAdES/Adobe/legal conformance remain not evaluated. The legacy `adbe` profile stays the default; no registered tool (62), schema migration or dependency |
 | Implemented + tested (Phase 38) | Deterministic unsigned Windows installer source package: `pc-agent release installer-source` stages the runtime release subset (no tests, real `.env`, data or private keys), generates an explicit per-user Inno Setup 6 script and SHA-256 manifest, and `installer-verify` fails closed on tamper/unsafe wiring. A guarded PowerShell helper can compile it with locally installed ISCC on Windows. The installer runs the existing venv setup, creates GUI/CLI shortcuts, and uninstall preserves user data/workspace/`.env`/credentials. No compiled EXE, Authenticode, SmartScreen reputation, registered tool (62), schema migration or dependency |
 | Implemented + tested (Phase 39) | Secure direct-only `.env` provider-key cleanup: `pc-agent credentials remove-env-keys` plans or removes a provider line only when its identical effective value is already verified in the OS credential store. Mismatched, missing, empty or unavailable-store keys stay untouched; approved changes are revalidated and atomically applied without a plaintext backup, with a secret-free receipt. No registered tool (62), schema migration or dependency |
-| Later | Authenticode signing, real vendor HTTPS update-feed hosting/configuration, optional true background auto-update service, macOS/Linux packaging, Adobe trust-program integration and externally verified full WebPKI/qualified-policy or PAdES workflows |
+| Implemented + tested (Phase 40) | Vendor-side signed update-feed publisher: `pc-agent-release-admin publish-feed` signs a verified portable bundle and emits a complete static HTTPS directory with strict Phase 24 feed, ZIP/signature, customer public-key config, hosting notes and SHA-256 publisher manifest; `verify-feed` revalidates inventory, bundle and Ed25519 signature offline. It never copies/prints the private key and does not upload or add background updating. No registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 41) | Linux/macOS POSIX installer source package: `pc-agent release posix-source` stages the runtime release subset with auditable per-user `install.sh`/`uninstall.sh`, GUI/CLI launchers, exact payload list and SHA-256 manifest; `posix-verify` fails closed without executing shell code. The installer creates `.venv`, runs doctor/GUI checks, adds a Linux desktop entry or macOS `.command`, and uninstall preserves `.env`, data, workspace and credentials. No native DEB/RPM/PKG/DMG, signing/notarization, registered tool (62), schema migration or dependency |
+| Hotfix (Phase 42) | Windows `WinError 1314` test compatibility: the Phase 39 symlink-rejection scenario is isolated and skips only when the account cannot create symlinks without Developer Mode/privilege. Production `.env` cleanup still rejects symlinks and remains otherwise unchanged; no registered tool (62), schema migration or dependency |
+| Hotfix (Phase 43) | Windows-host Phase 41 POSIX test compatibility: deterministic package hashes/inventory/content still run on Windows, while POSIX execute-bit and `sh` checks run only on a POSIX host with `sh`; shell install/uninstall execution skips on Windows instead of failing with `WinError 2`. Runtime POSIX packaging remains unchanged; no registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 44) | Linux Secret Service provider-key storage: `auto` selects freedesktop Secret Service via bounded `secret-tool` argv calls on Linux, with stable application/provider/purpose attributes, stdin-only secret storage, read-back verification, delete confirmation, generic fail-closed errors, and `linux-secret-service` source labels. Environment/`.env` precedence and Windows Credential Manager behavior are unchanged; no macOS Keychain, registered tool (62), schema migration or Python dependency |
+| Implemented + tested (Phase 45) | macOS Keychain provider-key storage: `auto` selects Apple's system `/usr/bin/security` on macOS, with a fixed service/provider account mapping, interactive stdin hex writes that never put a secret in argv, raw/hex read-back verification, delete confirmation, a bounded transport guard, generic fail-closed errors, and `macos-keychain` source labels. Environment/`.env` precedence and Windows/Linux credential behavior are unchanged; no macOS installer/signing/notarization, desktop parity, registered tool (62), schema migration or Python dependency |
+| Implemented + tested (Phase 46) | **Windows Inno Acceptance Harness**: direct `pc-agent release installer-acceptance` builds/verifies fresh Phase 38 source, compiles it with locally installed `ISCC.exe`, silently installs only into an isolated acceptance directory, verifies payload hashes/shortcuts/registry/installed CLI and GUI, then silently uninstalls and proves synthetic `.env`/`data`/`workspace` sentinels survive. It refuses an existing AppId/shortcut group, retains logs plus a verifiable JSON report, and never downloads Inno or signs the setup; live Windows evidence still requires running it in a signed-in Windows session. No registered tool (62), schema migration or Python dependency |
+| Implemented + tested (Phase 47) | **Native Debian Package**: direct `pc-agent release debian-package` builds a deterministic architecture-independent `.deb` containing the verified POSIX package, system launchers and desktop entry; `debian-verify` validates ar/control/data archives, `md5sums`, Installed-Size, embedded SHA-256 inventory and the embedded POSIX package without dpkg or shell execution. The package has no maintainer scripts; first launch prepares the existing per-user environment and may need network access for Python dependencies because wheels are not bundled. No RPM/PKG/DMG, repository/package signing, registered tool (62), schema migration or Python dependency |
+| Implemented + tested (Phase 48) | **Native RPM Package**: direct `pc-agent release rpm-package` builds a deterministic `noarch` RPM v4 package (lead, signature header with SHA1/SHA256 header digests, main header with per-file SHA-256 digests, gzip cpio payload) around the verified POSIX package with system launchers and a desktop entry; `rpm-verify` validates headers/regions, signature digests, file metadata and the embedded POSIX package without rpm or shell execution. The package has no scriptlets; first launch prepares the existing per-user environment and may need network access for Python dependencies because wheels are not bundled. Real RPM 4.20.1 `rpmkeys --checksig` verified all digests. No PKG/DMG, OpenPGP/repository signing, registered tool (62), schema migration or Python dependency |
+| Hotfix (Phase 49) | **Windows UTF-8 Test Hotfix**: Phase 45-48 scope tests now explicitly decode UTF-8 project documents instead of using the Windows locale encoding (cp1252), fixing the reported `UnicodeDecodeError` for `docs/providers.md`. An AST regression guard requires explicit UTF-8 on every checked `Path.read_text`/`write_text` call; no `PYTHONUTF8`, locale change, Administrator/Developer Mode, registered tool (62), schema migration or Python dependency |
+| Implemented + tested (Phase 50) | **Debian APT Repository**: direct `pc-agent release debian-repository` publishes the verified architecture-`all` `.deb` under `pool/`, with deterministic `Packages`/`Packages.gz` indexes for `all` and `amd64`, a hash-complete `Release` file and a strict repository manifest; `debian-repository-verify` revalidates the complete tree and embedded package without apt/dpkg. Optional `--signing-key` uses the operator's existing system GnuPG key to create `Release.gpg`, `InRelease` and an exported public keyring—no private key/passphrase is accepted or stored. No repository hosting, live Debian/Ubuntu install claim, registered tool (62), schema migration or Python dependency |
+| Implemented + tested (Phase 51) | **RPM Repository**: direct `pc-agent release rpm-repository` publishes the verified `noarch` `.rpm` under `Packages/`, with deterministic gzip primary/filelists/other XML, content-addressed repodata names, a hash-complete `repomd.xml` and a strict repository manifest; `rpm-repository-verify` revalidates the complete tree and embedded package without dnf/yum/rpm. Optional `--signing-key` uses the operator's existing system GnuPG key to sign `repomd.xml` and export its public key—no private key/passphrase is accepted or stored, and the RPM itself remains unsigned. No repository hosting, live Fedora/RHEL install claim, registered tool (62), schema migration or Python dependency |
+| Hotfix (Phase 52) | **Windows Repository Timestamp Hotfix**: Phase 50/51 repository builders no longer call Windows-unsupported `os.utime(..., follow_symlinks=False)` unguarded; a capability-checked helper rejects symlinks and uses the portable Windows timestamp form, fixing four Windows Phase 50 test failures and the equivalent latent Phase 51 failures. No repository format, registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 53) | **Live Anthropic Verification**: direct `pc-agent providers verify-anthropic` makes exactly one bounded 32-token Anthropic Messages API request with the already-configured key, bypassing router fallback/retries; it requires the fixed `PC_AGENT_ANTHROPIC_OK` response plus provider/model/usage checks and retains a secret-safe self-hashed JSON report. `verify-anthropic-report` revalidates it offline. Text-only (`vision_status: not_tested`); no registered tool (62), schema migration or dependency |
+| Later | Authenticode signing, optional true background auto-update service, native macOS packages, macOS desktop parity, Adobe trust-program integration and externally verified full WebPKI/qualified-policy or PAdES workflows |
 
 This build **does not** claim arbitrary computer control, arbitrary generated
 programs, full browser automation, password/coordinate UI control, AI
@@ -78,13 +92,13 @@ server, or cloud account yet.
 New installs apply the patchers in order: 1A, 1B, 1C, Phase 2, Phase 3,
 Phase 4, the Phase 4.1 hotfix, Phase 5, Phase 6, Phase 7, Phase 8, Phase 9,
 Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15, Phase 16,
-the Phase 16.1 hotfix, Phase 17, Phase 18, Phase 19, Phase 20, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, Phase 26, Phase 27, Phase 28, Phase 29, Phase 30, Phase 31, Phase 32, Phase 33, Phase 34, Phase 35, Phase 36, Phase 37, Phase 38, then Phase 39. The
-Phase 39 patcher is cumulative: it upgrades an existing Phase 9 (0.11.0)
-through Phase 38 (0.40.0) install:
+the Phase 16.1 hotfix, Phase 17, Phase 18, Phase 19, Phase 20, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, Phase 26, Phase 27, Phase 28, Phase 29, Phase 30, Phase 31, Phase 32, Phase 33, Phase 34, Phase 35, Phase 36, Phase 37, Phase 38, Phase 39, Phase 40, Phase 41, Phase 42, Phase 43, Phase 44, Phase 45, Phase 46, Phase 47, Phase 48, Phase 49, Phase 50, Phase 51, Phase 52, then Phase 53. The
+Phase 53 patcher is cumulative: it upgrades an existing Phase 9 (0.11.0)
+through Phase 52 (0.54.0) install:
 
 ```powershell
 cd D:\omni-assistant   # your project folder
-node PHASE_39_SECURE_ENV_KEY_CLEANUP.mjs
+node PHASE_53_LIVE_ANTHROPIC_VERIFICATION.mjs
 
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -98,15 +112,26 @@ pc-agent workflow list
 pc-agent gui --check
 ```
 
-Phase 39 adds secure `.env` provider-key cleanup without a registered tool,
+Phase 53 adds **Live Anthropic Verification** without a registered tool,
 so the count stays 62 built-ins and the database schema stays **v6**.
-Reinstalling refreshes the editable package metadata to 0.41.0; no new
-dependency is added beyond Phase 26's `pypdf[crypto]`. Your current `.env`
-keys keep taking precedence. Run `pc-agent credentials migrate` only when
-you want to copy them into Windows Credential Manager; that command still
-does not edit `.env`. Afterwards, `pc-agent credentials remove-env-keys`
-can remove only lines whose identical value is verified in Credential
-Manager. See `docs/phase39.md` for secure cleanup,
+Reinstalling refreshes the editable package metadata to 0.55.0; no new
+Python dependency is added beyond Phase 26's `pypdf[crypto]`. The new
+direct Anthropic check bypasses router fallback/retries and writes a
+secret-safe evidence report. Phase 52's **Windows Repository Timestamp
+Hotfix**, Phase 51's **RPM Repository**, Phase 50's **Debian APT
+Repository**, Phase 49's **Windows UTF-8 Test Hotfix**, Phase 48's
+**Native RPM Package** and Phase 47's **Native Debian Package** remain
+available unchanged. See `docs/phase53.md` for live verification,
+`docs/phase52.md` for the repository hotfix and `docs/phase51.md` for
+the RPM repository,
+`docs/phase50.md` for the APT repository, `docs/phase49.md` for the hotfix,
+`docs/phase48.md` for the RPM package, `docs/phase47.md` for the Debian
+package, `docs/phase46.md` for the harness, `docs/phase45.md` for macOS
+credentials, `docs/phase44.md` for Linux
+credentials, `docs/phase43.md` for the Windows
+POSIX test hotfix, `docs/phase42.md` for the symlink test hotfix,
+`docs/phase41.md` for POSIX packaging, `docs/phase40.md`
+for update-feed publishing, `docs/phase39.md` for secure cleanup,
 `docs/phase38.md` for the Windows installer source
 package, `docs/phase37.md` for the PAdES B-B signature
 profile, `docs/phase36.md` for LTV DSS embedding,
@@ -517,9 +542,21 @@ virtual environments and caches:
 ```powershell
 pc-agent release audit
 pc-agent release build
-pc-agent release verify workspace\self-healing-pc-agent-v0.41.0-portable.zip
+pc-agent release verify workspace\self-healing-pc-agent-v0.55.0-portable.zip
 pc-agent release installer-source
-pc-agent release installer-verify workspace\windows-installer-v0.41.0
+pc-agent release installer-verify workspace\windows-installer-v0.55.0
+pc-agent release installer-acceptance
+pc-agent release installer-acceptance-verify workspace\windows-installer-acceptance-v0.55.0\windows-installer-acceptance-report.json
+pc-agent release posix-source
+pc-agent release posix-verify workspace\posix-installer-v0.55.0
+pc-agent release debian-package
+pc-agent release debian-verify workspace\self-healing-pc-agent_0.55.0-1_all.deb
+pc-agent release debian-repository
+pc-agent release debian-repository-verify workspace\apt-repository-v0.55.0
+pc-agent release rpm-package
+pc-agent release rpm-verify workspace\self-healing-pc-agent-0.55.0-1.noarch.rpm
+pc-agent release rpm-repository
+pc-agent release rpm-repository-verify workspace\rpm-repository-v0.55.0
 ```
 
 Use `pc-agent maintenance backup|list|verify|restore` for verified local
@@ -543,6 +580,18 @@ non-empty `data`, `workspace`, `.env` and Credential Manager entries. There
 is no Authenticode certificate or SmartScreen reputation claim yet. See
 `docs/phase38.md`.
 
+### **Windows Inno Acceptance Harness** (Phase 46)
+
+On Windows with Inno Setup 6 installed, the **Windows Inno Acceptance
+Harness** performs the missing end-to-end check in
+`workspace\windows-installer-acceptance-v<version>`: fresh source build,
+`ISCC.exe` compile, silent isolated install, payload/shortcut/registry and
+installed CLI/GUI verification, silent uninstall, and sentinel
+`.env`/`data`/`workspace` preservation. It refuses to run if the stable
+AppId or Start Menu group already exists and leaves
+`windows-installer-acceptance-report.json` plus process/Inno logs as
+evidence. See `docs/phase46.md`.
+
 ## Secure `.env` provider-key cleanup (Phase 39)
 
 After `pc-agent credentials migrate`, run
@@ -552,6 +601,137 @@ command requires approval (or `--yes`), removes only `verified_match`
 lines, revalidates against concurrent changes, and writes a secret-free
 receipt under `data\credential-cleanups\`. It never makes a plaintext backup.
 Mismatched or unstored keys remain in `.env`. See `docs/phase39.md`.
+
+## Signed update feed publisher (Phase 40)
+
+The separate vendor tool can now turn a verified portable ZIP and local
+release private key into a complete static update-feed directory with
+`pc-agent-release-admin publish-feed`; `verify-feed` checks that tree
+offline before upload. The package contains the strict feed, signed ZIP,
+customer public-key settings, hosting notes and a SHA-256 publisher
+manifest. It excludes the private key, performs no upload, and adds no
+background or silent update behavior. A vendor still supplies the actual
+static HTTPS host, DNS and TLS certificate. See `docs/phase40.md`.
+
+## POSIX installer source package (Phase 41)
+
+`pc-agent release posix-source` creates a hash-manifested Linux/macOS
+runtime payload with per-user `install.sh`, conservative `uninstall.sh`,
+and GUI/CLI launchers; `posix-verify` checks it without executing shell
+code. The installer creates `.venv`, runs doctor/GUI checks, and adds a
+Linux desktop entry or macOS `.command`. Uninstall preserves `.env`, data,
+workspace files and credentials. It is not a native DEB/RPM/PKG/DMG and is
+not signed or Apple-notarized. See `docs/phase41.md`.
+
+## Windows symlink test hotfix (Phase 42)
+
+On an unprivileged Windows account, creating a test symlink can fail with
+`WinError 1314` before the production `.env` cleanup code runs. Phase 42
+isolates that case into its own test and skips only it when Windows refuses
+symlink creation. The production cleanup planner still rejects a symlink
+`.env` whenever the test can create one, and no runtime behavior changes.
+See `docs/phase42.md`.
+
+## Windows POSIX test hotfix (Phase 43)
+
+Windows/NTFS does not expose POSIX execute bits and does not provide `sh`
+by default. Phase 43 keeps the deterministic POSIX package hash, inventory,
+and content checks running on Windows, while execute-bit, syntax, and shell
+execution checks run only on a POSIX host with `sh`. POSIX package runtime
+behavior is unchanged; installing Git Bash or WSL is not required for the
+Windows test suite. See `docs/phase43.md`.
+
+## Linux Secret Service credentials (Phase 44)
+
+On Linux, `PC_AGENT_CREDENTIAL_STORE=auto` now selects the freedesktop
+Secret Service through the system `secret-tool`; `linux` selects it
+explicitly. The same direct `pc-agent credentials` commands work there,
+secrets reach `secret-tool store` only on stdin, and no credential value is
+printed. A running Secret Service provider and the distribution's
+`secret-tool` package are prerequisites. See `docs/phase44.md`.
+
+## macOS Keychain credentials (Phase 45)
+
+On macOS, `PC_AGENT_CREDENTIAL_STORE=auto` selects the user's Keychain
+through Apple's system `/usr/bin/security`; `macos` selects it explicitly.
+Writes use interactive stdin with a hexadecimal value, never argv, and are
+read back before success is reported. Effective stored keys are labelled
+`macos-keychain`, and the same direct `pc-agent credentials` commands work
+there. See `docs/phase45.md`.
+
+## Native Debian package (Phase 47)
+
+`pc-agent release debian-package` creates a deterministic `Architecture: all`
+`.deb` around the verified Phase 41 POSIX package, with `/usr/bin` launchers
+and a desktop entry but no maintainer scripts. `debian-verify` checks the
+Debian archives, control metadata, `md5sums` and embedded SHA-256 inventory
+without running dpkg or shell code. Installing the package places only the
+system payload; first launch prepares the existing per-user `.venv` and may
+need network access for Python wheels, which are not bundled. See
+`docs/phase47.md`.
+
+## Native RPM package (Phase 48)
+
+`pc-agent release rpm-package` creates a deterministic `noarch` RPM v4
+package around the same verified POSIX package, with `/usr/bin` launchers
+and a desktop entry but no scriptlets. `rpm-verify` checks the lead,
+signature/main headers and immutable regions, header digests, per-file
+SHA-256 metadata and embedded SHA-256 inventory without running rpm or
+shell code. Installing the package places only the system payload; first
+launch prepares the existing per-user `.venv` and may need network access
+for Python wheels, which are not bundled. See `docs/phase48.md`.
+
+## Windows UTF-8 test hotfix (Phase 49)
+
+Windows Python often defaults text reads to cp1252, while this project's
+documentation is UTF-8. Phase 49 makes every checked test/document text
+read explicitly UTF-8 and adds an AST regression guard, so the Phase 45
+scope test no longer fails on curly quotes in `docs/providers.md`. No
+`PYTHONUTF8` setting or machine locale change is needed. See
+`docs/phase49.md`.
+
+## Debian APT repository (Phase 50)
+
+`pc-agent release debian-repository` builds a deterministic static
+**Debian APT Repository** around the verified Phase 47 `.deb`: a `pool/`
+package copy, `Packages`/`Packages.gz` indexes for `all` and `amd64`, a
+hash-complete `Release`, and a strict JSON repository manifest.
+`debian-repository-verify` checks the complete tree and embedded `.deb`
+without running apt or dpkg. With `--signing-key`, the operator's existing
+system GnuPG key creates `Release.gpg`, `InRelease`, and an exported public
+keyring; the application never receives a private key or passphrase. The
+builder does not host or install from the repository. See
+`docs/phase50.md`.
+
+## RPM repository (Phase 51)
+
+`pc-agent release rpm-repository` builds a deterministic static
+**RPM Repository** around the verified Phase 48 `.rpm`: `Packages/`,
+gzip primary/filelists/other XML, a SHA-256-complete `repomd.xml`, and a
+strict JSON repository manifest. `rpm-repository-verify` checks the
+complete tree and embedded `.rpm` without running dnf, yum, or rpm. With
+`--signing-key`, the operator's existing system GnuPG key signs
+`repomd.xml` and exports its public key; the RPM itself remains unsigned
+and the application never receives a private key or passphrase. The
+builder does not host or install from the repository. See
+`docs/phase51.md`.
+
+## Windows repository timestamp hotfix (Phase 52)
+
+Windows CPython does not support `follow_symlinks=False` for `os.utime`.
+Phase 52's **Windows Repository Timestamp Hotfix** makes both repository
+builders use a capability-checked timestamp helper that explicitly rejects
+symlinks and falls back to the portable Windows call, preserving the same
+repository bytes. See `docs/phase52.md`.
+
+## Live Anthropic Verification (Phase 53)
+
+Phase 53's **Live Anthropic Verification** provides the explicit live
+evidence path for the Phase 19 adapter. `pc-agent providers
+verify-anthropic` sends only a fixed public connectivity prompt in one
+direct, bounded Anthropic request—no fallback, router retry, image, file or
+task text—and retains a secret-safe report for
+`providers verify-anthropic-report`. See `docs/phase53.md`.
 
 ## Direct Anthropic provider (Phase 19)
 

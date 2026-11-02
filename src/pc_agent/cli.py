@@ -29,6 +29,10 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .anthropic_verification import (
+    run_anthropic_live_verification,
+    verify_anthropic_live_verification_report,
+)
 from .browser_cdp import probe_browser
 from .config import Settings
 from .credentials import (
@@ -36,6 +40,8 @@ from .credentials import (
     build_credential_store,
     canonical_credential_provider,
 )
+from .debian_package import build_debian_package, verify_debian_package
+from .debian_repository import build_debian_repository, verify_debian_repository
 from .desktop_automation import probe_desktop_automation
 from .diagnostics import build_diagnostics, export_diagnostics
 from .documents.office import create_demo_office_files
@@ -87,9 +93,12 @@ from .online_updates import (
 )
 from .orchestrator import ApprovalRequest, ExecutionReport, TaskOrchestrator
 from .planning import DeterministicPlanner, PlannerOptions
+from .posix_package import build_posix_package, verify_posix_package
 from .providers import CompletionRequest, build_model_router, provider_statuses
 from .recovery import RecoveryService, TaskDiagnosis
 from .release import audit_install, build_release_bundle, verify_release_bundle
+from .rpm_package import build_rpm_package, rpm_package_filename, verify_rpm_package
+from .rpm_repository import build_rpm_repository, verify_rpm_repository
 from .self_repair import SelfRepairService
 from .storage.db import Database
 from .storage.repositories import (
@@ -116,6 +125,10 @@ from .updates import (
 from .windows_installer import (
     build_windows_installer_source,
     verify_windows_installer_source,
+)
+from .windows_installer_acceptance import (
+    run_windows_installer_acceptance,
+    verify_windows_installer_acceptance_report,
 )
 
 
@@ -409,7 +422,7 @@ def _add_desktop_element_selector_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent",
-        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 39)",
+        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 44)",
     )
     parser.add_argument("--version", action="version", version=f"pc-agent {__version__}")
     parser.add_argument(
@@ -728,14 +741,35 @@ def build_parser() -> argparse.ArgumentParser:
     recovery_show_parser.add_argument("--json", action="store_true")
 
     providers_parser = subparsers.add_parser(
-        "providers", help="Show configured AI provider slots and fallback route (no network call)"
+        "providers",
+        help="Show AI provider slots or run an explicit direct Anthropic live check",
     )
     providers_subparsers = providers_parser.add_subparsers(dest="providers_command")
     providers_subparsers.add_parser("list", help="List provider statuses without secrets")
+    providers_anthropic_verify_parser = providers_subparsers.add_parser(
+        "verify-anthropic",
+        help=(
+            "Make one bounded direct Anthropic Messages API request and "
+            "retain a secret-safe JSON report (no fallback or retry)"
+        ),
+    )
+    providers_anthropic_verify_parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Report .json path (must not exist; default: timestamped file under data)",
+    )
+    providers_anthropic_verify_parser.add_argument("--json", action="store_true")
+    providers_anthropic_report_parser = providers_subparsers.add_parser(
+        "verify-anthropic-report",
+        help="Verify a passed Anthropic live-verification report offline",
+    )
+    providers_anthropic_report_parser.add_argument("report", type=Path)
+    providers_anthropic_report_parser.add_argument("--json", action="store_true")
 
     credentials_parser = subparsers.add_parser(
         "credentials",
-        help="Manage provider API keys in Windows Credential Manager (values never printed)",
+        help="Manage provider API keys in secure OS storage (values never printed)",
     )
     credentials_subparsers = credentials_parser.add_subparsers(
         dest="credentials_command"
@@ -765,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
     credential_delete_parser.add_argument("--yes", action="store_true")
     credential_migrate_parser = credentials_subparsers.add_parser(
         "migrate",
-        help="Copy existing environment/.env provider keys into Credential Manager",
+        help="Copy existing environment/.env provider keys into secure OS storage",
     )
     credential_migrate_parser.add_argument(
         "provider", nargs="?", default=None, choices=credential_provider_choices
@@ -894,6 +928,190 @@ def build_parser() -> argparse.ArgumentParser:
     )
     release_installer_verify_parser.add_argument("source", type=Path)
     release_installer_verify_parser.add_argument("--json", action="store_true")
+    release_installer_acceptance_parser = release_subparsers.add_parser(
+        "installer-acceptance",
+        help=(
+            "On Windows, compile/install/uninstall the Inno package in an isolated "
+            "acceptance folder and retain a JSON report"
+        ),
+    )
+    release_installer_acceptance_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Acceptance directory (must not exist)",
+    )
+    release_installer_acceptance_parser.add_argument(
+        "--compiler",
+        type=Path,
+        default=None,
+        help="Exact ISCC.exe path (otherwise INNO_SETUP_COMPILER/PATH/Program Files)",
+    )
+    release_installer_acceptance_parser.add_argument("--json", action="store_true")
+    release_installer_acceptance_verify_parser = release_subparsers.add_parser(
+        "installer-acceptance-verify",
+        help="Verify a passed Windows Inno acceptance report and retained artifacts",
+    )
+    release_installer_acceptance_verify_parser.add_argument("report", type=Path)
+    release_installer_acceptance_verify_parser.add_argument("--json", action="store_true")
+    release_posix_source_parser = release_subparsers.add_parser(
+        "posix-source",
+        help="Build a hash-verified Linux/macOS POSIX installer source package",
+    )
+    release_posix_source_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="POSIX package directory (must not exist)",
+    )
+    release_posix_source_parser.add_argument("--json", action="store_true")
+    release_posix_verify_parser = release_subparsers.add_parser(
+        "posix-verify",
+        help="Verify a POSIX installer source package without executing it",
+    )
+    release_posix_verify_parser.add_argument("source", type=Path)
+    release_posix_verify_parser.add_argument("--json", action="store_true")
+    release_debian_package_parser = release_subparsers.add_parser(
+        "debian-package",
+        help="Build a deterministic native Debian .deb around the POSIX package",
+    )
+    release_debian_package_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output .deb path (must not exist)",
+    )
+    release_debian_package_parser.add_argument(
+        "--maintainer",
+        default=None,
+        help="Debian Maintainer value: Name <address>",
+    )
+    release_debian_package_parser.add_argument("--json", action="store_true")
+    release_debian_verify_parser = release_subparsers.add_parser(
+        "debian-verify",
+        help="Verify a native Debian .deb without invoking dpkg or shell code",
+    )
+    release_debian_verify_parser.add_argument("package", type=Path)
+    release_debian_verify_parser.add_argument("--json", action="store_true")
+    release_debian_repository_parser = release_subparsers.add_parser(
+        "debian-repository",
+        help="Build APT repository metadata around a verified native Debian .deb",
+    )
+    release_debian_repository_parser.add_argument(
+        "package",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="Verified .deb to publish (default: the current workspace .deb)",
+    )
+    release_debian_repository_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Repository directory (must not exist)",
+    )
+    release_debian_repository_parser.add_argument(
+        "--suite",
+        default="stable",
+        help="APT suite/codename (default: stable)",
+    )
+    release_debian_repository_parser.add_argument(
+        "--signing-key",
+        default=None,
+        help="Existing GnuPG key fingerprint, key ID or user ID for Release signing",
+    )
+    release_debian_repository_parser.add_argument(
+        "--gnupg-home",
+        type=Path,
+        default=None,
+        help="Existing GnuPG home containing the selected signing key",
+    )
+    release_debian_repository_parser.add_argument(
+        "--gpg",
+        default="gpg",
+        help="GnuPG executable name or path (default: gpg)",
+    )
+    release_debian_repository_parser.add_argument("--json", action="store_true")
+    release_debian_repository_verify_parser = release_subparsers.add_parser(
+        "debian-repository-verify",
+        help="Verify APT repository metadata without invoking apt or dpkg",
+    )
+    release_debian_repository_verify_parser.add_argument("repository", type=Path)
+    release_debian_repository_verify_parser.add_argument(
+        "--gpg",
+        default="gpg",
+        help="GnuPG executable name or path (default: gpg)",
+    )
+    release_debian_repository_verify_parser.add_argument(
+        "--json", action="store_true"
+    )
+    release_rpm_package_parser = release_subparsers.add_parser(
+        "rpm-package",
+        help="Build a deterministic native RPM .rpm around the POSIX package",
+    )
+    release_rpm_package_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output .rpm path (must not exist)",
+    )
+    release_rpm_package_parser.add_argument(
+        "--packager",
+        default=None,
+        help="RPM Packager value: Name <address>",
+    )
+    release_rpm_package_parser.add_argument("--json", action="store_true")
+    release_rpm_verify_parser = release_subparsers.add_parser(
+        "rpm-verify",
+        help="Verify a native RPM .rpm without invoking rpm or shell code",
+    )
+    release_rpm_verify_parser.add_argument("package", type=Path)
+    release_rpm_verify_parser.add_argument("--json", action="store_true")
+    release_rpm_repository_parser = release_subparsers.add_parser(
+        "rpm-repository",
+        help="Build DNF/YUM repository metadata around a verified native RPM .rpm",
+    )
+    release_rpm_repository_parser.add_argument(
+        "package",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="Verified .rpm to publish (default: the current workspace .rpm)",
+    )
+    release_rpm_repository_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Repository directory (must not exist)",
+    )
+    release_rpm_repository_parser.add_argument(
+        "--signing-key",
+        default=None,
+        help="Existing GnuPG key fingerprint, key ID or user ID for repomd signing",
+    )
+    release_rpm_repository_parser.add_argument(
+        "--gnupg-home",
+        type=Path,
+        default=None,
+        help="Existing GnuPG home containing the selected signing key",
+    )
+    release_rpm_repository_parser.add_argument(
+        "--gpg",
+        default="gpg",
+        help="GnuPG executable name or path (default: gpg)",
+    )
+    release_rpm_repository_parser.add_argument("--json", action="store_true")
+    release_rpm_repository_verify_parser = release_subparsers.add_parser(
+        "rpm-repository-verify",
+        help="Verify RPM repository metadata without invoking dnf, yum or rpm",
+    )
+    release_rpm_repository_verify_parser.add_argument("repository", type=Path)
+    release_rpm_repository_verify_parser.add_argument(
+        "--gpg",
+        default="gpg",
+        help="GnuPG executable name or path (default: gpg)",
+    )
+    release_rpm_repository_verify_parser.add_argument("--json", action="store_true")
 
     update_parser = subparsers.add_parser(
         "update",
@@ -2247,7 +2465,7 @@ def _run_doctor(settings: Settings, *, as_json: bool = False) -> int:
     )
     print(
         f"Self-Healing PC Agent {__version__} "
-        "(PHASE 39 Secure .env Key Cleanup)"
+        "(PHASE 53 Live Anthropic Verification)"
     )
     print(f"Python: {platform.python_version()}")
     print(f"Environment: {summary['environment']}")
@@ -2286,7 +2504,7 @@ def _run_doctor(settings: Settings, *, as_json: bool = False) -> int:
         f"built-ins={len(builtin_tools)}, office={office_tools}, files={file_tools}, "
         "web.fetch=public-only by default, desktop=open/info plus gated Windows UIA, "
         "images=local Pillow tools plus gated provider vision, "
-        "provider keys=environment first, then Windows Credential Manager"
+        "provider keys=environment first, then secure OS storage"
     )
     print(
         "Web limits: "
@@ -6464,7 +6682,10 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
     if command is None:
         print(
             "Usage: pc-agent release audit|build|verify|info|installer-source|"
-            "installer-verify ...",
+            "installer-verify|installer-acceptance|installer-acceptance-verify|"
+            "posix-source|posix-verify|debian-package|debian-verify|"
+            "debian-repository|debian-repository-verify|rpm-package|rpm-verify|"
+            "rpm-repository|rpm-repository-verify ...",
             file=sys.stderr,
         )
         return 2
@@ -6500,6 +6721,141 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
         info = verify_windows_installer_source(source)
         _print_windows_installer_source(info, as_json=bool(args.json))
         return 0
+    if command == "installer-acceptance":
+        settings.ensure_directories()
+        output = (
+            _resolve_cli_path(settings, args.output)
+            if args.output is not None
+            else settings.workspace_dir / f"windows-installer-acceptance-v{__version__}"
+        )
+        compiler = (
+            _resolve_cli_path(settings, args.compiler, existing=True)
+            if args.compiler is not None
+            else None
+        )
+        report = run_windows_installer_acceptance(
+            settings.root_dir,
+            output,
+            compiler=compiler,
+        )
+        _print_windows_installer_acceptance(report, as_json=bool(args.json))
+        return 0 if report.status == "passed" else 1
+    if command == "installer-acceptance-verify":
+        report_path = _resolve_cli_path(settings, args.report, existing=True)
+        verification = verify_windows_installer_acceptance_report(report_path)
+        _print_windows_installer_acceptance_verification(
+            verification, as_json=bool(args.json)
+        )
+        return 0
+    if command == "posix-source":
+        settings.ensure_directories()
+        output = (
+            _resolve_cli_path(settings, args.output)
+            if args.output is not None
+            else settings.workspace_dir / f"posix-installer-v{__version__}"
+        )
+        info = build_posix_package(settings.root_dir, output)
+        _print_posix_package(info, as_json=bool(args.json), built=True)
+        return 0
+    if command == "posix-verify":
+        source = _resolve_cli_path(settings, args.source, existing=True)
+        info = verify_posix_package(source)
+        _print_posix_package(info, as_json=bool(args.json))
+        return 0
+    if command == "debian-package":
+        settings.ensure_directories()
+        output = (
+            _resolve_cli_path(settings, args.output)
+            if args.output is not None
+            else settings.workspace_dir
+            / f"self-healing-pc-agent_{__version__}-1_all.deb"
+        )
+        build_options: dict[str, Any] = {}
+        if args.maintainer is not None:
+            build_options["maintainer"] = args.maintainer
+        info = build_debian_package(settings.root_dir, output, **build_options)
+        _print_debian_package(info, as_json=bool(args.json), built=True)
+        return 0
+    if command == "debian-verify":
+        package = _resolve_cli_path(settings, args.package, existing=True)
+        info = verify_debian_package(package)
+        _print_debian_package(info, as_json=bool(args.json))
+        return 0
+    if command == "debian-repository":
+        settings.ensure_directories()
+        package = (
+            _resolve_cli_path(settings, args.package, existing=True)
+            if args.package is not None
+            else settings.workspace_dir
+            / f"self-healing-pc-agent_{__version__}-1_all.deb"
+        )
+        output = (
+            _resolve_cli_path(settings, args.output)
+            if args.output is not None
+            else settings.workspace_dir / f"apt-repository-v{__version__}"
+        )
+        info = build_debian_repository(
+            settings.root_dir,
+            package,
+            output,
+            suite=args.suite,
+            signing_key=args.signing_key,
+            gnupg_home=args.gnupg_home,
+            gpg_executable=args.gpg,
+        )
+        _print_debian_repository(info, as_json=bool(args.json), built=True)
+        return 0
+    if command == "debian-repository-verify":
+        repository = _resolve_cli_path(settings, args.repository, existing=True)
+        info = verify_debian_repository(repository, gpg_executable=args.gpg)
+        _print_debian_repository(info, as_json=bool(args.json))
+        return 0
+    if command == "rpm-package":
+        settings.ensure_directories()
+        output = (
+            _resolve_cli_path(settings, args.output)
+            if args.output is not None
+            else settings.workspace_dir
+            / f"self-healing-pc-agent-{__version__}-1.noarch.rpm"
+        )
+        build_options: dict[str, Any] = {}
+        if args.packager is not None:
+            build_options["packager"] = args.packager
+        info = build_rpm_package(settings.root_dir, output, **build_options)
+        _print_rpm_package(info, as_json=bool(args.json), built=True)
+        return 0
+    if command == "rpm-verify":
+        package = _resolve_cli_path(settings, args.package, existing=True)
+        info = verify_rpm_package(package)
+        _print_rpm_package(info, as_json=bool(args.json))
+        return 0
+    if command == "rpm-repository":
+        settings.ensure_directories()
+        package = (
+            _resolve_cli_path(settings, args.package, existing=True)
+            if args.package is not None
+            else settings.workspace_dir / rpm_package_filename()
+        )
+        output = (
+            _resolve_cli_path(settings, args.output)
+            if args.output is not None
+            else settings.workspace_dir / f"rpm-repository-v{__version__}"
+        )
+        info = build_rpm_repository(
+            settings.root_dir,
+            package,
+            output,
+            signing_key=args.signing_key,
+            gnupg_home=args.gnupg_home,
+            gpg_executable=args.gpg,
+        )
+        _print_rpm_repository(info, as_json=bool(args.json), built=True)
+        return 0
+    if command == "rpm-repository-verify":
+        repository = _resolve_cli_path(settings, args.repository, existing=True)
+        info = verify_rpm_repository(repository, gpg_executable=args.gpg)
+        _print_rpm_repository(info, as_json=bool(args.json))
+        return 0
     if command in {"verify", "info"}:
         bundle = _resolve_cli_path(settings, args.bundle, existing=True)
         info = verify_release_bundle(bundle)
@@ -6510,6 +6866,33 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
         )
         return 0
     raise PcAgentError(f"Unknown release command: {command}")
+
+
+def _print_anthropic_verification(report: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+    print(f"Anthropic live verification: {report.summary()}")
+    for check in report.checks:
+        suffix = f" - {check.detail}" if check.detail else ""
+        print(f"  [{check.status.upper()}] {check.name}{suffix}")
+    if report.error:
+        print(f"Error: {report.error}")
+    print("Credential value: not printed or stored in the report")
+    print("Vision: not tested by this text-only verification")
+
+
+def _print_anthropic_verification_report(
+    verification: Any, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(verification.to_dict(), indent=2))
+        return
+    print(f"Verified Anthropic live-verification report: {verification.summary()}")
+    print(f"Location: {verification.report_path}")
+    print(f"Requested model: {verification.requested_model}")
+    print(f"Endpoint: {verification.endpoint_origin}")
+    print("Vision: not tested by this text-only verification")
 
 
 def _print_windows_installer_source(
@@ -6527,6 +6910,104 @@ def _print_windows_installer_source(
     if info.compiled_output_count:
         print(f"Ignored compiled output files: {info.compiled_output_count}")
     print("Authenticode signing: not performed (unsigned installer source)")
+
+
+def _print_windows_installer_acceptance(report: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+    print(f"Windows installer acceptance: {report.summary()}")
+    for step in report.steps:
+        suffix = f" - {step.detail}" if step.detail else ""
+        print(f"  [{step.status.upper()}] {step.name}{suffix}")
+    if report.error:
+        print(f"Error: {report.error}")
+    print("Authenticode signing: not performed (unsigned setup EXE)")
+    print("SmartScreen: not evaluated by silent acceptance")
+
+
+def _print_windows_installer_acceptance_verification(
+    verification: Any, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(verification.to_dict(), indent=2))
+        return
+    print(f"Verified Windows installer acceptance report: {verification.summary()}")
+    print(f"Location: {verification.report_path}")
+    print("Authenticode signing: not performed (unsigned setup EXE)")
+
+
+def _print_posix_package(info: Any, *, as_json: bool, built: bool = False) -> None:
+    if as_json:
+        print(json.dumps(info.to_dict(), indent=2))
+        return
+    action = "Built and verified" if built else "Verified"
+    print(f"{action} POSIX installer source: {info.summary()}")
+    print(f"Location: {info.path}")
+    print(f"Install script SHA-256: {info.install_script_sha256}")
+    print(f"Manifest SHA-256: {info.manifest_sha256}")
+    print("Native PKG/DMG, signing and notarization: not performed")
+
+
+def _print_debian_package(info: Any, *, as_json: bool, built: bool = False) -> None:
+    if as_json:
+        print(json.dumps(info.to_dict(), indent=2))
+        return
+    action = "Built and verified" if built else "Verified"
+    print(f"{action} Debian package: {info.summary()}")
+    print(f"Location: {info.path}")
+    print(f"Package SHA-256: {info.package_sha256}")
+    print(f"Manifest SHA-256: {info.manifest_sha256}")
+    print("Repository/package signing: not performed")
+
+
+def _print_debian_repository(
+    info: Any, *, as_json: bool, built: bool = False
+) -> None:
+    if as_json:
+        print(json.dumps(info.to_dict(), indent=2))
+        return
+    action = "Built and verified" if built else "Verified"
+    print(f"{action} Debian APT repository: {info.summary()}")
+    print(f"Location: {info.path}")
+    print(f"Package SHA-256: {info.package_sha256}")
+    print(f"Release SHA-256: {info.release_sha256}")
+    print(f"Manifest SHA-256: {info.manifest_sha256}")
+    if info.signed:
+        print("Repository signing: OpenPGP signed")
+        print(f"Signing key fingerprint: {info.signing_key_fingerprint}")
+    else:
+        print("Repository signing: not performed (unsigned repository)")
+
+
+def _print_rpm_package(info: Any, *, as_json: bool, built: bool = False) -> None:
+    if as_json:
+        print(json.dumps(info.to_dict(), indent=2))
+        return
+    action = "Built and verified" if built else "Verified"
+    print(f"{action} RPM package: {info.summary()}")
+    print(f"Location: {info.path}")
+    print(f"Package SHA-256: {info.package_sha256}")
+    print(f"Manifest SHA-256: {info.manifest_sha256}")
+    print("Repository/package signing: not performed")
+
+
+def _print_rpm_repository(info: Any, *, as_json: bool, built: bool = False) -> None:
+    if as_json:
+        print(json.dumps(info.to_dict(), indent=2))
+        return
+    action = "Built and verified" if built else "Verified"
+    print(f"{action} RPM repository: {info.summary()}")
+    print(f"Location: {info.path}")
+    print(f"Package SHA-256: {info.package_sha256}")
+    print(f"Repomd SHA-256: {info.repomd_sha256}")
+    print(f"Manifest SHA-256: {info.manifest_sha256}")
+    if info.signed:
+        print("Repository metadata signing: OpenPGP signed")
+        print(f"Signing key fingerprint: {info.signing_key_fingerprint}")
+    else:
+        print("Repository metadata signing: not performed (unsigned repository)")
+    print("RPM package OpenPGP signing: not performed")
 
 
 def _confirm_update_action(summary: str, *, assume_yes: bool) -> bool:
@@ -7106,8 +7587,30 @@ def _print_env_cleanup_result(result: Any, *, as_json: bool) -> None:
 
 
 def _run_providers_command(settings: Settings, args: argparse.Namespace) -> int:
+    if args.providers_command == "verify-anthropic":
+        _require_license(settings, FEATURE_PROVIDERS)
+        settings.ensure_directories()
+        report_path = (
+            _resolve_cli_path(settings, args.report)
+            if args.report is not None
+            else None
+        )
+        report = run_anthropic_live_verification(settings, report_path)
+        _print_anthropic_verification(report, as_json=bool(args.json))
+        return 0 if report.status == "passed" else 1
+    if args.providers_command == "verify-anthropic-report":
+        report_path = _resolve_cli_path(settings, args.report, existing=True)
+        verification = verify_anthropic_live_verification_report(report_path)
+        _print_anthropic_verification_report(
+            verification, as_json=bool(args.json)
+        )
+        return 0
     if args.providers_command != "list":
-        print("Usage: pc-agent providers list", file=sys.stderr)
+        print(
+            "Usage: pc-agent providers list|verify-anthropic|"
+            "verify-anthropic-report ...",
+            file=sys.stderr,
+        )
         return 2
     for status in provider_statuses(settings):
         route = "in-route" if status.in_route else "not-in-route"

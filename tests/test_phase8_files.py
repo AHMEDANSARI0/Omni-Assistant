@@ -361,7 +361,7 @@ def test_cli_files_commands(tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
 
     assert main([*root, "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 39 Secure .env Key Cleanup" in doctor
+    assert "PHASE 53 Live Anthropic Verification" in doctor
     assert "built-ins=62" in doctor and "files=5" in doctor
 
 

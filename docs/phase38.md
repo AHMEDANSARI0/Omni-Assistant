@@ -120,3 +120,13 @@ Authenticode certificate and a Windows build/check run.
 
 There is no registered model-callable installer tool, and no GUI, provider,
 database/schema, task, planner, or dynamic-authority change in this phase.
+
+## Phase 46 follow-up — **Windows Inno Acceptance Harness**
+
+Phase 46 adds the guarded **Windows Inno Acceptance Harness** described in
+`docs/phase46.md`. It compiles this source package with a locally installed
+`ISCC.exe`, installs and uninstalls it silently in an isolated directory,
+verifies installed payload hashes, shortcuts, registry state, CLI/GUI
+checks and sentinel preservation, and retains a JSON report. Phase 38's own
+Linux-side evidence boundary above remains historically accurate; a live
+Windows transcript exists only after the harness passes on Windows.
