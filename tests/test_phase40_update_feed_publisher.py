@@ -26,7 +26,7 @@ from pc_agent.update_feed_publisher import (
 from pc_agent.updates import b64url_encode
 
 ROOT = Path(__file__).resolve().parents[1]
-_FUTURE = "0.56.0"
+_FUTURE = "0.61.0"
 _BASE_URL = "https://updates.example.com/self-healing-pc-agent"
 _PUBLISHED_AT = "2026-10-30T12:00:00Z"
 _KEY_ID = "release-test"
@@ -253,7 +253,7 @@ def test_phase40_feed_verification_fails_closed(
     shutil.copytree(output, rehashed)
     feed_path = rehashed / "stable.json"
     feed = json.loads(feed_path.read_text(encoding="utf-8"))
-    feed["version"] = "0.57.0"
+    feed["version"] = "0.62.0"
     feed_path.write_text(json.dumps(feed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     manifest_path = rehashed / UPDATE_FEED_PUBLISHER_MANIFEST
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -357,7 +357,7 @@ def test_phase40_release_admin_and_customer_consumer_round_trip(
 
 
 def test_phase40_scope_inventory_and_counts() -> None:
-    assert __version__ == "0.55.0"
+    assert __version__ == "0.60.0"
     assert len(build_default_registry().list_tools()) == 62
     assert LATEST_SCHEMA_VERSION == 6
 

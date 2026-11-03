@@ -455,9 +455,9 @@ def test_ltv_dss_direct_cli_and_gui(
         )
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.55.0"
+    assert summary.version == __version__ == "0.60.0"
     assert summary.builtin_tools == 62
-    assert "PHASE 53 Live Anthropic Verification" in summary.to_text()
+    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
 
 
 def test_phase36_scope_docs_schema_and_no_registered_tool() -> None:
@@ -465,7 +465,7 @@ def test_phase36_scope_docs_schema_and_no_registered_tool() -> None:
     candidates = {path.as_posix() for path in release_candidate_files(project_root)}
     ids = {item.spec.id for item in build_default_registry().list_tools()}
 
-    assert __version__ == "0.55.0"
+    assert __version__ == "0.60.0"
     assert LATEST_SCHEMA_VERSION == 6
     assert len(ids) == 62
     assert "pdf.add_ltv" not in ids

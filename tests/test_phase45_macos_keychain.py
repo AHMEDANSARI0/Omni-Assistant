@@ -319,7 +319,7 @@ def test_phase45_scope_and_documentation() -> None:
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert __version__ == "0.55.0"
+    assert __version__ == "0.60.0"
     assert LATEST_SCHEMA_VERSION == 6
     assert len(build_default_registry().list_tools()) == 62
     assert project["project"]["version"] == __version__

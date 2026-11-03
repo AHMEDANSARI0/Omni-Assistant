@@ -488,7 +488,7 @@ def test_cli_image_commands_and_vision_confirmation(
 
     assert main([*root, "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 53 Live Anthropic Verification" in doctor
+    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in doctor
     assert "built-ins=62" in doctor
     assert "Vision: disabled" in doctor
 
@@ -568,7 +568,7 @@ def test_gui_controller_images_and_doctor(tmp_path: Path) -> None:
     _write_sample(settings.workspace_dir / "sample.png")
 
     summary = controller.doctor_summary()
-    assert "PHASE 53 Live Anthropic Verification" in summary.to_text()
+    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
     assert summary.builtin_tools == 62
     assert "Vision: enabled" in summary.to_text()
 

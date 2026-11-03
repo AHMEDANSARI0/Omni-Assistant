@@ -32,6 +32,9 @@ from .controller import (
     TaskRunOptions,
     WebFetchOutcome,
     format_approval_request,
+    format_auto_upgrade_run,
+    format_auto_upgrade_schedule,
+    format_auto_upgrade_status,
     format_diagnosis,
     format_downloaded_update,
     format_execution_report,
@@ -335,7 +338,7 @@ class PcAgentGuiApp:
 
         update_frame = ttk.LabelFrame(
             tab,
-            text="Signed Updates (Offline + Explicit Online)",
+            text="Signed Updates (Offline + Online + Background)",
             style="Section.TLabelframe",
             padding=6,
         )
@@ -392,7 +395,7 @@ class PcAgentGuiApp:
         ttk.Entry(update_frame, textvariable=self.update_channel_var).grid(
             row=4, column=1, sticky="ew", pady=2
         )
-        ttk.Label(update_frame, text="Explicit check/download; no auto-apply").grid(
+        ttk.Label(update_frame, text="Background stays config-gated").grid(
             row=4, column=2, sticky="e", padx=(6, 0), pady=2
         )
         update_actions = ttk.Frame(update_frame)
@@ -433,6 +436,33 @@ class PcAgentGuiApp:
             online_actions,
             text="Download + Stage",
             command=self._stage_online_update,
+        ).pack(side="left", padx=(6, 0))
+        auto_actions = ttk.Frame(update_frame)
+        auto_actions.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Button(
+            auto_actions,
+            text="Auto Status",
+            command=self._show_auto_upgrade_status,
+        ).pack(side="left")
+        ttk.Button(
+            auto_actions,
+            text="Run Auto Once",
+            command=self._run_auto_upgrade_now,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            auto_actions,
+            text="Schedule Status",
+            command=self._show_auto_upgrade_schedule_status,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            auto_actions,
+            text="Install Schedule",
+            command=self._install_auto_upgrade_schedule,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            auto_actions,
+            text="Remove Schedule",
+            command=self._uninstall_auto_upgrade_schedule,
         ).pack(side="left", padx=(6, 0))
 
         self.doctor_text = self._make_text(tab, height=24, width=96)
@@ -2052,6 +2082,95 @@ class PcAgentGuiApp:
 
         self._run_async(
             "List offline updates", self.controller.list_offline_updates, done
+        )
+
+    def _show_auto_upgrade_status(self) -> None:
+        def done(status: Any) -> None:
+            self._set_text(self.doctor_text, format_auto_upgrade_status(status))
+
+        self._run_async(
+            "Show background auto-upgrade status",
+            self.controller.auto_upgrade_status,
+            done,
+        )
+
+    def _run_auto_upgrade_now(self) -> None:
+        mode = self.settings.auto_upgrade_mode
+        if not messagebox.askokcancel(
+            "Run background auto-upgrade once",
+            "Run one signed background auto-upgrade pass now?\n\n"
+            f"Configured mode: {mode}\n"
+            "stage-only never applies. apply-when-idle may apply only "
+            "when every maintenance, active-task, idle and power gate passes.",
+            parent=self.root,
+        ):
+            return
+
+        def done(report: Any) -> None:
+            if report.staged_update_id:
+                self.update_id_var.set(report.staged_update_id)
+            if report.applied_update_id:
+                self.update_id_var.set(report.applied_update_id)
+            self._set_text(self.doctor_text, format_auto_upgrade_run(report))
+
+        self._run_async(
+            "Run background auto-upgrade",
+            self.controller.auto_upgrade_run_now,
+            done,
+        )
+
+    def _show_auto_upgrade_schedule_status(self) -> None:
+        def done(result: Any) -> None:
+            self._set_text(
+                self.doctor_text, format_auto_upgrade_schedule(result)
+            )
+
+        self._run_async(
+            "Show Windows auto-upgrade schedule",
+            self.controller.auto_upgrade_schedule_status,
+            done,
+        )
+
+    def _install_auto_upgrade_schedule(self) -> None:
+        if not messagebox.askokcancel(
+            "Install Windows auto-upgrade schedule",
+            "Register the per-user Windows Scheduled Task?\n\n"
+            "It wakes at logon and hourly, but the worker itself enforces "
+            ".env opt-in, signed HTTPS, interval, maintenance-window, "
+            "active-task, idle and AC-power gates.",
+            parent=self.root,
+        ):
+            return
+
+        def done(result: Any) -> None:
+            self._set_text(
+                self.doctor_text, format_auto_upgrade_schedule(result)
+            )
+
+        self._run_async(
+            "Install Windows auto-upgrade schedule",
+            self.controller.install_auto_upgrade_schedule,
+            done,
+        )
+
+    def _uninstall_auto_upgrade_schedule(self) -> None:
+        if not messagebox.askokcancel(
+            "Remove Windows auto-upgrade schedule",
+            "Remove the Windows Scheduled Task? Existing state, reports, "
+            "staged updates and .env settings are kept.",
+            parent=self.root,
+        ):
+            return
+
+        def done(result: Any) -> None:
+            self._set_text(
+                self.doctor_text, format_auto_upgrade_schedule(result)
+            )
+
+        self._run_async(
+            "Remove Windows auto-upgrade schedule",
+            self.controller.uninstall_auto_upgrade_schedule,
+            done,
         )
 
     def _create_pdf_demo(self) -> None:

@@ -94,3 +94,13 @@ the Secret Service.
   evidence is not claimed.
 - macOS Keychain is not implemented in this phase, and no desktop
   automation parity is claimed.
+
+## Phase 54 follow-up — **Live GNOME Keyring/KWallet Evidence**
+
+Phase 54 supplies the live evidence path not claimed above:
+`pc-agent credentials linux-secret-service-acceptance` identifies the
+session-bus owner of `org.freedesktop.secrets`, accepts only GNOME
+Keyring or KWallet/KSecretService, round-trips/deletes a unique isolated
+random probe, and proves real provider keys unchanged without recording
+any secret. Its report can be revalidated offline. See
+`docs/phase54.md`.

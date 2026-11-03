@@ -1,10 +1,12 @@
 # Phase 24: Online Signed Update Download
 
 Phase 24 extends the Phase 21 signed-update system with an explicit,
-operator-initiated HTTPS download path. There is **no background checker, no
-silent download, and no silent installation**. Online staging still leaves
-application separate: `online-stage` can download, verify and stage an update,
-but it will **never auto-apply** it.
+operator-initiated HTTPS download path. The Phase 24 commands themselves
+have no background checker, silent download or silent installation.
+Online staging still leaves application separate: `online-stage` can
+download, verify and stage an update, but it will **never auto-apply** it.
+Phase 56 later added a separately opted-in **Background Auto-Upgrade**
+worker around this same verified path; see `docs/phase56.md`.
 
 ## Trust model
 
@@ -121,8 +123,10 @@ does not poll for updates when opened.
 
 ## Boundaries
 
-- No background service, scheduler, silent download, silent staging, silent
-  apply, restart, package installation or telemetry was added.
+- Phase 24 itself added no background service, scheduler, silent download,
+  silent staging, silent apply, restart, package installation or telemetry.
+  Phase 56 is the later, separately gated exception for the background
+  worker/scheduler; it still adds no telemetry or planner capability.
 - No planner/task tool can initiate an online update; tool count stays 60.
 - No AI provider sees the feed, bundle or signature.
 - The downloaded ZIP is still the Phase 18 portable bundle format. This is
@@ -134,12 +138,19 @@ does not poll for updates when opened.
 ## Remaining work after Phase 24
 
 - A signed Windows installer/Authenticode flow remains separate future work.
-- A true background auto-update service was intentionally not implemented.
+- A true background auto-update service was intentionally not implemented in
+  Phase 24. Phase 56 later implemented the Windows-first background worker
+  under a separate signed-HTTPS opt-in; Linux/macOS schedulers remain
+  planned.
 - macOS/Linux packaging, Keychain/Secret Service credentials and desktop
   automation parity remain future platform work.
 - PDF password, form and digital-signature workflows remain separate.
 - Live Anthropic verification still needs a user-provided Anthropic key.
 - Phase 40 later added the vendor publisher for this exact static tree and
-  its customer public-key configuration. The vendor must still upload that
-  verified package to its own real HTTPS origin; no public host was created
-  or proven live by the software.
+  its customer public-key configuration. Phase 55 later added
+  **Windows HTTPS Update-Feed Hosting**: a verified Windows deployment
+  package, built-in TLS host/scheduled-task and IIS profiles, plus
+  `pc-agent update hosting-check` retained live evidence. The operator
+  still supplies the Windows host, DNS, firewall/NAT and publicly trusted
+  TLS certificate; a public host is proven only by a passed report from
+  that real URL. Linux/macOS hosting profiles remain planned.

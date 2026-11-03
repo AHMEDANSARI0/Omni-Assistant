@@ -22,6 +22,16 @@ from pathlib import Path
 from typing import Any
 
 from .. import __version__
+from ..auto_upgrade import (
+    AutoUpgradeRunReport,
+    AutoUpgradeSchedulerResult,
+    AutoUpgradeStatus,
+    get_auto_upgrade_status,
+    get_windows_auto_upgrade_schedule,
+    install_windows_auto_upgrade_schedule,
+    run_auto_upgrade,
+    uninstall_windows_auto_upgrade_schedule,
+)
 from ..browser_cdp import probe_browser
 from ..config import Settings
 from ..credentials import CredentialStore, build_credential_store
@@ -184,7 +194,7 @@ class DoctorSummary:
             [
                 (
                     f"Self-Healing PC Agent {self.version} "
-                    "(PHASE 53 Live Anthropic Verification)"
+                    "(PHASE 58 Windows Auto-Upgrade Lock Hotfix)"
                 ),
                 f"Python: {self.python_version}",
                 f"Environment: {self.environment}",
@@ -653,7 +663,9 @@ class GuiController:
             f"key_id={self.settings.release_key_id or 'any'}; "
             f"required={required}; online={public['online_updates']}; "
             f"feed_host={public['update_feed_host']}; "
-            f"channel={public['update_channel']}; latest={latest}"
+            f"channel={public['update_channel']}; "
+            f"auto_upgrade={public['auto_upgrade']} "
+            f"({public['auto_upgrade_mode']}); latest={latest}"
         )
 
     def check_offline_update(
@@ -749,6 +761,28 @@ class GuiController:
         if limit < 1 or limit > 200:
             raise PcAgentError("Update list limit must be between 1 and 200.")
         return list_updates(self.settings)[:limit]
+
+    def auto_upgrade_status(self) -> AutoUpgradeStatus:
+        """Read background state; this never changes .env configuration."""
+
+        return get_auto_upgrade_status(
+            self.settings, include_scheduler=True
+        )
+
+    def auto_upgrade_run_now(self) -> AutoUpgradeRunReport:
+        """Run one explicit GUI-triggered pass under the configured policy."""
+
+        self.settings.ensure_directories()
+        return run_auto_upgrade(self.settings, force=True)
+
+    def auto_upgrade_schedule_status(self) -> AutoUpgradeSchedulerResult:
+        return get_windows_auto_upgrade_schedule()
+
+    def install_auto_upgrade_schedule(self) -> AutoUpgradeSchedulerResult:
+        return install_windows_auto_upgrade_schedule(self.settings)
+
+    def uninstall_auto_upgrade_schedule(self) -> AutoUpgradeSchedulerResult:
+        return uninstall_windows_auto_upgrade_schedule()
 
     def database_backup_summary(self) -> str:
         backups = DatabaseMaintenanceService(
@@ -2445,6 +2479,51 @@ def format_update_list(updates: Sequence[StagedUpdate]) -> str:
     if not updates:
         return "No offline updates recorded."
     return "\n".join(f"- {update.summary()}" for update in updates)
+
+
+def format_auto_upgrade_status(status: AutoUpgradeStatus) -> str:
+    lines = [f"Background auto-upgrade status: {status.summary()}"]
+    if status.blockers:
+        lines.append("Blockers: " + "; ".join(status.blockers))
+    lines.append(f"State: {status.state_path}")
+    if status.scheduler is not None:
+        lines.append(
+            "Windows schedule: "
+            f"installed={status.scheduler.installed}; "
+            f"task={status.scheduler.task_name}; "
+            f"state={status.scheduler.state}"
+        )
+    lines.append(
+        "Configuration remains .env/CLI controlled; the GUI only reads "
+        "state, runs one explicit pass, or registers/removes the task."
+    )
+    return "\n".join(lines)
+
+
+def format_auto_upgrade_run(report: AutoUpgradeRunReport) -> str:
+    lines = [f"Background auto-upgrade: {report.summary()}"]
+    lines.extend(
+        f"  [{check.status.upper()}] {check.name}: {check.detail}"
+        for check in report.checks
+    )
+    if report.error:
+        lines.append(f"Error: {report.error}")
+    lines.append(f"State: {report.state_path}")
+    lines.append(f"Report: {report.report_path}")
+    if report.restart_required:
+        lines.append(
+            "Restart required before using an applied version; reinstall "
+            "editable metadata if that step was not enabled."
+        )
+    return "\n".join(lines)
+
+
+def format_auto_upgrade_schedule(result: AutoUpgradeSchedulerResult) -> str:
+    lines = [f"Windows auto-upgrade schedule: {result.summary()}"]
+    if result.executable:
+        lines.append(f"Executable: {result.executable}")
+    lines.append(result.detail)
+    return "\n".join(lines)
 
 
 def format_self_repair_diagnosis(diagnosis: SelfRepairDiagnosis) -> str:

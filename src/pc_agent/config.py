@@ -30,6 +30,7 @@ _ALLOWED_ENVIRONMENTS = frozenset({"development", "test", "production"})
 _ALLOWED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _ALLOWED_LICENSE_ENFORCEMENT = frozenset({"off", "warn", "enforce"})
 _ALLOWED_CREDENTIAL_STORES = frozenset({"auto", "windows", "linux", "macos", "env"})
+_ALLOWED_AUTO_UPGRADE_MODES = frozenset({"stage-only", "apply-when-idle"})
 # Provider slots understood by the replaceable provider-abstraction layer.
 # `providers list` says which slots have a direct adapter in this build.
 _ALLOWED_PROVIDERS = frozenset(
@@ -167,6 +168,16 @@ class Settings:
     update_channel: str = "stable"
     online_update_timeout_seconds: float = 30.0
     online_update_max_bytes: int = 25_000_000
+    # Phase 56 background auto-upgrade. This is a second, separate opt-in
+    # from explicit online downloads. It accepts signed updates only; the
+    # default mode stages a verified update but does not apply it.
+    auto_upgrade_enabled: bool = False
+    auto_upgrade_mode: str = "stage-only"
+    auto_upgrade_interval_hours: int = 24
+    auto_upgrade_idle_minutes: int = 15
+    auto_upgrade_maintenance_window: str | None = None
+    auto_upgrade_require_ac_power: bool = True
+    auto_upgrade_reinstall: bool = False
     gemini_api_key: str | None = field(default=None, repr=False)
     openrouter_api_key: str | None = field(default=None, repr=False)
     openai_api_key: str | None = field(default=None, repr=False)
@@ -276,6 +287,19 @@ class Settings:
                 self.online_update_timeout_seconds
             ),
             "online_update_max_bytes": str(self.online_update_max_bytes),
+            "auto_upgrade": "yes" if self.auto_upgrade_enabled else "no",
+            "auto_upgrade_mode": self.auto_upgrade_mode,
+            "auto_upgrade_interval_hours": str(self.auto_upgrade_interval_hours),
+            "auto_upgrade_idle_minutes": str(self.auto_upgrade_idle_minutes),
+            "auto_upgrade_maintenance_window": (
+                self.auto_upgrade_maintenance_window or "any"
+            ),
+            "auto_upgrade_require_ac_power": (
+                "yes" if self.auto_upgrade_require_ac_power else "no"
+            ),
+            "auto_upgrade_reinstall": (
+                "yes" if self.auto_upgrade_reinstall else "no"
+            ),
         }
 
     @classmethod
@@ -438,6 +462,27 @@ class Settings:
         online_update_max_bytes = _parse_online_update_max_bytes(
             get("PC_AGENT_ONLINE_UPDATE_MAX_BYTES", "25000000")
         )
+        auto_upgrade_enabled = _parse_auto_upgrade_enabled(
+            get("PC_AGENT_AUTO_UPGRADE", "0")
+        )
+        auto_upgrade_mode = _parse_auto_upgrade_mode(
+            get("PC_AGENT_AUTO_UPGRADE_MODE", "stage-only")
+        )
+        auto_upgrade_interval_hours = _parse_auto_upgrade_interval_hours(
+            get("PC_AGENT_AUTO_UPGRADE_INTERVAL_HOURS", "24")
+        )
+        auto_upgrade_idle_minutes = _parse_auto_upgrade_idle_minutes(
+            get("PC_AGENT_AUTO_UPGRADE_IDLE_MINUTES", "15")
+        )
+        auto_upgrade_maintenance_window = _parse_auto_upgrade_window(
+            get("PC_AGENT_AUTO_UPGRADE_MAINTENANCE_WINDOW")
+        )
+        auto_upgrade_require_ac_power = _parse_auto_upgrade_require_ac_power(
+            get("PC_AGENT_AUTO_UPGRADE_REQUIRE_AC_POWER", "1")
+        )
+        auto_upgrade_reinstall = _parse_auto_upgrade_reinstall(
+            get("PC_AGENT_AUTO_UPGRADE_REINSTALL", "0")
+        )
 
         gemini_model = _parse_model(
             "PC_AGENT_GEMINI_MODEL", get("PC_AGENT_GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
@@ -563,6 +608,13 @@ class Settings:
             update_channel=update_channel,
             online_update_timeout_seconds=online_update_timeout_seconds,
             online_update_max_bytes=online_update_max_bytes,
+            auto_upgrade_enabled=auto_upgrade_enabled,
+            auto_upgrade_mode=auto_upgrade_mode,
+            auto_upgrade_interval_hours=auto_upgrade_interval_hours,
+            auto_upgrade_idle_minutes=auto_upgrade_idle_minutes,
+            auto_upgrade_maintenance_window=auto_upgrade_maintenance_window,
+            auto_upgrade_require_ac_power=auto_upgrade_require_ac_power,
+            auto_upgrade_reinstall=auto_upgrade_reinstall,
             gemini_api_key=api_keys["gemini"],
             openrouter_api_key=api_keys["openrouter"],
             openai_api_key=api_keys["openai"],
@@ -817,6 +869,84 @@ def _parse_online_updates_enabled(raw: str) -> bool:
         "PC_AGENT_ONLINE_UPDATES must be a boolean "
         "(1/0, true/false, yes/no, on/off)."
     )
+
+
+def _parse_auto_upgrade_boolean(name: str, raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ConfigError(
+        f"{name} must be a boolean (1/0, true/false, yes/no, on/off)."
+    )
+
+
+def _parse_auto_upgrade_enabled(raw: str) -> bool:
+    return _parse_auto_upgrade_boolean("PC_AGENT_AUTO_UPGRADE", raw)
+
+
+def _parse_auto_upgrade_mode(raw: str) -> str:
+    value = raw.strip().lower().replace("_", "-") or "stage-only"
+    if value not in _ALLOWED_AUTO_UPGRADE_MODES:
+        raise ConfigError(
+            "PC_AGENT_AUTO_UPGRADE_MODE must be one of: "
+            "stage-only, apply-when-idle."
+        )
+    return value
+
+
+def _parse_auto_upgrade_interval_hours(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            "PC_AGENT_AUTO_UPGRADE_INTERVAL_HOURS must be an integer."
+        ) from exc
+    if value < 1 or value > 168:
+        raise ConfigError(
+            "PC_AGENT_AUTO_UPGRADE_INTERVAL_HOURS must be between 1 and 168."
+        )
+    return value
+
+
+def _parse_auto_upgrade_idle_minutes(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            "PC_AGENT_AUTO_UPGRADE_IDLE_MINUTES must be an integer."
+        ) from exc
+    if value < 0 or value > 240:
+        raise ConfigError(
+            "PC_AGENT_AUTO_UPGRADE_IDLE_MINUTES must be between 0 and 240."
+        )
+    return value
+
+
+def _parse_auto_upgrade_window(raw: str) -> str | None:
+    value = raw.strip()
+    if not value:
+        return None
+    match = re.fullmatch(
+        r"([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)", value
+    )
+    if match is None or match.group(1, 2) == match.group(3, 4):
+        raise ConfigError(
+            "PC_AGENT_AUTO_UPGRADE_MAINTENANCE_WINDOW must be HH:MM-HH:MM "
+            "with different start and end times."
+        )
+    return value
+
+
+def _parse_auto_upgrade_require_ac_power(raw: str) -> bool:
+    return _parse_auto_upgrade_boolean(
+        "PC_AGENT_AUTO_UPGRADE_REQUIRE_AC_POWER", raw
+    )
+
+
+def _parse_auto_upgrade_reinstall(raw: str) -> bool:
+    return _parse_auto_upgrade_boolean("PC_AGENT_AUTO_UPGRADE_REINSTALL", raw)
 
 
 def _is_loopback_host(host: str) -> bool:

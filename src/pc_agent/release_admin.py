@@ -18,6 +18,12 @@ from typing import Any
 from .errors import PcAgentError
 from .licensing.ed25519 import generate_seed, public_key_from_seed, sign
 from .release import verify_release_bundle
+from .update_feed_hosting import (
+    build_update_feed_hosting_package,
+    list_hosting_profiles,
+    serve_update_feed_hosting_package,
+    verify_update_feed_hosting_package,
+)
 from .update_feed_publisher import (
     build_update_feed_package,
     verify_update_feed_package,
@@ -210,6 +216,89 @@ def _verify_feed(args: argparse.Namespace) -> int:
     return 0
 
 
+def _hosting_public_key(args: argparse.Namespace) -> str | bytes:
+    if args.public_key_file is not None:
+        return _read_public_key(args.public_key_file)
+    return str(args.public_key)
+
+
+def _print_hosting_package(info: Any, *, action: str, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(info.to_dict(), indent=2))
+        return
+    print(f"{action} Windows HTTPS update-feed hosting package: {info.summary()}")
+    print(f"Location: {info.path}")
+    print(f"Feed URL: {info.feed_url}")
+    print(f"Deployment: {info.deployment_name} at {info.deployment_root}")
+    print(f"Bundle SHA-256: {info.bundle_sha256}")
+    print(f"Hosting manifest SHA-256: {info.manifest_sha256}")
+    print("TLS certificate/private key included: no")
+    print("Uploaded/live verified: no (deploy first, then run hosting-check)")
+
+
+def _hosting_profiles(args: argparse.Namespace) -> int:
+    profiles = list_hosting_profiles()
+    if args.json:
+        print(json.dumps([profile.to_dict() for profile in profiles], indent=2))
+        return 0
+    print("Update-feed hosting profiles:")
+    for profile in profiles:
+        print(
+            f"  {profile.profile_id}: platform={profile.platform}; "
+            f"status={profile.status}; {profile.display_name}"
+        )
+    print("Linux/macOS entries are structure only in this Windows-first phase.")
+    return 0
+
+
+def _build_hosting(args: argparse.Namespace) -> int:
+    info = build_update_feed_hosting_package(
+        args.package,
+        args.output,
+        public_key=_hosting_public_key(args),
+        key_id=args.key_id,
+        profile_id=args.profile,
+        deployment_name=args.deployment_name,
+        deployment_root=args.deployment_root,
+    )
+    _print_hosting_package(
+        info, action="Built and verified", as_json=bool(args.json)
+    )
+    return 0
+
+
+def _verify_hosting(args: argparse.Namespace) -> int:
+    info = verify_update_feed_hosting_package(
+        args.package,
+        public_key=_hosting_public_key(args),
+        key_id=args.key_id,
+        expected_profile=args.profile,
+    )
+    _print_hosting_package(info, action="Verified", as_json=bool(args.json))
+    return 0
+
+
+def _is_windows() -> bool:
+    return sys.platform == "win32"
+
+
+def _serve_hosting(args: argparse.Namespace) -> int:
+    if not _is_windows():
+        raise PcAgentError(
+            "The built-in HTTPS update-feed host is enabled on Windows only "
+            "in this phase; Linux/macOS hosting profiles are planned."
+        )
+    return serve_update_feed_hosting_package(
+        args.package,
+        public_key=_hosting_public_key(args),
+        key_id=args.key_id,
+        certificate_path=args.certificate,
+        private_key_path=args.private_key,
+        bind_host=args.bind,
+        port=args.port,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent-release-admin",
@@ -271,6 +360,57 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--base-url", default=None)
     verify_parser.add_argument("--channel", default=None)
     verify_parser.set_defaults(handler=_verify_feed)
+
+    profiles_parser = subparsers.add_parser(
+        "hosting-profiles",
+        help="List Windows-first update-feed hosting profiles",
+    )
+    profiles_parser.add_argument("--json", action="store_true")
+    profiles_parser.set_defaults(handler=_hosting_profiles)
+
+    build_hosting_parser = subparsers.add_parser(
+        "build-hosting",
+        help="Build a Windows operational hosting package around a feed package",
+    )
+    build_hosting_parser.add_argument("package", type=Path)
+    build_key_group = build_hosting_parser.add_mutually_exclusive_group(required=True)
+    build_key_group.add_argument("--public-key")
+    build_key_group.add_argument("--public-key-file", type=Path)
+    build_hosting_parser.add_argument("--key-id", default="release-1")
+    build_hosting_parser.add_argument("--profile", default="windows-https-task")
+    build_hosting_parser.add_argument("--deployment-name", default=None)
+    build_hosting_parser.add_argument("--deployment-root", default=None)
+    build_hosting_parser.add_argument("--output", type=Path, required=True)
+    build_hosting_parser.add_argument("--json", action="store_true")
+    build_hosting_parser.set_defaults(handler=_build_hosting)
+
+    verify_hosting_parser = subparsers.add_parser(
+        "verify-hosting",
+        help="Verify a Windows operational update-feed hosting package",
+    )
+    verify_hosting_parser.add_argument("package", type=Path)
+    verify_key_group = verify_hosting_parser.add_mutually_exclusive_group(required=True)
+    verify_key_group.add_argument("--public-key")
+    verify_key_group.add_argument("--public-key-file", type=Path)
+    verify_hosting_parser.add_argument("--key-id", default="release-1")
+    verify_hosting_parser.add_argument("--profile", default=None)
+    verify_hosting_parser.add_argument("--json", action="store_true")
+    verify_hosting_parser.set_defaults(handler=_verify_hosting)
+
+    serve_hosting_parser = subparsers.add_parser(
+        "serve-hosting",
+        help="Serve a verified Windows hosting package over HTTPS until stopped",
+    )
+    serve_hosting_parser.add_argument("package", type=Path)
+    serve_key_group = serve_hosting_parser.add_mutually_exclusive_group(required=True)
+    serve_key_group.add_argument("--public-key")
+    serve_key_group.add_argument("--public-key-file", type=Path)
+    serve_hosting_parser.add_argument("--key-id", default="release-1")
+    serve_hosting_parser.add_argument("--certificate", type=Path, required=True)
+    serve_hosting_parser.add_argument("--private-key", type=Path, required=True)
+    serve_hosting_parser.add_argument("--bind", default="0.0.0.0")
+    serve_hosting_parser.add_argument("--port", type=int, default=None)
+    serve_hosting_parser.set_defaults(handler=_serve_hosting)
     return parser
 
 

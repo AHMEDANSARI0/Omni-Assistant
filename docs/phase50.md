@@ -92,3 +92,15 @@ remain separate future work.
 Phase 52 fixes this builder's Windows-incompatible `os.utime`
 `follow_symlinks=False` call with a capability-checked, symlink-rejecting
 helper. See `docs/phase52.md`.
+
+## Phase 57 follow-up — **Live Debian/Ubuntu APT Evidence**
+
+Phase 57 later added the direct live acceptance for a repository built by
+this contract. On an exact Debian/Ubuntu host where the application package
+is absent, `pc-agent release debian-repository-acceptance` reverifies the
+repository/package, runs APT update/candidate/install through a temporary
+source and isolated APT state/cache, verifies dpkg state and every installed
+file, then purges only the acceptance package and retains a self-hashed
+report. The historical Phase 50 boundary above describes what Phase 50
+itself delivered; a host is proven by its own passed Phase 57 report. See
+`docs/phase57.md`.

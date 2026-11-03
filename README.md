@@ -68,7 +68,12 @@ what it did.
 | Implemented + tested (Phase 51) | **RPM Repository**: direct `pc-agent release rpm-repository` publishes the verified `noarch` `.rpm` under `Packages/`, with deterministic gzip primary/filelists/other XML, content-addressed repodata names, a hash-complete `repomd.xml` and a strict repository manifest; `rpm-repository-verify` revalidates the complete tree and embedded package without dnf/yum/rpm. Optional `--signing-key` uses the operator's existing system GnuPG key to sign `repomd.xml` and export its public key—no private key/passphrase is accepted or stored, and the RPM itself remains unsigned. No repository hosting, live Fedora/RHEL install claim, registered tool (62), schema migration or Python dependency |
 | Hotfix (Phase 52) | **Windows Repository Timestamp Hotfix**: Phase 50/51 repository builders no longer call Windows-unsupported `os.utime(..., follow_symlinks=False)` unguarded; a capability-checked helper rejects symlinks and uses the portable Windows timestamp form, fixing four Windows Phase 50 test failures and the equivalent latent Phase 51 failures. No repository format, registered tool (62), schema migration or dependency |
 | Implemented + tested (Phase 53) | **Live Anthropic Verification**: direct `pc-agent providers verify-anthropic` makes exactly one bounded 32-token Anthropic Messages API request with the already-configured key, bypassing router fallback/retries; it requires the fixed `PC_AGENT_ANTHROPIC_OK` response plus provider/model/usage checks and retains a secret-safe self-hashed JSON report. `verify-anthropic-report` revalidates it offline. Text-only (`vision_status: not_tested`); no registered tool (62), schema migration or dependency |
-| Later | Authenticode signing, optional true background auto-update service, native macOS packages, macOS desktop parity, Adobe trust-program integration and externally verified full WebPKI/qualified-policy or PAdES workflows |
+| Implemented + tested (Phase 54) | **Live GNOME Keyring/KWallet Evidence**: direct Linux `pc-agent credentials linux-secret-service-acceptance` identifies the D-Bus owner of `org.freedesktop.secrets`, accepts only GNOME Keyring or KWallet/KSecretService, round-trips one unique random acceptance probe through real `secret-tool`, deletes/proves it absent, and compares real provider keys unchanged in memory. A secret-safe self-hashed report is retained and can be verified offline. No registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 55) | **Windows HTTPS Update-Feed Hosting**: vendor `pc-agent-release-admin build-hosting` wraps a verified Phase 40 feed in a hash-manifest Windows deployment package with a built-in bounded HTTPS static host/scheduled-task profile or a versioned IIS deployment/rollback profile; `serve-hosting` runs only on Windows with an operator-supplied trusted certificate. Direct `pc-agent update hosting-check` fetches and fully verifies the live feed, ZIP, signature and cache policy without staging/applying, retaining a secret-safe self-hashed report for offline verification. Linux/macOS profiles are structured but planned. No registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 56) | **Background Auto-Upgrade**: a separately opted-in Windows Scheduled Task wakes a one-shot worker that checks only a signed HTTPS feed, verifies/downloads/stages a strictly newer bundle, and records self-hashed state/reports. Default `stage-only` never applies; `apply-when-idle` additionally requires the maintenance window, no active task, Windows idle time, AC power and a verified staged signature before using the existing backup/rollback apply path. Linux systemd-user and macOS LaunchAgent profiles are structured but planned. No registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 57) | **Live Debian/Ubuntu APT Evidence**: direct `pc-agent release debian-repository-acceptance` reverifies the Phase 50 repository/current `.deb`, refuses a pre-existing package, uses a temporary APT source/state/cache to run real APT update/candidate/install, verifies dpkg state and every installed file against the package manifest, purges only the acceptance package, and retains a strict self-hashed report for `debian-repository-acceptance-verify`. Signed repositories use `signed-by`; unsigned local acceptance records its temporary `trusted=yes` exception honestly. No registered tool (62), schema migration or dependency |
+| Hotfix (Phase 58) | **Windows Auto-Upgrade Lock Hotfix**: the Phase 56 worker now seeks to byte 0 before both Windows `msvcrt.locking` lock and unlock operations. This fixes the reported second-run `PermissionError` caused by an existing `a+b` lock file starting at EOF; an offset-faithful fake-`msvcrt` regression reproduces the old failure and proves repeated lock cycles plus nested-worker refusal. No registered tool (62), schema migration, configuration or dependency change |
+| Later | Authenticode signing, native macOS packages, macOS desktop parity, Adobe trust-program integration and externally verified full WebPKI/qualified-policy or PAdES workflows |
 
 This build **does not** claim arbitrary computer control, arbitrary generated
 programs, full browser automation, password/coordinate UI control, AI
@@ -92,13 +97,13 @@ server, or cloud account yet.
 New installs apply the patchers in order: 1A, 1B, 1C, Phase 2, Phase 3,
 Phase 4, the Phase 4.1 hotfix, Phase 5, Phase 6, Phase 7, Phase 8, Phase 9,
 Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15, Phase 16,
-the Phase 16.1 hotfix, Phase 17, Phase 18, Phase 19, Phase 20, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, Phase 26, Phase 27, Phase 28, Phase 29, Phase 30, Phase 31, Phase 32, Phase 33, Phase 34, Phase 35, Phase 36, Phase 37, Phase 38, Phase 39, Phase 40, Phase 41, Phase 42, Phase 43, Phase 44, Phase 45, Phase 46, Phase 47, Phase 48, Phase 49, Phase 50, Phase 51, Phase 52, then Phase 53. The
-Phase 53 patcher is cumulative: it upgrades an existing Phase 9 (0.11.0)
-through Phase 52 (0.54.0) install:
+the Phase 16.1 hotfix, Phase 17, Phase 18, Phase 19, Phase 20, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, Phase 26, Phase 27, Phase 28, Phase 29, Phase 30, Phase 31, Phase 32, Phase 33, Phase 34, Phase 35, Phase 36, Phase 37, Phase 38, Phase 39, Phase 40, Phase 41, Phase 42, Phase 43, Phase 44, Phase 45, Phase 46, Phase 47, Phase 48, Phase 49, Phase 50, Phase 51, Phase 52, Phase 53, Phase 54, then Phase 55. The
+Phase 55 patcher is cumulative: it upgrades an existing Phase 9 (0.11.0)
+through Phase 54 (0.56.0) install:
 
 ```powershell
 cd D:\omni-assistant   # your project folder
-node PHASE_53_LIVE_ANTHROPIC_VERIFICATION.mjs
+node PHASE_55_WINDOWS_HTTPS_UPDATE_FEED_HOSTING.mjs
 
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -112,16 +117,26 @@ pc-agent workflow list
 pc-agent gui --check
 ```
 
-Phase 53 adds **Live Anthropic Verification** without a registered tool,
-so the count stays 62 built-ins and the database schema stays **v6**.
-Reinstalling refreshes the editable package metadata to 0.55.0; no new
-Python dependency is added beyond Phase 26's `pypdf[crypto]`. The new
-direct Anthropic check bypasses router fallback/retries and writes a
-secret-safe evidence report. Phase 52's **Windows Repository Timestamp
-Hotfix**, Phase 51's **RPM Repository**, Phase 50's **Debian APT
-Repository**, Phase 49's **Windows UTF-8 Test Hotfix**, Phase 48's
-**Native RPM Package** and Phase 47's **Native Debian Package** remain
-available unchanged. See `docs/phase53.md` for live verification,
+Phase 58 is the **Windows Auto-Upgrade Lock Hotfix** and adds no
+registered tool, so the count stays 62 built-ins and the database schema
+stays **v6**. Reinstalling refreshes the editable package metadata to
+0.60.0; no new Python dependency is added beyond Phase 26's
+`pypdf[crypto]`. The Phase 56 Windows worker now locks and unlocks byte 0
+of its persistent lock file consistently, fixing the reported second-run
+`msvcrt.locking` `PermissionError`. Phase 57's **Live Debian/Ubuntu APT
+Evidence**, Phase 56's **Background Auto-Upgrade**, Phase 55's
+**Windows HTTPS Update-Feed Hosting**, Phase 54's **Live
+GNOME Keyring/KWallet Evidence**, Phase 53's **Live Anthropic
+Verification**, Phase 52's **Windows
+Repository Timestamp Hotfix**, Phase 51's **RPM Repository**, Phase 50's
+**Debian APT Repository**, Phase 49's **Windows UTF-8 Test Hotfix**,
+Phase 48's **Native RPM Package** and Phase 47's **Native Debian
+Package** remain available unchanged. See `docs/phase58.md` for the
+Windows lock hotfix, `docs/phase57.md` for live Debian/Ubuntu APT
+evidence, `docs/phase56.md` for background
+auto-upgrade, `docs/phase55.md` for Windows
+HTTPS update-feed hosting, `docs/phase54.md` for Linux
+Secret Service evidence, `docs/phase53.md` for Anthropic verification,
 `docs/phase52.md` for the repository hotfix and `docs/phase51.md` for
 the RPM repository,
 `docs/phase50.md` for the APT repository, `docs/phase49.md` for the hotfix,
@@ -542,21 +557,21 @@ virtual environments and caches:
 ```powershell
 pc-agent release audit
 pc-agent release build
-pc-agent release verify workspace\self-healing-pc-agent-v0.55.0-portable.zip
+pc-agent release verify workspace\self-healing-pc-agent-v0.60.0-portable.zip
 pc-agent release installer-source
-pc-agent release installer-verify workspace\windows-installer-v0.55.0
+pc-agent release installer-verify workspace\windows-installer-v0.60.0
 pc-agent release installer-acceptance
-pc-agent release installer-acceptance-verify workspace\windows-installer-acceptance-v0.55.0\windows-installer-acceptance-report.json
+pc-agent release installer-acceptance-verify workspace\windows-installer-acceptance-v0.60.0\windows-installer-acceptance-report.json
 pc-agent release posix-source
-pc-agent release posix-verify workspace\posix-installer-v0.55.0
+pc-agent release posix-verify workspace\posix-installer-v0.60.0
 pc-agent release debian-package
-pc-agent release debian-verify workspace\self-healing-pc-agent_0.55.0-1_all.deb
+pc-agent release debian-verify workspace\self-healing-pc-agent_0.60.0-1_all.deb
 pc-agent release debian-repository
-pc-agent release debian-repository-verify workspace\apt-repository-v0.55.0
+pc-agent release debian-repository-verify workspace\apt-repository-v0.60.0
 pc-agent release rpm-package
-pc-agent release rpm-verify workspace\self-healing-pc-agent-0.55.0-1.noarch.rpm
+pc-agent release rpm-verify workspace\self-healing-pc-agent-0.60.0-1.noarch.rpm
 pc-agent release rpm-repository
-pc-agent release rpm-repository-verify workspace\rpm-repository-v0.55.0
+pc-agent release rpm-repository-verify workspace\rpm-repository-v0.60.0
 ```
 
 Use `pc-agent maintenance backup|list|verify|restore` for verified local
@@ -609,9 +624,12 @@ release private key into a complete static update-feed directory with
 `pc-agent-release-admin publish-feed`; `verify-feed` checks that tree
 offline before upload. The package contains the strict feed, signed ZIP,
 customer public-key settings, hosting notes and a SHA-256 publisher
-manifest. It excludes the private key, performs no upload, and adds no
-background or silent update behavior. A vendor still supplies the actual
-static HTTPS host, DNS and TLS certificate. See `docs/phase40.md`.
+manifest. It excludes the private key and performs no upload. Phase 55
+supplies the Windows hosting package/server and IIS deployment around this
+exact tree; the operator still supplies the Windows host, DNS and publicly
+trusted TLS certificate. Phase 56 adds the separately opted-in background
+consumer for that hosted signed feed. See `docs/phase40.md`,
+`docs/phase55.md` and `docs/phase56.md`.
 
 ## POSIX installer source package (Phase 41)
 
@@ -733,6 +751,61 @@ direct, bounded Anthropic request—no fallback, router retry, image, file or
 task text—and retains a secret-safe report for
 `providers verify-anthropic-report`. See `docs/phase53.md`.
 
+## Live GNOME Keyring/KWallet Evidence (Phase 54)
+
+On a signed-in Linux desktop, `pc-agent credentials
+linux-secret-service-acceptance` proves that `org.freedesktop.secrets` is
+owned by GNOME Keyring or KWallet/KSecretService, round-trips and deletes
+one isolated random probe through `secret-tool`, and confirms every real
+provider key is unchanged. The retained self-hashed report can be checked
+with `credentials linux-secret-service-acceptance-verify`. See
+`docs/phase54.md`.
+
+## Windows HTTPS Update-Feed Hosting (Phase 55)
+
+Use `pc-agent-release-admin build-hosting` to wrap a verified Phase 40
+feed package in a Windows operational deployment, then run the built-in
+HTTPS host as a scheduled task or deploy the IIS profile. After the
+operator's DNS, firewall and trusted certificate are in place,
+`pc-agent update hosting-check` downloads and verifies the live feed,
+signature, portable ZIP and cache policy without staging or applying it;
+`hosting-check-verify` revalidates the retained report offline. Linux and
+macOS profiles are named in the registry but remain planned in this
+Windows-first phase. See `docs/phase55.md`.
+
+## Background Auto-Upgrade (Phase 56)
+
+After the real Phase 55 host passes `hosting-check`, separately set
+`PC_AGENT_AUTO_UPGRADE=1` with the signed HTTPS feed and release key.
+Use `pc-agent update auto-status`, `auto-run` and `auto-verify-report` in
+the foreground first, then `auto-install-schedule` to register the per-user
+Windows task. The default Background auto-upgrade mode is `stage-only`:
+it downloads, verifies and stages, but never applies.
+`apply-when-idle` may apply only inside the maintenance window with no
+active task, enough Windows idle time, AC power and a verified signature.
+State and every run report are retained under `data\updates`. Linux
+systemd-user and macOS LaunchAgent profiles remain planned. See
+`docs/phase56.md`.
+
+## Live Debian/Ubuntu APT Evidence (Phase 57)
+
+On a Debian or Ubuntu host where `self-healing-pc-agent` is not already
+installed, `pc-agent release debian-repository-acceptance` performs a
+guarded live APT install from the verified Phase 50 local repository,
+checks the exact APT candidate and dpkg state, verifies all installed
+files against the package manifest, then purges only the test package.
+`debian-repository-acceptance-verify` revalidates the retained report
+offline. It may install declared distribution dependencies and does not
+auto-remove them. See `docs/phase57.md`.
+
+## Windows Auto-Upgrade Lock Hotfix (Phase 58)
+
+Repeated Phase 56 Windows worker runs now lock and unlock the persistent
+`auto-upgrade.lock` first byte consistently. This removes the second-run
+`msvcrt.locking` `PermissionError` seen in the two real Windows Phase 56
+tests, without changing the signed-feed, staging or idle-apply policy.
+See `docs/phase58.md`.
+
 ## Direct Anthropic provider (Phase 19)
 
 Anthropic is now a real Messages API route rather than a reserved slot.
@@ -774,8 +847,9 @@ stay on the same origin, downloads are bounded and redirected only on that
 origin, and the downloaded ZIP must match the feed size/SHA-256 before the
 existing portable-bundle and Ed25519 checks run. `online-check` does not
 authenticate the bundle, `online-download` does not stage it, and
-`online-stage` never applies it. There is no background updater or planner
-tool. See `docs/phase24.md`.
+`online-stage` itself never applies it. Phase 56 later adds a separate,
+default-off background worker and scheduler, but no planner tool. See
+`docs/phase24.md` and `docs/phase56.md`.
 
 ## Scanned PDF OCR (Phase 22)
 

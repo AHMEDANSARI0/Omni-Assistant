@@ -1,4 +1,4 @@
-# Registered tools - through Phase 53
+# Registered tools - through Phase 55
 
 Built-in tools are reviewed source-code handlers. Phase 2 adds approved
 `custom.*` dynamic tools loaded from SQLite. Both kinds expose a stable id,
@@ -292,6 +292,41 @@ Phase 53 likewise adds **no registered tool**.
 verify-anthropic` and `verify-anthropic-report` commands; no planner,
 task or dynamic tool can trigger the live request or approve a report as
 a model-callable capability. See `docs/phase53.md`.
+
+Phase 54 likewise adds **no registered tool**.
+**Live GNOME Keyring/KWallet Evidence** is confined to the direct
+`pc-agent credentials linux-secret-service-acceptance` and
+`linux-secret-service-acceptance-verify` commands; no planner, task or
+dynamic tool can write an acceptance probe or read/compare provider keys
+as a model-callable capability. See `docs/phase54.md`.
+
+Phase 55 likewise adds **no registered tool**.
+**Windows HTTPS Update-Feed Hosting** is confined to the vendor
+`pc-agent-release-admin hosting-profiles|build-hosting|verify-hosting|serve-hosting`
+commands and direct `pc-agent update hosting-check` /
+`hosting-check-verify` commands; no planner, task or dynamic tool can
+build, serve, deploy, download from, stage or apply a hosted update as a
+model-callable capability. See `docs/phase55.md`.
+
+Phase 56 likewise adds **no registered tool**. **Background Auto-Upgrade**
+is confined to direct `pc-agent update auto-status|auto-run|
+auto-verify-report|auto-install-schedule|auto-uninstall-schedule|
+auto-schedule-status` commands, the GUI Signed Updates controls and the
+Windows Scheduled Task invoking `auto-run`; no planner, task or dynamic tool
+can enable it, change its mode, trigger it or bypass its gates. See
+`docs/phase56.md`.
+
+Phase 57 likewise adds **no registered tool**. **Live Debian/Ubuntu APT
+Evidence** is confined to direct `pc-agent release
+debian-repository-acceptance` and `debian-repository-acceptance-verify`
+commands; no planner, task or dynamic tool can run APT/dpkg, install or
+purge the system package, or approve its report as a model-callable
+capability. See `docs/phase57.md`.
+
+Phase 58 likewise adds **no registered tool**. The
+**Windows Auto-Upgrade Lock Hotfix** only corrects the direct Phase 56 worker's
+Windows byte-range lock offset; it grants no planner, task or dynamic tool
+any update, lock or scheduler capability. See `docs/phase58.md`.
 
 ## Approved dynamic tools
 

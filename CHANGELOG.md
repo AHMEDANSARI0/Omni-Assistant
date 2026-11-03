@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.60.0 - PHASE 58 Windows Auto-Upgrade Lock Hotfix
+
+- Fixes the two real Windows Phase 56 failures in which a second
+  `run_auto_upgrade` raised `PermissionError` while releasing the worker
+  lock. An existing lock file opened with `a+b` starts at EOF, while
+  `msvcrt.locking` acts from the current file position; the old code locked
+  that EOF byte and then tried to unlock byte 0.
+- The Windows worker now seeks to byte 0 before both `LK_NBLCK` and
+  `LK_UNLCK` and records the exact lock offset. POSIX `flock`, the
+  persistent lock file and all signed-update safety gates are unchanged.
+- Adds an offset-faithful fake-`msvcrt` regression that reproduces the old
+  unlock failure, proves repeated lock cycles and still refuses a nested
+  concurrent worker.
+- Adds no registered tool (62), schema migration (v6), configuration key or
+  Python dependency.
+
+## 0.59.0 - PHASE 57 Live Debian/Ubuntu APT Evidence
+
+- Adds direct `pc-agent release debian-repository-acceptance` for a guarded
+  live Debian/Ubuntu run: host/tool/admin checks, offline repository and
+  embedded-package verification, an initially-absent package guard, APT
+  update/candidate/install through a temporary source and isolated state,
+  exact dpkg state, every installed file checked against the verified
+  package manifest, and cleanup by purging only
+  `self-healing-pc-agent`.
+- Supports both repository trust modes honestly: signed repositories use a
+  temporary `signed-by=` keyring, while an unsigned local repository is
+  recorded as `trusted-yes-local-acceptance-only`. Declared distribution
+  dependencies installed by APT are not auto-removed.
+- Retains passed/failed self-hashed reports containing only command names,
+  return codes, timing, output byte counts and output hashes; direct
+  `debian-repository-acceptance-verify` strictly revalidates a passed
+  current-version report offline.
+- Adds no registered tool (62), schema migration (v6) or Python dependency.
+
+## 0.58.0 - PHASE 56 Background Auto-Upgrade
+
+- **Signed background worker**: new direct `pc-agent update auto-run`
+  performs one bounded pass against the configured signed HTTPS feed. It
+  requires a separate background opt-in plus online updates, a release
+  public key/key ID and mandatory signed updates; downgrades,
+  same-version bundles, HTTP feeds, unsigned bundles and hash/signature
+  mismatches fail closed.
+- **Safe modes and gates**: default `stage-only` downloads, verifies and
+  stages but never applies. `apply-when-idle` may reuse the Phase 21
+  backed-up apply path only inside the maintenance window with no active
+  task, sufficient Windows user idle time, AC power when required and a
+  verified staged signature. Optional no-dependency editable reinstall,
+  bounded failure backoff and a single-instance lock are included.
+- **Windows scheduler and evidence**: new `auto-status`,
+  `auto-verify-report`, `auto-install-schedule`,
+  `auto-uninstall-schedule` and `auto-schedule-status` commands manage a
+  per-user Windows Scheduled Task and retained self-hashed state/run
+  reports. GUI Signed Updates gains matching status/run/schedule controls.
+  Linux systemd-user and macOS LaunchAgent profiles are structured as
+  planned and fail closed. No registered tool (62 built-ins), schema or
+  Python dependency change.
+
+## 0.57.0 - PHASE 55 Windows HTTPS Update-Feed Hosting
+
+- **Windows operational hosting package**: new vendor
+  `pc-agent-release-admin build-hosting` and `verify-hosting` commands wrap
+  a verified Phase 40 signed feed in a strict hash-manifest deployment
+  bundle. The default profile includes a bounded built-in HTTPS static
+  host plus Windows scheduled-task start/register/unregister scripts; the
+  IIS profile includes hardened `web.config` files and versioned
+  deployment/rollback scripts using an existing certificate thumbprint.
+- **Live HTTPS evidence**: new direct `pc-agent update hosting-check`
+  fetches one public feed, signature and portable ZIP, then verifies TLS,
+  same-origin URLs, cache policy, size/SHA-256, portable-bundle structure
+  and Ed25519 signature without staging or applying the update. Its
+  secret-safe self-hashed report can be checked offline with
+  `hosting-check-verify`.
+- **Cross-platform structure, Windows-first delivery**: Linux Nginx/Caddy
+  and macOS Nginx/Caddy profiles are registered as planned and fail closed;
+  no Linux/macOS deployment or live acceptance is claimed in this phase.
+  No registered tool (62 built-ins), schema or Python dependency change.
+
+## 0.56.0 - PHASE 54 Live GNOME Keyring/KWallet Evidence
+
+- **Live Linux Secret Service acceptance**: new direct
+  `pc-agent credentials linux-secret-service-acceptance` command identifies
+  the session-bus owner of `org.freedesktop.secrets` through `gdbus` or
+  `busctl`, accepts only GNOME Keyring or KWallet/KSecretService, and then
+  stores, reads back, deletes and proves absent one fresh random probe
+  under acceptance-only Secret Service attributes.
+- **Real-key safety proof**: existing provider keys are compared only in
+  memory before and after the probe; neither their values nor hashes are
+  recorded. The probe is supplied to `secret-tool` on stdin, uses separate
+  attributes from provider keys, and cleanup is attempted after failures.
+- **Retained offline evidence**: passed/failed runs write a secret-safe,
+  self-hashed JSON report without overwriting an existing file;
+  `linux-secret-service-acceptance-verify` strictly revalidates a passed
+  report offline. No registered tool (62 built-ins), schema, credential
+  resolution order or Python dependency change.
+
 ## 0.55.0 - PHASE 53 Live Anthropic Verification
 
 - **Direct live Anthropic check**: new `pc-agent providers verify-anthropic`

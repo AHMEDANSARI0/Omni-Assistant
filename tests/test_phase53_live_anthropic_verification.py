@@ -260,7 +260,7 @@ def test_phase53_cli_direct_run_and_offline_report_verification(
 
 
 def test_phase53_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.55.0"
+    assert __version__ == "0.60.0"
     assert LATEST_SCHEMA_VERSION == 6
     assert len(build_default_registry().list_tools()) == 62
 
@@ -307,6 +307,4 @@ def test_phase53_scope_inventory_and_documentation() -> None:
     assert ANTHROPIC_VERIFICATION_EXPECTED_RESPONSE in phase
     assert "vision_status: not_tested" in phase
     assert "no fallback" in phase.lower()
-    assert changelog.splitlines()[2] == (
-        "## 0.55.0 - PHASE 53 Live Anthropic Verification"
-    )
+    assert "## 0.55.0 - PHASE 53 Live Anthropic Verification" in changelog

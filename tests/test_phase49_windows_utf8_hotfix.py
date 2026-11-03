@@ -75,7 +75,7 @@ def test_phase49_scope_documents_decode_as_utf8() -> None:
 
 
 def test_phase49_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.55.0"
+    assert __version__ == "0.60.0"
     assert LATEST_SCHEMA_VERSION == 6
     assert len(build_default_registry().list_tools()) == 62
 

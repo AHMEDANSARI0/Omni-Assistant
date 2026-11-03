@@ -801,6 +801,55 @@ def audit_install(settings: Settings) -> ReleaseAudit:
             )
         )
 
+    if not settings.auto_upgrade_enabled:
+        checks.append(
+            AuditCheck(
+                "auto_upgrade",
+                "info",
+                "Background auto-upgrade is disabled; online staging remains explicit.",
+            )
+        )
+    elif not (
+        settings.online_updates_enabled
+        and (settings.update_feed_url or "").lower().startswith("https://")
+        and settings.release_public_key
+        and settings.release_key_id
+        and settings.require_signed_updates
+    ):
+        checks.append(
+            AuditCheck(
+                "auto_upgrade",
+                "warn",
+                (
+                    "Background auto-upgrade is enabled but is not ready; it "
+                    "requires an HTTPS feed plus a release key/key ID and "
+                    "PC_AGENT_REQUIRE_SIGNED_UPDATES=1."
+                ),
+            )
+        )
+    elif settings.auto_upgrade_mode == "apply-when-idle":
+        checks.append(
+            AuditCheck(
+                "auto_upgrade",
+                "warn",
+                (
+                    "Background auto-upgrade may apply signed updates when "
+                    "its maintenance, active-task, idle and power gates pass."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            AuditCheck(
+                "auto_upgrade",
+                "pass",
+                (
+                    "Background auto-upgrade is in stage-only mode; it can "
+                    "stage signed updates but cannot apply them."
+                ),
+            )
+        )
+
     candidates = release_candidate_files(settings.root_dir)
     checks.append(
         AuditCheck(

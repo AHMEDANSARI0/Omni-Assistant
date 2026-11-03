@@ -47,7 +47,7 @@ def test_phase43_windows_host_guards_are_narrowly_scoped() -> None:
 
 
 def test_phase43_scope_inventory_and_counts() -> None:
-    assert __version__ == "0.55.0"
+    assert __version__ == "0.60.0"
     assert len(build_default_registry().list_tools()) == 62
     assert LATEST_SCHEMA_VERSION == 6
 

@@ -93,7 +93,7 @@ def test_phase38_builds_deterministic_hash_verified_installer_source(
     first_info = verify_windows_installer_source(first)
     second_info = verify_windows_installer_source(second)
 
-    assert first_info.version == __version__ == "0.55.0"
+    assert first_info.version == __version__ == "0.60.0"
     assert first_info.app_id == WINDOWS_INSTALLER_APP_ID
     assert first_info.file_count == first_info.payload_file_count + 1
     assert (
@@ -142,7 +142,7 @@ def test_phase38_builds_deterministic_hash_verified_installer_source(
 
     output = first / "output"
     output.mkdir()
-    (output / "SelfHealingPCAgent-Setup-0.55.0.exe").write_bytes(b"not-real")
+    (output / "SelfHealingPCAgent-Setup-0.60.0.exe").write_bytes(b"not-real")
     with_output = verify_windows_installer_source(first)
     assert with_output.compiled_output_count == 1
 

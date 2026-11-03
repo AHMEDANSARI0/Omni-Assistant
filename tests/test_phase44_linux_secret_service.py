@@ -253,7 +253,7 @@ def test_phase44_settings_linux_mode_and_source_labels(
 
 
 def test_phase44_scope_inventory_and_counts() -> None:
-    assert __version__ == "0.55.0"
+    assert __version__ == "0.60.0"
     assert len(build_default_registry().list_tools()) == 62
     assert LATEST_SCHEMA_VERSION == 6
 

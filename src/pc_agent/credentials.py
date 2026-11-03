@@ -14,6 +14,7 @@ using environment/``.env`` values.
 from __future__ import annotations
 
 import ctypes
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,9 @@ _CREDENTIAL_COMMENT = "Self-Healing PC Agent provider API key"
 _SECRET_SERVICE_APPLICATION = "self-healing-pc-agent"
 _SECRET_SERVICE_PURPOSE = "provider-api-key"
 _SECRET_SERVICE_PROBE_PROVIDER = "__pc_agent_probe__"
+_SECRET_SERVICE_ACCEPTANCE_PROVIDER = "__pc_agent_acceptance__"
+_SECRET_SERVICE_ACCEPTANCE_PURPOSE = "live-acceptance-probe"
+_ACCEPTANCE_PROBE_ID_RE = re.compile(r"[0-9a-f]{32}")
 _SECRET_TOOL_TIMEOUT_SECONDS = 10.0
 _SECRET_TOOL_MAX_STDOUT_BYTES = 8192
 _MACOS_SECURITY_EXECUTABLE = "/usr/bin/security"
@@ -479,7 +483,80 @@ class LinuxSecretServiceBackend:
     def get(self, provider: str) -> str | None:
         canonical = canonical_credential_provider(provider)
         self._require_available()
-        completed = self._run(("lookup", *self._attributes(canonical)))
+        return self._lookup_attributes(
+            self._attributes(canonical), f"the {canonical} API key"
+        )
+
+    def set(self, provider: str, secret: str) -> None:
+        canonical = canonical_credential_provider(provider)
+        cleaned = _validate_secret(secret)
+        self._require_available()
+        attributes = self._attributes(canonical)
+        self._store_attributes(
+            attributes,
+            cleaned,
+            label=f"Self-Healing PC Agent provider API key ({canonical})",
+            description=f"the {canonical} API key",
+        )
+        if self.get(canonical) != cleaned:
+            raise CredentialError(
+                f"Linux Secret Service did not verify the stored {canonical} API key."
+            )
+
+    def delete(self, provider: str) -> bool:
+        canonical = canonical_credential_provider(provider)
+        self._require_available()
+        return self._clear_attributes(
+            self._attributes(canonical), f"the {canonical} API key"
+        )
+
+    def get_acceptance_secret(self, probe_id: str) -> str | None:
+        """Read only the isolated Phase 54 live-acceptance probe item."""
+
+        attributes = self._acceptance_attributes(probe_id)
+        self._require_available()
+        return self._lookup_attributes(
+            attributes, "the Linux Secret Service acceptance probe"
+        )
+
+    def set_acceptance_secret(self, probe_id: str, secret: str) -> None:
+        """Store one isolated acceptance probe without touching provider keys."""
+
+        attributes = self._acceptance_attributes(probe_id)
+        cleaned = _validate_secret(secret)
+        self._require_available()
+        if self._lookup_attributes(
+            attributes, "the Linux Secret Service acceptance probe"
+        ) is not None:
+            raise CredentialError(
+                "Linux Secret Service acceptance probe already exists."
+            )
+        self._store_attributes(
+            attributes,
+            cleaned,
+            label="Self-Healing PC Agent Linux Secret Service acceptance probe",
+            description="the Linux Secret Service acceptance probe",
+        )
+        if self._lookup_attributes(
+            attributes, "the Linux Secret Service acceptance probe"
+        ) != cleaned:
+            raise CredentialError(
+                "Linux Secret Service did not verify the stored acceptance probe."
+            )
+
+    def delete_acceptance_secret(self, probe_id: str) -> bool:
+        """Delete only the isolated Phase 54 live-acceptance probe item."""
+
+        attributes = self._acceptance_attributes(probe_id)
+        self._require_available()
+        return self._clear_attributes(
+            attributes, "the Linux Secret Service acceptance probe"
+        )
+
+    def _lookup_attributes(
+        self, attributes: Sequence[str], description: str
+    ) -> str | None:
+        completed = self._run(("lookup", *attributes))
         if completed.returncode == 0:
             if len(completed.stdout) > _SECRET_TOOL_MAX_STDOUT_BYTES:
                 raise CredentialError(
@@ -499,43 +576,39 @@ class LinuxSecretServiceBackend:
             # item matches; service errors write a diagnostic to stderr.
             return None
         raise CredentialError(
-            f"Linux Secret Service could not read the {canonical} API key."
+            f"Linux Secret Service could not read {description}."
         )
 
-    def set(self, provider: str, secret: str) -> None:
-        canonical = canonical_credential_provider(provider)
-        cleaned = _validate_secret(secret)
-        self._require_available()
+    def _store_attributes(
+        self,
+        attributes: Sequence[str],
+        secret: str,
+        *,
+        label: str,
+        description: str,
+    ) -> None:
         completed = self._run(
-            (
-                "store",
-                f"--label=Self-Healing PC Agent provider API key ({canonical})",
-                *self._attributes(canonical),
-            ),
-            input_data=cleaned.encode("utf-8"),
+            ("store", f"--label={label}", *attributes),
+            input_data=secret.encode("utf-8"),
         )
         if completed.returncode != 0:
             raise CredentialError(
-                f"Linux Secret Service could not store the {canonical} API key."
-            )
-        if self.get(canonical) != cleaned:
-            raise CredentialError(
-                f"Linux Secret Service did not verify the stored {canonical} API key."
+                f"Linux Secret Service could not store {description}."
             )
 
-    def delete(self, provider: str) -> bool:
-        canonical = canonical_credential_provider(provider)
-        self._require_available()
-        if self.get(canonical) is None:
+    def _clear_attributes(
+        self, attributes: Sequence[str], description: str
+    ) -> bool:
+        if self._lookup_attributes(attributes, description) is None:
             return False
-        completed = self._run(("clear", *self._attributes(canonical)))
+        completed = self._run(("clear", *attributes))
         if completed.returncode != 0 and completed.stderr:
             raise CredentialError(
-                f"Linux Secret Service could not delete the {canonical} API key."
+                f"Linux Secret Service could not delete {description}."
             )
-        if self.get(canonical) is not None:
+        if self._lookup_attributes(attributes, description) is not None:
             raise CredentialError(
-                f"Linux Secret Service could not delete the {canonical} API key."
+                f"Linux Secret Service could not delete {description}."
             )
         return True
 
@@ -549,6 +622,23 @@ class LinuxSecretServiceBackend:
             canonical,
             "purpose",
             _SECRET_SERVICE_PURPOSE,
+        )
+
+    @staticmethod
+    def _acceptance_attributes(probe_id: str) -> tuple[str, ...]:
+        if _ACCEPTANCE_PROBE_ID_RE.fullmatch(probe_id) is None:
+            raise CredentialError(
+                "The Linux Secret Service acceptance probe ID is invalid."
+            )
+        return (
+            "application",
+            _SECRET_SERVICE_APPLICATION,
+            "provider",
+            _SECRET_SERVICE_ACCEPTANCE_PROVIDER,
+            "purpose",
+            _SECRET_SERVICE_ACCEPTANCE_PURPOSE,
+            "probe_id",
+            probe_id,
         )
 
     def _require_available(self) -> None:
@@ -791,6 +881,10 @@ class CredentialStore:
     ) -> None:
         self._backend = backend
         self.mode = mode.strip().lower() or "auto"
+
+    @property
+    def backend(self) -> CredentialBackend:
+        return self._backend
 
     @property
     def backend_name(self) -> str:

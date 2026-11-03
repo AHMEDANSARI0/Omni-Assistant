@@ -109,6 +109,14 @@ obtain a TLS certificate, upload files, or prove that a chosen public host
 is currently live. The vendor must still upload this exact tree to their
 own HTTPS origin and may use the generated customer configuration.
 
+Phase 55 later added **Windows HTTPS Update-Feed Hosting** around this
+exact package: `build-hosting`/`verify-hosting`, a Windows-only built-in
+TLS host and scheduled-task scripts, a versioned IIS deployment/rollback
+profile, and retained `hosting-check` live evidence. That follow-up still
+does not create DNS, a publicly trusted certificate, firewall/NAT access
+or a public Windows machine; Linux/macOS hosting profiles are planned.
+See `docs/phase55.md`.
+
 This phase also does not add background polling, silent downloads, silent
 staging/application, Authenticode, or a model-callable update tool. Online
 updates remain disabled unless the customer explicitly enables them, and

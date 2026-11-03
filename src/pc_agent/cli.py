@@ -33,12 +33,25 @@ from .anthropic_verification import (
     run_anthropic_live_verification,
     verify_anthropic_live_verification_report,
 )
+from .auto_upgrade import (
+    DEFAULT_AUTO_UPGRADE_TASK_NAME,
+    get_auto_upgrade_status,
+    get_windows_auto_upgrade_schedule,
+    install_windows_auto_upgrade_schedule,
+    run_auto_upgrade,
+    uninstall_windows_auto_upgrade_schedule,
+    verify_auto_upgrade_report,
+)
 from .browser_cdp import probe_browser
 from .config import Settings
 from .credentials import (
     SUPPORTED_CREDENTIAL_PROVIDERS,
     build_credential_store,
     canonical_credential_provider,
+)
+from .debian_apt_acceptance import (
+    run_debian_apt_acceptance,
+    verify_debian_apt_acceptance_report,
 )
 from .debian_package import build_debian_package, verify_debian_package
 from .debian_repository import build_debian_repository, verify_debian_repository
@@ -81,6 +94,10 @@ from .licensing import (
     LicenseService,
     LicenseStatus,
 )
+from .linux_secret_service_acceptance import (
+    run_linux_secret_service_acceptance,
+    verify_linux_secret_service_acceptance_report,
+)
 from .logging_config import configure_logging
 from .maintenance import DatabaseMaintenanceService
 from .online_updates import (
@@ -114,6 +131,11 @@ from .tooling.models import DynamicToolStatus
 from .tooling.service import ToolBuilderService, build_runtime_registry
 from .tooling.templates import TEMPLATES
 from .tools import ToolContext, ToolResult, build_default_registry
+from .update_feed_hosting import (
+    read_release_public_key_file,
+    run_update_feed_hosting_live_verification,
+    verify_update_feed_hosting_report,
+)
 from .updates import (
     apply_staged_update,
     check_update,
@@ -782,6 +804,28 @@ def build_parser() -> argparse.ArgumentParser:
         "list", help="List stored/effective provider-key sources without values"
     )
     credential_list_parser.add_argument("--json", action="store_true")
+    credential_linux_acceptance_parser = credentials_subparsers.add_parser(
+        "linux-secret-service-acceptance",
+        help=(
+            "On Linux, prove the GNOME Keyring/KWallet Secret Service with "
+            "one isolated random probe and retain a secret-safe JSON report"
+        ),
+    )
+    credential_linux_acceptance_parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Report .json path (must not exist; default: timestamped file under data)",
+    )
+    credential_linux_acceptance_parser.add_argument("--json", action="store_true")
+    credential_linux_acceptance_verify_parser = credentials_subparsers.add_parser(
+        "linux-secret-service-acceptance-verify",
+        help="Verify a passed Linux Secret Service acceptance report offline",
+    )
+    credential_linux_acceptance_verify_parser.add_argument("report", type=Path)
+    credential_linux_acceptance_verify_parser.add_argument(
+        "--json", action="store_true"
+    )
     credential_provider_choices = (
         *SUPPORTED_CREDENTIAL_PROVIDERS,
         "openai_compatible",
@@ -1045,6 +1089,49 @@ def build_parser() -> argparse.ArgumentParser:
     release_debian_repository_verify_parser.add_argument(
         "--json", action="store_true"
     )
+    release_debian_repository_acceptance_parser = release_subparsers.add_parser(
+        "debian-repository-acceptance",
+        help=(
+            "On Debian/Ubuntu, APT-install, verify and purge the current "
+            "package from a verified local repository and retain a report"
+        ),
+    )
+    release_debian_repository_acceptance_parser.add_argument(
+        "repository",
+        type=Path,
+        nargs="?",
+        default=None,
+        help="Verified APT repository (default: the current workspace repository)",
+    )
+    release_debian_repository_acceptance_parser.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Report .json path (must not exist; default: timestamped file under data)",
+    )
+    release_debian_repository_acceptance_parser.add_argument(
+        "--gpg",
+        default="gpg",
+        help="GnuPG executable name or path for signed-repository verification",
+    )
+    release_debian_repository_acceptance_parser.add_argument(
+        "--yes", action="store_true"
+    )
+    release_debian_repository_acceptance_parser.add_argument(
+        "--json", action="store_true"
+    )
+    release_debian_repository_acceptance_verify_parser = (
+        release_subparsers.add_parser(
+            "debian-repository-acceptance-verify",
+            help="Verify a passed live Debian/Ubuntu APT acceptance report offline",
+        )
+    )
+    release_debian_repository_acceptance_verify_parser.add_argument(
+        "report", type=Path
+    )
+    release_debian_repository_acceptance_verify_parser.add_argument(
+        "--json", action="store_true"
+    )
     release_rpm_package_parser = release_subparsers.add_parser(
         "rpm-package",
         help="Build a deterministic native RPM .rpm around the POSIX package",
@@ -1156,6 +1243,82 @@ def build_parser() -> argparse.ArgumentParser:
     update_online_stage_parser.add_argument("--allow-unsigned", action="store_true")
     update_online_stage_parser.add_argument("--allow-downgrade", action="store_true")
     update_online_stage_parser.add_argument("--json", action="store_true")
+    update_hosting_check_parser = update_subparsers.add_parser(
+        "hosting-check",
+        help="Fetch and fully verify one live Windows HTTPS update feed",
+    )
+    update_hosting_check_parser.add_argument("--feed-url", default=None)
+    update_hosting_check_parser.add_argument("--channel", default=None)
+    hosting_key_group = update_hosting_check_parser.add_mutually_exclusive_group()
+    hosting_key_group.add_argument("--public-key", default=None)
+    hosting_key_group.add_argument("--public-key-file", type=Path, default=None)
+    update_hosting_check_parser.add_argument("--key-id", default=None)
+    update_hosting_check_parser.add_argument(
+        "--profile", default="windows-https-task"
+    )
+    update_hosting_check_parser.add_argument("--expected-version", default=None)
+    update_hosting_check_parser.add_argument("--report", type=Path, default=None)
+    update_hosting_check_parser.add_argument("--json", action="store_true")
+    update_hosting_verify_parser = update_subparsers.add_parser(
+        "hosting-check-verify",
+        help="Verify a passed live Windows HTTPS hosting report offline",
+    )
+    update_hosting_verify_parser.add_argument("report", type=Path)
+    update_hosting_verify_parser.add_argument("--json", action="store_true")
+    update_auto_status_parser = update_subparsers.add_parser(
+        "auto-status",
+        help="Show signed background auto-upgrade state and Windows schedule",
+    )
+    update_auto_status_parser.add_argument(
+        "--task-name", default=DEFAULT_AUTO_UPGRADE_TASK_NAME
+    )
+    update_auto_status_parser.add_argument("--json", action="store_true")
+    update_auto_run_parser = update_subparsers.add_parser(
+        "auto-run",
+        help="Run one bounded signed background auto-upgrade pass",
+    )
+    update_auto_run_parser.add_argument(
+        "--force", action="store_true", help="Ignore the recorded due time"
+    )
+    update_auto_run_parser.add_argument("--report", type=Path, default=None)
+    update_auto_run_parser.add_argument("--json", action="store_true")
+    update_auto_verify_parser = update_subparsers.add_parser(
+        "auto-verify-report",
+        help="Verify one retained background auto-upgrade run report offline",
+    )
+    update_auto_verify_parser.add_argument("report", type=Path)
+    update_auto_verify_parser.add_argument("--json", action="store_true")
+    update_auto_install_parser = update_subparsers.add_parser(
+        "auto-install-schedule",
+        help="Install the Windows Scheduled Task auto-upgrade worker",
+    )
+    update_auto_install_parser.add_argument(
+        "--task-name", default=DEFAULT_AUTO_UPGRADE_TASK_NAME
+    )
+    update_auto_install_parser.add_argument(
+        "--executable", type=Path, default=None
+    )
+    update_auto_install_parser.add_argument("--yes", action="store_true")
+    update_auto_install_parser.add_argument("--json", action="store_true")
+    update_auto_uninstall_parser = update_subparsers.add_parser(
+        "auto-uninstall-schedule",
+        help="Remove the Windows Scheduled Task auto-upgrade worker",
+    )
+    update_auto_uninstall_parser.add_argument(
+        "--task-name", default=DEFAULT_AUTO_UPGRADE_TASK_NAME
+    )
+    update_auto_uninstall_parser.add_argument("--yes", action="store_true")
+    update_auto_uninstall_parser.add_argument("--json", action="store_true")
+    update_auto_schedule_status_parser = update_subparsers.add_parser(
+        "auto-schedule-status",
+        help="Show the Windows Scheduled Task auto-upgrade worker state",
+    )
+    update_auto_schedule_status_parser.add_argument(
+        "--task-name", default=DEFAULT_AUTO_UPGRADE_TASK_NAME
+    )
+    update_auto_schedule_status_parser.add_argument(
+        "--json", action="store_true"
+    )
     update_apply_parser = update_subparsers.add_parser(
         "apply", help="Apply one staged update with backup and verification"
     )
@@ -2465,7 +2628,7 @@ def _run_doctor(settings: Settings, *, as_json: bool = False) -> int:
     )
     print(
         f"Self-Healing PC Agent {__version__} "
-        "(PHASE 53 Live Anthropic Verification)"
+        "(PHASE 58 Windows Auto-Upgrade Lock Hotfix)"
     )
     print(f"Python: {platform.python_version()}")
     print(f"Environment: {summary['environment']}")
@@ -2648,6 +2811,14 @@ def _run_doctor(settings: Settings, *, as_json: bool = False) -> int:
         f"online={summary['online_updates']}; "
         f"feed_host={summary['update_feed_host']}; "
         f"channel={summary['update_channel']}"
+    )
+    print(
+        "Background auto-upgrade: "
+        f"enabled={summary['auto_upgrade']}; mode={summary['auto_upgrade_mode']}; "
+        f"interval_hours={summary['auto_upgrade_interval_hours']}; "
+        f"idle_minutes={summary['auto_upgrade_idle_minutes']}; "
+        f"window={summary['auto_upgrade_maintenance_window']}; "
+        "signed HTTPS only"
     )
     production_audit = audit_install(settings)
     database_backups = DatabaseMaintenanceService(
@@ -6684,8 +6855,9 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
             "Usage: pc-agent release audit|build|verify|info|installer-source|"
             "installer-verify|installer-acceptance|installer-acceptance-verify|"
             "posix-source|posix-verify|debian-package|debian-verify|"
-            "debian-repository|debian-repository-verify|rpm-package|rpm-verify|"
-            "rpm-repository|rpm-repository-verify ...",
+            "debian-repository|debian-repository-verify|"
+            "debian-repository-acceptance|debian-repository-acceptance-verify|"
+            "rpm-package|rpm-verify|rpm-repository|rpm-repository-verify ...",
             file=sys.stderr,
         )
         return 2
@@ -6810,6 +6982,45 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
         info = verify_debian_repository(repository, gpg_executable=args.gpg)
         _print_debian_repository(info, as_json=bool(args.json))
         return 0
+    if command == "debian-repository-acceptance":
+        settings.ensure_directories()
+        repository = (
+            _resolve_cli_path(settings, args.repository, existing=True)
+            if args.repository is not None
+            else settings.workspace_dir / f"apt-repository-v{__version__}"
+        )
+        report_path = (
+            _resolve_cli_path(settings, args.report)
+            if args.report is not None
+            else None
+        )
+        summary = (
+            "APT-install the current self-healing-pc-agent package from "
+            f"{repository}, verify every installed file, then purge only "
+            "that package; APT may install its declared dependencies and "
+            "those dependencies will not be auto-removed"
+        )
+        confirmed = bool(args.yes) if args.json else _confirm_debian_apt_acceptance(
+            summary, assume_yes=bool(args.yes)
+        )
+        if not confirmed:
+            print("Debian APT live acceptance cancelled.")
+            return 3
+        report = run_debian_apt_acceptance(
+            settings,
+            repository,
+            report_path,
+            gpg_executable=args.gpg,
+        )
+        _print_debian_apt_acceptance(report, as_json=bool(args.json))
+        return 0 if report.status == "passed" else 1
+    if command == "debian-repository-acceptance-verify":
+        report_path = _resolve_cli_path(settings, args.report, existing=True)
+        verification = verify_debian_apt_acceptance_report(report_path)
+        _print_debian_apt_acceptance_verification(
+            verification, as_json=bool(args.json)
+        )
+        return 0
     if command == "rpm-package":
         settings.ensure_directories()
         output = (
@@ -6866,6 +7077,36 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
         )
         return 0
     raise PcAgentError(f"Unknown release command: {command}")
+
+
+def _print_linux_secret_service_acceptance(
+    report: Any, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+    print(f"Linux Secret Service acceptance: {report.summary()}")
+    for check in report.checks:
+        suffix = f" - {check.detail}" if check.detail else ""
+        print(f"  [{check.status.upper()}] {check.name}{suffix}")
+    if report.error:
+        print(f"Error: {report.error}")
+    print("Credential values: not printed or stored in the report")
+    print("Probe: isolated random value; real provider keys are not written")
+
+
+def _print_linux_secret_service_acceptance_verification(
+    verification: Any, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(verification.to_dict(), indent=2))
+        return
+    print(
+        "Verified Linux Secret Service acceptance report: "
+        f"{verification.summary()}"
+    )
+    print(f"Location: {verification.report_path}")
+    print(f"Probe ID: {verification.probe_id}")
 
 
 def _print_anthropic_verification(report: Any, *, as_json: bool) -> None:
@@ -6980,6 +7221,36 @@ def _print_debian_repository(
         print("Repository signing: not performed (unsigned repository)")
 
 
+def _print_debian_apt_acceptance(report: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+    print(f"Debian APT live acceptance: {report.summary()}")
+    for check in report.checks:
+        suffix = f" - {check.detail}" if check.detail else ""
+        print(f"  [{check.status.upper()}] {check.name}{suffix}")
+    if report.error:
+        print(f"Error: {report.error}")
+    print(f"Repository: {report.repository_path}")
+    print(f"Report: {report.report_path}")
+    print("APT command output: hashes and byte counts only; raw output not stored")
+    print("Dependencies installed by APT: not auto-removed by the cleanup purge")
+
+
+def _print_debian_apt_acceptance_verification(
+    verification: Any, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(verification.to_dict(), indent=2))
+        return
+    print(
+        "Verified Debian APT live acceptance report: "
+        f"{verification.summary()}"
+    )
+    print(f"Location: {verification.report_path}")
+    print(f"Package SHA-256: {verification.package_sha256}")
+
+
 def _print_rpm_package(info: Any, *, as_json: bool, built: bool = False) -> None:
     if as_json:
         print(json.dumps(info.to_dict(), indent=2))
@@ -7015,6 +7286,14 @@ def _confirm_update_action(summary: str, *, assume_yes: bool) -> bool:
         summary,
         preapproved=assume_yes,
         heading="Approval required for this exact offline update operation:",
+    )
+
+
+def _confirm_debian_apt_acceptance(summary: str, *, assume_yes: bool) -> bool:
+    return _confirm_direct_write(
+        summary,
+        preapproved=assume_yes,
+        heading="Approval required for this exact live Debian APT operation:",
     )
 
 
@@ -7102,12 +7381,104 @@ def _print_online_stage_result(
     _print_staged_update(result.staged, as_json=False)
 
 
+def _print_update_feed_hosting_report(report: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+    print(f"Windows HTTPS update-feed hosting check: {report.summary()}")
+    for check in report.checks:
+        suffix = f" - {check.detail}" if check.detail else ""
+        print(f"  [{check.status.upper()}] {check.name}{suffix}")
+    if report.error:
+        print(f"Error: {report.error}")
+    print(f"Report: {report.report_path}")
+    print("Downloaded bundle: verified in a temporary folder; not staged or applied")
+    print("Response bodies and keys: not stored in the report")
+
+
+def _print_update_feed_hosting_verification(
+    verification: Any, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(verification.to_dict(), indent=2))
+        return
+    print(
+        "Verified Windows HTTPS update-feed hosting report: "
+        f"{verification.summary()}"
+    )
+    print(f"Location: {verification.report_path}")
+    print(f"Feed URL: {verification.feed_url}")
+    print(f"Bundle SHA-256: {verification.bundle_sha256}")
+
+
+def _print_auto_upgrade_run(report: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return
+    print(f"Background auto-upgrade: {report.summary()}")
+    for check in report.checks:
+        suffix = f" - {check.detail}" if check.detail else ""
+        print(f"  [{check.status.upper()}] {check.name}{suffix}")
+    if report.error:
+        print(f"Error: {report.error}")
+    print(f"State: {report.state_path}")
+    print(f"Report: {report.report_path}")
+    if report.restart_required:
+        print(
+            "Restart required: reinstall editable metadata if needed, "
+            "restart pc-agent, then run pc-agent doctor."
+        )
+
+
+def _print_auto_upgrade_status(status: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(status.to_dict(), indent=2))
+        return
+    print(f"Background auto-upgrade status: {status.summary()}")
+    if status.blockers:
+        print("Blockers: " + "; ".join(status.blockers))
+    print(f"State: {status.state_path}")
+    if status.scheduler is not None:
+        scheduler = status.scheduler
+        print(
+            "Windows schedule: "
+            f"installed={scheduler.installed}; task={scheduler.task_name}; "
+            f"state={scheduler.state}"
+        )
+    if status.state.get("latest_report"):
+        print(f"Latest report: {status.state['latest_report']}")
+    print("Policy: signed HTTPS only; default mode stages without applying")
+
+
+def _print_auto_upgrade_scheduler(result: Any, *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result.to_dict(), indent=2))
+        return
+    print(f"Windows auto-upgrade schedule: {result.summary()}")
+    if result.executable:
+        print(f"Executable: {result.executable}")
+    print(result.detail)
+
+
+def _print_auto_upgrade_verification(
+    verification: Any, *, as_json: bool
+) -> None:
+    if as_json:
+        print(json.dumps(verification.to_dict(), indent=2))
+        return
+    print(f"Verified background auto-upgrade report: {verification.summary()}")
+    print(f"Location: {verification.report_path}")
+
+
 def _run_update_command(settings: Settings, args: argparse.Namespace) -> int:
     command = getattr(args, "update_command", None)
     if command is None:
         print(
             "Usage: pc-agent update check|stage|online-check|online-download|"
-            "online-stage|apply|rollback|list|show ...",
+            "online-stage|hosting-check|hosting-check-verify|auto-status|"
+            "auto-run|auto-verify-report|auto-install-schedule|"
+            "auto-uninstall-schedule|auto-schedule-status|apply|rollback|"
+            "list|show ...",
             file=sys.stderr,
         )
         return 2
@@ -7177,6 +7548,110 @@ def _run_update_command(settings: Settings, args: argparse.Namespace) -> int:
         _print_online_stage_result(result, as_json=bool(args.json))
         if not args.json:
             print(f"Next: pc-agent update apply {result.staged.update_id}")
+        return 0
+    if command == "hosting-check":
+        settings.ensure_directories()
+        public_key: str | bytes | None = args.public_key
+        if args.public_key_file is not None:
+            public_key_path = _resolve_cli_path(
+                settings, args.public_key_file, existing=True
+            )
+            public_key = read_release_public_key_file(public_key_path)
+        report_path = (
+            _resolve_cli_path(settings, args.report)
+            if args.report is not None
+            else None
+        )
+        report = run_update_feed_hosting_live_verification(
+            settings,
+            report_path,
+            feed_url=args.feed_url,
+            public_key=public_key,
+            key_id=args.key_id,
+            channel=args.channel,
+            profile_id=args.profile,
+            expected_version=args.expected_version,
+        )
+        _print_update_feed_hosting_report(report, as_json=bool(args.json))
+        return 0 if report.status == "passed" else 1
+    if command == "hosting-check-verify":
+        report_path = _resolve_cli_path(settings, args.report, existing=True)
+        verification = verify_update_feed_hosting_report(report_path)
+        _print_update_feed_hosting_verification(
+            verification, as_json=bool(args.json)
+        )
+        return 0
+    if command == "auto-status":
+        status = get_auto_upgrade_status(
+            settings,
+            include_scheduler=True,
+            task_name=args.task_name,
+        )
+        _print_auto_upgrade_status(status, as_json=bool(args.json))
+        return 0 if not status.enabled or status.ready else 1
+    if command == "auto-run":
+        settings.ensure_directories()
+        report_path = (
+            _resolve_cli_path(settings, args.report)
+            if args.report is not None
+            else None
+        )
+        auto_report = run_auto_upgrade(
+            settings,
+            force=bool(args.force),
+            report_path=report_path,
+        )
+        _print_auto_upgrade_run(auto_report, as_json=bool(args.json))
+        return auto_report.exit_code
+    if command == "auto-verify-report":
+        report_path = _resolve_cli_path(settings, args.report, existing=True)
+        verification = verify_auto_upgrade_report(report_path)
+        _print_auto_upgrade_verification(
+            verification, as_json=bool(args.json)
+        )
+        return 0
+    if command == "auto-install-schedule":
+        summary = (
+            f"install Windows background auto-upgrade task {args.task_name} "
+            f"for root {settings.root_dir}"
+        )
+        confirmed = bool(args.yes) if args.json else _confirm_update_action(
+            summary, assume_yes=bool(args.yes)
+        )
+        if not confirmed:
+            print("Windows auto-upgrade schedule install cancelled.")
+            return 3
+        executable = (
+            _resolve_cli_path(settings, args.executable, existing=True)
+            if args.executable is not None
+            else None
+        )
+        schedule = install_windows_auto_upgrade_schedule(
+            settings,
+            task_name=args.task_name,
+            executable=executable,
+        )
+        _print_auto_upgrade_scheduler(schedule, as_json=bool(args.json))
+        return 0
+    if command == "auto-uninstall-schedule":
+        summary = (
+            f"remove Windows background auto-upgrade task {args.task_name} "
+            f"for root {settings.root_dir}"
+        )
+        confirmed = bool(args.yes) if args.json else _confirm_update_action(
+            summary, assume_yes=bool(args.yes)
+        )
+        if not confirmed:
+            print("Windows auto-upgrade schedule removal cancelled.")
+            return 3
+        schedule = uninstall_windows_auto_upgrade_schedule(
+            task_name=args.task_name
+        )
+        _print_auto_upgrade_scheduler(schedule, as_json=bool(args.json))
+        return 0
+    if command == "auto-schedule-status":
+        schedule = get_windows_auto_upgrade_schedule(task_name=args.task_name)
+        _print_auto_upgrade_scheduler(schedule, as_json=bool(args.json))
         return 0
     if command == "apply":
         settings.ensure_directories()
@@ -7332,11 +7807,31 @@ def _run_credentials_command(settings: Settings, args: argparse.Namespace) -> in
     command = args.credentials_command
     if command is None:
         print(
-            "Usage: pc-agent credentials status|list|set|delete|migrate|"
+            "Usage: pc-agent credentials status|list|"
+            "linux-secret-service-acceptance|"
+            "linux-secret-service-acceptance-verify|set|delete|migrate|"
             "remove-env-keys ...",
             file=sys.stderr,
         )
         return 2
+
+    if command == "linux-secret-service-acceptance":
+        settings.ensure_directories()
+        report_path = (
+            _resolve_cli_path(settings, args.report)
+            if args.report is not None
+            else None
+        )
+        report = run_linux_secret_service_acceptance(settings, report_path)
+        _print_linux_secret_service_acceptance(report, as_json=bool(args.json))
+        return 0 if report.status == "passed" else 1
+    if command == "linux-secret-service-acceptance-verify":
+        report_path = _resolve_cli_path(settings, args.report, existing=True)
+        verification = verify_linux_secret_service_acceptance_report(report_path)
+        _print_linux_secret_service_acceptance_verification(
+            verification, as_json=bool(args.json)
+        )
+        return 0
 
     store = _credential_store(settings)
     sources = dict(settings.credential_sources)

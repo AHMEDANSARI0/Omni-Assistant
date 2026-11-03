@@ -1,4 +1,4 @@
-# AI providers - through Phase 53
+# AI providers - through Phase 54
 
 ## Implemented adapters
 
@@ -29,6 +29,13 @@ once with a fixed public prompt and a 32-token ceiling, bypassing router
 fallback/retries and recording only secret-safe report metadata. Use
 `pc-agent providers verify-anthropic-report` to revalidate the retained
 report offline. See `docs/phase53.md`.
+
+Phase 54 adds **Live GNOME Keyring/KWallet Evidence** for the Linux
+credential backend: a direct acceptance command identifies the real
+`org.freedesktop.secrets` owner, round-trips one isolated random probe,
+deletes it, and proves real provider keys unchanged without recording
+values. It is a local desktop-session operation, not an AI-provider call.
+See `docs/phase54.md`.
 
 ## Credential storage (Phase 16/44/45)
 
@@ -161,7 +168,8 @@ image, user prompt, router fallback or router retry. See
 
 | Command | External provider call? |
 |---|---|
-| `providers list`, `providers verify-anthropic-report`, `credentials status/list`, `doctor`, GUI Dashboard/Providers refresh | No |
+| `providers list`, `providers verify-anthropic-report`, `credentials status/list`, `credentials linux-secret-service-acceptance-verify`, `doctor`, GUI Dashboard/Providers refresh | No |
+| `credentials linux-secret-service-acceptance` | No provider call; local Linux D-Bus/Secret Service only |
 | `providers verify-anthropic` | Yes — one explicit direct Anthropic text request; no fallback/retry and no vision test |
 | Supported deterministic `run` task (CLI or GUI Tasks tab) | No |
 | Direct `office`, `web fetch` or `desktop` command, or the matching GUI tab | No provider call; web fetch contacts only the exact requested site |
