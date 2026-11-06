@@ -38,7 +38,7 @@ from pc_agent.updates import (
     stage_update,
 )
 
-_FUTURE = "0.61.0"
+_FUTURE = "0.82.0"
 _PAST = "0.22.0"
 _SECRET = "[SECURITY_DATA]"
 
@@ -630,8 +630,8 @@ def test_gui_controller_signed_update_flow_and_doctor_text(
 
     summary = controller.doctor_summary()
     text = summary.to_text()
-    assert summary.version == __version__ == "0.60.0"
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in text
+    assert summary.version == __version__ == "0.81.2"
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in text
     assert "Signed updates: public_key=yes" in text
     assert "latest=" in summary.signed_updates_summary
 
@@ -644,9 +644,9 @@ def test_phase21_scope_schema_tools_and_release_candidates() -> None:
     }
     pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(tool_ids) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(tool_ids) == 69
     assert not any(tool_id.startswith("update.") for tool_id in tool_ids)
     assert "pc-agent-release-admin" in pyproject
     assert "src/pc_agent/updates.py" in candidates

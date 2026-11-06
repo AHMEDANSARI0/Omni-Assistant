@@ -9,8 +9,10 @@ from .desktop_tools import register_desktop_tools
 from .file_tools import register_file_tools
 from .git_tools import register_git_tools
 from .image_tools import register_image_tools
+from .knowledge_tools import register_knowledge_tools
 from .office_tools import register_office_tools
 from .pdf_tools import register_pdf_tools
+from .perception_tools import register_perception_tools
 from .registry import ToolRegistry
 from .web_tools import register_web_tools
 from .workspace_tools import register_workspace_tools
@@ -29,4 +31,6 @@ def build_default_registry() -> ToolRegistry:
     register_command_tools(registry)
     register_browser_tools(registry)
     register_image_tools(registry)
+    register_perception_tools(registry)
+    register_knowledge_tools(registry)
     return registry

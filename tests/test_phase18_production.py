@@ -318,7 +318,7 @@ def test_diagnostics_are_counts_only_and_redacted(tmp_path: Path) -> None:
     assert payload["counts"]["tasks_by_status"]["queued"] == 1
     assert payload["counts"]["preferences"] == 1
     assert payload["counts"]["memory_by_kind"]["note"] == 1
-    assert payload["tools"]["builtin_count"] == 62
+    assert payload["tools"]["builtin_count"] == 69
     gemini = next(row for row in payload["providers"] if row["name"] == "gemini")
     assert gemini["credential_source"] == "environment"
 
@@ -432,7 +432,7 @@ def test_gui_controller_release_audit_and_doctor_text(tmp_path: Path) -> None:
     assert "CLI-only" in rendered_audit
     assert "count=1" in summary.database_backup_summary
     text = summary.to_text()
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in text
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in text
     assert "Production: release audit" in text
     assert _SECRET not in text
 
@@ -481,9 +481,9 @@ def test_current_project_candidates_include_phase18_but_no_private_areas() -> No
         path.as_posix() for path in release_candidate_files(project_root)
     }
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(build_default_registry().list_tools()) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(build_default_registry().list_tools()) == 69
     assert "src/pc_agent/release.py" in candidates
     assert "src/pc_agent/maintenance.py" in candidates
     assert "src/pc_agent/diagnostics.py" in candidates

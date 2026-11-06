@@ -75,14 +75,15 @@ def test_phase49_scope_documents_decode_as_utf8() -> None:
 
 
 def test_phase49_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(build_default_registry().list_tools()) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(build_default_registry().list_tools()) == 69
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["version"] == __version__
     assert project["project"]["dependencies"] == [
         "certifi>=2024.7.4",
+        "cryptography>=42,<51",
         "pypdf[crypto]>=5.0,<7",
         "pypdfium2>=5,<6",
         "Pillow>=10.4,<14",

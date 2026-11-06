@@ -5,7 +5,7 @@ secure, lightweight, extensible agent that plans and executes user tasks with
 explicit permissions, verifies results deterministically, and reports honestly
 what it did.
 
-## Current status: PHASE 44 - Linux Secret Service credentials (this build)
+## Current status: TRANSFORMATION PHASE 12 - Visual Workflow Builder (this build)
 
 | Status | Capability |
 |---|---|
@@ -73,6 +73,20 @@ what it did.
 | Implemented + tested (Phase 56) | **Background Auto-Upgrade**: a separately opted-in Windows Scheduled Task wakes a one-shot worker that checks only a signed HTTPS feed, verifies/downloads/stages a strictly newer bundle, and records self-hashed state/reports. Default `stage-only` never applies; `apply-when-idle` additionally requires the maintenance window, no active task, Windows idle time, AC power and a verified staged signature before using the existing backup/rollback apply path. Linux systemd-user and macOS LaunchAgent profiles are structured but planned. No registered tool (62), schema migration or dependency |
 | Implemented + tested (Phase 57) | **Live Debian/Ubuntu APT Evidence**: direct `pc-agent release debian-repository-acceptance` reverifies the Phase 50 repository/current `.deb`, refuses a pre-existing package, uses a temporary APT source/state/cache to run real APT update/candidate/install, verifies dpkg state and every installed file against the package manifest, purges only the acceptance package, and retains a strict self-hashed report for `debian-repository-acceptance-verify`. Signed repositories use `signed-by`; unsigned local acceptance records its temporary `trusted=yes` exception honestly. No registered tool (62), schema migration or dependency |
 | Hotfix (Phase 58) | **Windows Auto-Upgrade Lock Hotfix**: the Phase 56 worker now seeks to byte 0 before both Windows `msvcrt.locking` lock and unlock operations. This fixes the reported second-run `PermissionError` caused by an existing `a+b` lock file starting at EOF; an offset-faithful fake-`msvcrt` regression reproduces the old failure and proves repeated lock cycles plus nested-worker refusal. No registered tool (62), schema migration, configuration or dependency change |
+| Implemented + tested (Phase 59) | **Linux systemd-user Auto-Upgrade Scheduler**: the existing direct schedule commands and GUI controls now dispatch to Windows Scheduled Task or a per-user Linux systemd one-shot service plus persistent hourly timer. Linux installation preflights the user manager, refuses unmanaged same-named units, writes managed units atomically with rollback, reports unavailable managers gracefully, and removes only managed units. The signed worker policy is unchanged; Linux `stage-only` is functional at that boundary while Linux idle/power sensors remain separate work. macOS LaunchAgent remains planned. No registered tool (62), schema migration or dependency |
+| Implemented + tested (Phase 60) | **Linux Idle and AC Power Sensors**: Linux `apply-when-idle` now reads the current UID's interactive systemd-logind idle hints/monotonic timestamps and kernel `/sys/class/power_supply` state, with logind `OnExternalPower` only as an inconclusive-sysfs fallback. Malformed, absent or ambiguous readings remain unknown, and unknown required idle/power state now defers on every platform. The Phase 59 scheduler and signed worker policy are unchanged. No registered tool (62), schema migration or dependency |
+| Implemented + tested (Transformation Phase 1) | **Canonical Baseline and Windows Acceptance**: the delivered Phase 60 tree is frozen as the implementation source of truth after reconciliation against audited GitHub Phase 58 commit `89610f3d18f9348b6fe8ead679bab81ee34155df`; Phase 59/60 are retained, stale Phase 44 build labels are repaired, `cryptography` is declared directly, doctor/diagnostics/release-audit expose one secret-free baseline identity and document check, and root architecture/roadmap/feature/security/performance/test documents plus a Windows acceptance pack are added. No registered tool (62), schema migration (v6) or new runtime capability is claimed; native Windows evidence remains pending |
+| Implemented + tested (Transformation Phase 2) | **Safety Kernel**: all orchestrated tool calls pass through `SafetyKernel` with hard timeouts (isolated worker subprocess killed at the deadline for data-context tools; bounded daemon-thread timeout for browser/desktop/vision), a file-backed emergency stop (`pc-agent safety`), a digest-bound Approval Center for non-interactive exact-scope decisions (`pc-agent approvals`, schema v7), approval records that store argument SHA-256 digests instead of raw arguments, and optional passphrase-encrypted database backups (`maintenance backup --encrypt`). Doctor/GUI/diagnostics/release-audit expose live safety state. No registered tool (62); native Windows evidence remains pending |
+| Implemented + tested (Transformation Phase 8) | **Memory v2 and Knowledge Base**: schema **v10** adds model-tagged note embeddings + tags (content edits invalidate vectors) and `knowledge_documents`/`knowledge_chunks`; explicit ingestion of text/PDF/Office files (never silent OCR, SHA-256 dedupe) with an offline deterministic hashing embedder by default and optional OpenAI-compatible/Ollama embedding backends; hybrid vector+keyword search over documents and notes with a labelled keyword fallback; grounded `knowledge ask` with `[S#]` citations that calls no provider when nothing matches. Two agent tools (`knowledge.ingest`, `knowledge.search`, worker-excluded) bring the registry to **64 built-ins**. Native Windows evidence remains pending |
+| Implemented + tested (Transformation Phase 10) | **Voice Pipeline**: schema **v12** `voice_sessions` ledger; push-to-talk capture (native Windows `winmm`, ALSA `arecord`) with hard duration bounds; local-first STT (System.Speech, faster-whisper, whisper.cpp) plus a cloud engine gated by a global flag *and* per-call consent; offline TTS (System.Speech, espeak-ng) that delivers text via a temp file/stdin, never a command line; microphone off by default with persisted consent, separate wake-word opt-in, discard-by-default audio, opt-in redacted transcripts, purge/clear commands, emergency-stop block; no new tool (still **64 built-ins**). Also fixes the two Windows failures reported on 0.71.0 (hard-timeout probe interpreter, Windows process RSS). Native Windows evidence remains pending |
+| Implemented + tested (Transformation Phase 9) | **Specialized Multi-Agent Runtime + Agent Studio**: schema **v11** stores agent definitions (role, persona, builtin-tool allow-list, provider preference, budgets) and a run ledger; six builtin specialists (coordinator, researcher, document-worker, data-analyst, knowledge-keeper, reviewer) plus full custom-agent CRUD. Every agent run is an ordinary Safety-Kernel task whose orchestrator gets a **filtered tool registry**, so least privilege is structural; team runs execute <=6 assignments as a bounded dependency graph (explicit, or coordinator-proposed through one strictly validated JSON completion), depth-1 only, no new tool (still **64 built-ins**). Native Windows evidence remains pending |
+| Implemented + tested (Transformation Phase 11) | **Advanced Browser, Windows Desktop Automation and Computer Vision**: offline Pillow-only perception (`vision.screen` reports measured brightness/contrast/dominant colours plus a resolution-normalised ink grid, `vision.locate` finds a template with a coarse nomination pass and full-pixel verification on the full-size screenshot, and a flat template is refused instead of matching everywhere); `browser.wait` polls a selector/text/URL condition for at most 120s, `browser.tabs` lists/activates/closes tabs and refuses to close the last one; `desktop.window_state` minimises/maximises/restores/moves/resizes a window with bounds clamped to the virtual screen (minimum 120x120, own window refused). Schema **v13** adds an `automation_runs` audit ledger that records allowed *and* refused actions without page text, screenshots or file contents; the registry grows to **69 built-ins**, the release audit to **25 checks**, and CLI/HTTP/GUI/web/diagnostics/doctor surfaces are all wired to the same service. Native Windows evidence remains pending |
+| Implemented + tested (Transformation Phase 12) | **Visual Workflow Builder**: a flow is a strict, versioned **JSON graph of instruction nodes** (`flow_schema` 1) that compiles into an ordinary Mission Center mission, so every node keeps the same Safety Kernel, approvals, token budgets, hard timeouts, verification and recovery. Unknown keys are refused, node ids are slugs (`^[a-z0-9][a-z0-9_-]{0,31}$`), `{{variable}}` placeholders must resolve, cycles are refused (Kahn), and limits are explicit (20 nodes, 8 variables, 8 triggers per flow, 60 s..30 d schedules, 64 KB imports). Immutable versions in `flow_versions`, portable `export`/`import` with a SHA-256 checksum over `{flow, triggers}` (an edited document is refused), `manual`/`schedule`/`event` triggers with an `app_events` watermark and one firing per trigger per tick, and `reconcile()` that closes runs by reading Mission Center instead of trusting a timer. Schema **v14** adds `flow_definitions`, `flow_versions`, `flow_triggers`, `flow_runs`; the release audit grows to **26 checks** (tool count stays **69** - a flow is data, not a tool); CLI `pc-agent flows …`, 18 HTTP routes, a 14th GUI tab **Workflows**, a web **Workflow Builder** panel, a `flows` diagnostics section and a `Flows:` doctor line. The same release widens `redact_text()` to catch bare provider keys (`sk-`, `ghp_`, `AIza`, `xai-`, `gsk_`) so a provider rejection can never be persisted in a run record |
+| Implemented + tested (Transformation Phase 17) | **Accessibility, multilingual UI and polish**: a `src/pc_agent/i18n/` layer with **61 interface keys translated for real** into Spanish, **Urdu** and **Arabic** (English is the source of truth), explicit `{placeholder}` substitution, a counted English fallback for anything not translated yet, and a four-entry allow-list so a fake translation fails the suite - user content, task instructions and provider messages are **never** machine-translated. `src/pc_agent/a11y.py` implements the real WCAG 2.1 relative-luminance/contrast maths, adds a high-contrast palette, and reports the language, direction, text scale (80-200%), theme, motion state, every locale's computed coverage, the measured contrast table (passing/total + WCAG level), the documented keyboard shortcuts, the claims this build can make (each with how it is verified) and **five disclosed limits** (Tk 8.6 has no bidi/shaping, no desktop accessibility tree, no OS theme detection, no captioning, four locales only). Preferences persist in `data/ui.json` (environment still wins; a corrupt file cannot break startup). The web Command Center gains real `lang`/`dir` switching with RTL mirroring, a skip link, landmarks, `aria-live` regions, `:focus-visible`, `prefers-reduced-motion` and a working Accessibility panel; the desktop app gains a 19th **Accessibility** tab with scaled fonts and mirrored RTL header. Schema stays **v18** (no migration), release audit grows to **31 checks**, tool count unchanged at **69**, `pc-agent i18n …`, `pc-agent a11y …`, `pc-agent perf bench`, 5 HTTP routes, an `a11y` diagnostics section and an `Accessibility:` doctor line |
+| Implemented + tested (Transformation Phase 16) | **Optional encrypted device sync**: a `src/pc_agent/sync/` package that carries reminders, flows and profiles between *your own* devices through a folder you already sync (OneDrive/Dropbox/USB/LAN share) - no port, no server, no account. Each device holds an Ed25519 signing key and an X25519 encryption key in `data/sync/identity.json` (mode `0600`); pairing records a peer's public keys plus a grouped fingerprint and needs `confirm="PAIR"`. Every bundle is sealed per recipient with ephemeral-static X25519 + HKDF-SHA256 + AES-256-GCM (header as AAD) and signed with Ed25519 over the header and the digests of all recipient entries, so a tampered header, a swapped recipient entry, an unpaired sender or a peer whose key changed is all refused. Replay protection uses the processed bundle id plus a strictly increasing per-sender sequence inside a 900 s clock window; size, record count, request count and retention are bounded. Conflicts never destroy local data (reminders de-dupe, flows follow `local|newest|remote`, profiles are create-only, every skip is reported). A peer can never execute anything: only `remind`/`notify`/`ping` coordination requests exist and each waits in a ledger for a local human accept. Schema **v18** (`sync_devices`, `sync_bundles`, `sync_requests`, `sync_state`), release audit grows to **30 checks**, tool count unchanged at **69**, `pc-agent sync …` CLI, 12 HTTP routes, an 18th GUI tab **Sync**, a web **Device sync** panel, a `sync` diagnostics section and a `Sync:` doctor line |
+| Implemented + tested (Transformation Phase 15) | **Plugin ecosystem**: a `src/pc_agent/plugins/` package with a strict manifest contract (unknown fields, bad ids/versions, unknown capabilities and traversal paths refused), content checksums bound into the manifest, Ed25519 publisher signatures verified against `PC_AGENT_PLUGIN_TRUSTED_KEYS` (unsigned bundles refused unless explicitly opted in), a closed capability list where `network` and `subprocess` are never granted, verify/install/enable/disable/rollback/uninstall with 5 retained versions, and sandboxed tool execution - POSIX `setrlimit` or a Windows Job Object plus an isolated interpreter (`-I -B`), a scrubbed environment, a `sys.addaudithook` hook that denies sockets, subprocesses, `ctypes` and writes outside the granted roots, and a hard timeout. Every call needs `confirm=<plugin id>`. Markdown skills are returned as text and never executed. Schema **v17** (`plugins`, `plugin_versions`, `plugin_runs`, `plugin_state`), release audit grows to **29 checks**, tool count unchanged at **69**, `pc-agent plugins …` CLI, 12 HTTP routes, a 17th GUI tab **Plugins**, a web panel, a `plugins` diagnostics section and a `Plugins:` doctor line |
+| Implemented + tested (Transformation Phase 14) | **Proactive intelligence**: a `ProactiveEngine` (`src/pc_agent/proactive.py`) with durable one-shot/repeating reminders (due as `+15m`/`+2h`/`+3d`, `HH:MM` or ISO-8601; snooze/dismiss/done/enable/delete), a notification policy the user can reason about (wraparound quiet hours with opt-in `critical` crossover, rolling hourly cap 1-500 default 20, per-key cooldown 0-86400 s default 300, and an outbound switch that stays **off** by default), and a daily briefing composed only from live state - reminders, calendar, drive, flows, tasks and system health - stored once per local date. Bad settings are refused at load, not coerced. Schema **v16** (`reminders`, `notifications`, `proactive_briefings`, `proactive_state`), release audit grows to **28 checks**, tool count unchanged at **69**, `pc-agent proactive …` CLI, 13 HTTP routes under `/v1/proactive/*`, a 16th GUI tab **Proactive**, a web dashboard panel, a `proactive` diagnostics section and a `Proactive:` doctor line; the real `api_server` scheduler now runs the proactive tick |
+| Implemented + tested (Transformation Phase 13) | **Connectors**: five default-off, local-first connectors with one durable ledger. **Calendar** reads/writes a real `.ics` file (RFC 5545 folding, escaped text, `UID`+`DTSTART` validation, atomic replace, existing events preserved; naive input times are treated as local, never relabelled UTC). **Drive** indexes one local folder by SHA-256 content hash (add/modify/remove/unchanged, symlink-escape refusal, secret names skipped, bounded files and bytes, reported truncation). **Email** reads IMAP headers only (`BODY.PEEK[HEADER.FIELDS …]`, RFC 2047 subjects, no bodies or attachments) and sends over SMTP StartTLS behind a **second** gate plus a per-message `confirm="SEND"` token with CRLF-injection refusal. **Chat** posts one HMAC-signed JSON message (`X-PcAgent-Signature: sha256=…`) to an SSRF-validated endpoint with redirects refused. **Webhook** verifies inbound events (bounded body, clock skew, constant-time signature, replay protection keyed on `kind:external_id`). Schema **v15** adds `connector_events`, `connector_deliveries`, `connector_state`; release audit grows to **27 checks**, tool count unchanged (**69** - connectors are integrations, not tools until Phase 14); CLI `pc-agent connectors …`, 9 HTTP routes, a 15th GUI tab **Connectors**, a web **Connectors** panel, a `connectors` diagnostics section and a `Connectors:` doctor line |
 | Later | Authenticode signing, native macOS packages, macOS desktop parity, Adobe trust-program integration and externally verified full WebPKI/qualified-policy or PAdES workflows |
 
 This build **does not** claim arbitrary computer control, arbitrary generated
@@ -94,16 +108,15 @@ server, or cloud account yet.
 
 ## Setup / upgrade (Windows PowerShell)
 
-New installs apply the patchers in order: 1A, 1B, 1C, Phase 2, Phase 3,
-Phase 4, the Phase 4.1 hotfix, Phase 5, Phase 6, Phase 7, Phase 8, Phase 9,
-Phase 10, Phase 11, Phase 12, Phase 13, Phase 14, Phase 15, Phase 16,
-the Phase 16.1 hotfix, Phase 17, Phase 18, Phase 19, Phase 20, Phase 21, Phase 22, Phase 23, Phase 24, Phase 25, Phase 26, Phase 27, Phase 28, Phase 29, Phase 30, Phase 31, Phase 32, Phase 33, Phase 34, Phase 35, Phase 36, Phase 37, Phase 38, Phase 39, Phase 40, Phase 41, Phase 42, Phase 43, Phase 44, Phase 45, Phase 46, Phase 47, Phase 48, Phase 49, Phase 50, Phase 51, Phase 52, Phase 53, Phase 54, then Phase 55. The
-Phase 55 patcher is cumulative: it upgrades an existing Phase 9 (0.11.0)
-through Phase 54 (0.56.0) install:
+For an existing install, use the latest cumulative patcher. The 0.81.0 patcher
+upgrades any earlier install - including the audited GitHub Phase 58 tree and the
+delivered Phase 60 tree - to the same canonical 0.81.2 files (every earlier
+phase, including the 0.79.1 Windows hotfix and the 0.80.1 sandbox fix, is
+included; nothing else is required):
 
 ```powershell
 cd D:\omni-assistant   # your project folder
-node PHASE_55_WINDOWS_HTTPS_UPDATE_FEED_HOSTING.mjs
+node TRANSFORMATION_PHASE_19_VOICE_SIGNING.mjs
 
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -114,25 +127,193 @@ pc-agent doctor
 pc-agent demo pdf
 pc-agent run "Merge PDFs from Folder A and Folder B then extract pages 1-2"
 pc-agent workflow list
+pc-agent agents list
+pc-agent voice status
+pc-agent voice devices
+pc-agent voice privacy
+pc-agent automation capabilities
+pc-agent automation stats
 pc-agent gui --check
+pc-agent sync status
+pc-agent sync identity
+pc-agent i18n list
+pc-agent a11y status
+pc-agent perf bench
+pc-agent release production-check
+pc-agent i18n status
 ```
 
-Phase 58 is the **Windows Auto-Upgrade Lock Hotfix** and adds no
-registered tool, so the count stays 62 built-ins and the database schema
-stays **v6**. Reinstalling refreshes the editable package metadata to
-0.60.0; no new Python dependency is added beyond Phase 26's
-`pypdf[crypto]`. The Phase 56 Windows worker now locks and unlocks byte 0
-of its persistent lock file consistently, fixing the reported second-run
-`msvcrt.locking` `PermissionError`. Phase 57's **Live Debian/Ubuntu APT
-Evidence**, Phase 56's **Background Auto-Upgrade**, Phase 55's
+Transformation Phase 18 adds **final production hardening** and closes the
+programme: `.github/workflows/ci.yml` runs the whole gate - `ruff`, the full
+suite, `release audit` and the new `release production-check` - on
+`ubuntu-latest` and `windows-latest` across Python 3.11 and 3.13, plus an
+accessibility/i18n/perf job and a tag-only packaging job. No secrets are used
+(`permissions: contents: read`). `pc-agent release production-check` is the
+phase's centrepiece: it builds a real release bundle from this tree, verifies it
+without extracting, proves a **tampered** archive is refused, signs with an
+**ephemeral** Ed25519 key, proves an **unsigned** bundle is refused while
+signing is required, then stages, applies and rolls back the update in a
+throw-away copy and compares tree hashes - ten steps, ~1.7 s, and the running
+install is never touched. Results are recorded in `data/production-check.json`
+and surfaced as release check **32** (`production_hardening`), a `Hardening:`
+doctor line and a 20th dashboard tab **Production** whose button runs the real
+check. Two new suites make the posture executable: 19 security checks
+(SSRF incl. DNS rebinding, command-injection, archive traversal, secret leakage,
+emergency stop, tool-schema pollution) and 9 measured performance checks with
+budgets written into `PERFORMANCE_REPORT.md`. The four documents the programme
+still owed now exist: `AUDIT_REPORT.md`, `DEVELOPER_GUIDE.md`,
+`INSTALLATION_GUIDE.md` and `PLUGIN_DEVELOPMENT_GUIDE.md`. Schema stays **v18**,
+70 built-in tools, **33** release checks, **20** GUI tabs, **1130** tests.
+
+The last open item has an executable path instead of a promise:
+`pc-agent release evidence` runs the acceptance gates on the Windows machine
+(suite, release audit, end-to-end release chain, a real `-I -B` plugin worker,
+owner-only file hardening, measured accessibility) and seals the result;
+`pc-agent release evidence record` stores it in `data/windows-acceptance.json`;
+only then does the baseline and the `Hardening:` doctor line say
+`windows-acceptance=verified:<date>`. On any other host the command refuses to
+claim anything, and `--self-test` proves the harness while staying unrecordable.
+The seal is tamper-evident, not authentication - see `SECURITY_REPORT.md`.
+
+Transformation Phase 17 adds **accessibility and multilingual UI**
+(`pc-agent i18n status|list|strings|set`, `pc-agent a11y status|check|contrast`,
+`pc-agent perf bench`, `/v1/i18n/*`, `/v1/a11y/status`, `/v1/perf/bench`, the 19th
+GUI tab **Accessibility** (now followed by Production), a web Accessibility panel; schema **v18**, still 69
+built-in tools, **33** release checks). Four interface languages ship with real
+translations - English, Spanish, Urdu and Arabic - and Urdu/Arabic are marked
+right-to-left, which mirrors the web layout and the desktop header. Text size
+(80-200%), high contrast and reduced motion are persisted in `data/ui.json` and
+an environment variable still wins. Contrast is **measured**, not claimed: the
+report prints the WCAG 2.1 ratio for every text/UI pair on both palettes, and the
+five things this build cannot do (Tk bidi/shaping, desktop accessibility tree, OS
+theme detection, captioning, more locales) are printed instead of hidden.
+
+Transformation Phase 16 adds **optional encrypted device sync**
+(`pc-agent sync status|identity|peers|pair|unpair|pause|resume|export|import|tick|bundles|requests|request|decide`,
+`/v1/sync/*`, GUI Sync tab, web panel; schema **v18**, still 69 built-in tools).
+It is off until you set `PC_AGENT_ALLOW_SYNC=1` and is deliberately not a cloud
+service: bundles are written into a folder you already sync, encrypted to each
+paired device's X25519 key and signed with the sender's Ed25519 key. A bundle from
+an unpaired device, a tampered header, an old sequence number or a bundle outside
+the clock window is refused, and a peer can only ever ask this device to create a
+reminder or show a notification - both wait for your accept.
+
+Transformation Phase 10 adds the **Voice Pipeline** (`pc-agent voice
+status|devices|enable|disable|wake-word|ptt|transcribe|say|sessions|privacy`,
+`/v1/voice/...`, GUI Voice tab, web Voice panel; schema **v12**, still 64
+built-in tools): push-to-talk capture through native Windows `winmm` (or ALSA
+`arecord` on Linux), local-first speech-to-text (Windows System.Speech,
+faster-whisper, whisper.cpp) with an optional cloud engine that needs *both* a
+global flag and per-call consent, offline text-to-speech (System.Speech,
+espeak-ng), and a microphone that is **off until you explicitly enable it** -
+with wake-word listening as a second, separate opt-in. Recordings are deleted
+right after transcription unless you opt into retention, transcripts are opt-in
+and redacted, and `pc-agent voice privacy --purge-audio` wipes anything kept.
+This release also fixes two Windows test failures you reported: the Safety
+Kernel hard-timeout probe now resolves `python.exe` (not `python3`), and Windows
+process RSS is read through `K32GetProcessMemoryInfo`/PSAPI with explicit 64-bit
+handle signatures instead of returning `None`.
+
+Transformation Phase 11 adds **Advanced Automation and local vision**
+(`pc-agent automation capabilities|runs|stats|screen|locate`,
+`/v1/automation/...`, `/v1/vision/...`, `/v1/browser/wait`, `/v1/browser/tabs`,
+`/v1/desktop/window-state`, GUI Automation tab, web panel; schema **v13**,
+**69** built-in tools, **25** release checks). Browser runs can now *wait* for a
+real page condition instead of sleeping, manage tabs (never closing the last
+one), and desktop runs can place a real window - minimise, maximise, restore,
+move or resize inside the virtual screen, with a 120x120 minimum and the
+assistant's own window refused. Screen understanding is offline and needs no
+API key: `vision.screen` measures an image (brightness, contrast, dominant
+colours, a resolution-normalised ink grid over up to 12x12 cells) and
+`vision.locate` finds a template using a coarse nomination pass followed by
+full-pixel verification on the full-size screenshot, so a reported match is a
+measured one; a flat-colour template is refused because it would match
+everywhere. Every browser/desktop/vision action - allowed or refused - is
+written to a local `automation_runs` ledger that stores the action, target label
+and short detail only, never page text, screenshots or file contents.
+
+Transformation Phase 9 adds the **Specialized Multi-Agent Runtime +
+Agent Studio** (`pc-agent agents list|create|run|team|runs`,
+`GET/POST /v1/agents...`, GUI Agents tab, web Agent Studio panel;
+schema **v11**, still 64 built-in tools): six builtin specialists
+(coordinator, researcher, document-worker, data-analyst,
+knowledge-keeper, reviewer) plus your own custom agents, each
+running tasks through a filtered tool registry so a specialist
+can only ever use its own tools. Team runs execute a small
+dependency graph of assignments - written by you or proposed by
+the coordinator and validated locally. Transformation Phase 8 adds **Memory v2 and the local Knowledge Base**
+(`pc-agent knowledge ingest|list|search|ask|remove|stats`,
+`pc-agent memory search|reindex`, `GET /v1/knowledge/...`,
+`GET /v1/memory/search`, GUI Knowledge tab, web Knowledge panel;
+schema **v10**, 64 built-in tools): ingest text/PDF/Office files
+explicitly (no silent OCR), search them together with your memory
+notes by meaning-ish hybrid vector+keyword matching — offline by
+default via a deterministic hashing embedder, or with a configured
+OpenAI-compatible/Ollama embedding model — and ask grounded
+questions answered only from retrieved sources with `[S#]`
+citations. Transformation Phase 7 adds the **Provider Platform v2**
+(`pc-agent providers capabilities|route|usage|evaluate`,
+`pc-agent ask --stream`, `GET /v1/providers/capabilities|usage`,
+`POST /v1/providers/stream`): per-provider capabilities, strategy
+routing (default / local-first / fastest by measured latency /
+cheapest by your configured prices), local usage analytics with no
+prompt text stored, token streaming where adapters support it, and a
+built-in evaluation suite. Transformation Phase 6 adds **live system monitoring**
+(`pc-agent system status|sample`, authenticated `GET /v1/system`):
+real CPU/memory/disk usage, network rates, agent process RSS, GPU via
+`nvidia-smi` when present (an honest "unavailable" otherwise), battery,
+and a top-process table — shown in the web Command Center's **System
+(live)** panel, the desktop Command Center tab, doctor, and diagnostics
+exports. Transformation Phase 5 adds the **JARVIS Command Center**: a built-in
+web UI served by the local API (`pc-agent api serve`, then open the
+printed `http://127.0.0.1:8765/` URL and paste the token once) with live
+tasks, mission graphs, approvals, safety controls, schedules, and the
+event tail — plus a matching **Command Center tab** in the desktop GUI.
+Every number and button is real API/app state; nothing is simulated.
+Transformation Phase 4 adds the **Mission Center**: missions group
+tasks into a dependency graph (schema **v9**) that runs with bounded
+parallelism (`pc-agent missions create|add-task|link|run|show|cancel`),
+plus task schedules (`pc-agent schedules add|list|tick`; the API
+process ticks them automatically) — every branch still runs through
+the Safety Kernel. Transformation Phase 3 adds the **Local Service**: a loopback-only
+token-authenticated local API (`pc-agent api status|serve`, schema **v8**)
+over one shared service layer, a durable global event system
+(`pc-agent events list`), optional structured JSON logging
+(`PC_AGENT_LOG_FORMAT=json` writes `data/logs/pc-agent.jsonl`), and
+file-based settings profiles (`pc-agent profiles ...`) that can never
+carry secrets or capability gates. TRANSFORMATION PHASE 2 adds the **Safety Kernel**: every orchestrated
+tool call now runs under a hard timeout, worker-eligible tools execute in
+an isolated subprocess that is killed at the deadline, a file-backed
+**emergency stop** (`pc-agent safety stop|resume|status`) can halt all
+autonomous execution, non-interactive approvals flow through a
+digest-bound **Approval Center** (`pc-agent approvals
+list|show|approve|deny`, schema **v7**), approval records store argument
+digests instead of raw arguments, and database backups can be
+passphrase-encrypted (`pc-agent maintenance backup --encrypt`). It adds
+no registered tool, so the count stayed 62 built-ins at that point
+(Phase 8 raises it to 64). Reinstalling
+refreshes the editable package metadata to 0.77.0. Transformation Phase 1
+froze the delivered Phase 60 tree as canonical after reconciliation
+against audited GitHub Phase 58 and declared `cryptography` directly
+because PDF trust/signing modules import it. Phase 60's
+Linux idle/power sensors, Phase 59's **Linux systemd-user Auto-Upgrade Scheduler**,
+Phase 58's
+**Windows Auto-Upgrade Lock Hotfix**, Phase 57's **Live Debian/Ubuntu
+APT Evidence**, Phase 56's **Background Auto-Upgrade**, Phase 55's
 **Windows HTTPS Update-Feed Hosting**, Phase 54's **Live
 GNOME Keyring/KWallet Evidence**, Phase 53's **Live Anthropic
 Verification**, Phase 52's **Windows
 Repository Timestamp Hotfix**, Phase 51's **RPM Repository**, Phase 50's
 **Debian APT Repository**, Phase 49's **Windows UTF-8 Test Hotfix**,
 Phase 48's **Native RPM Package** and Phase 47's **Native Debian
-Package** remain available unchanged. See `docs/phase58.md` for the
-Windows lock hotfix, `docs/phase57.md` for live Debian/Ubuntu APT
+Package** remain available unchanged. See
+`docs/transformation_phase2.md` for the Safety Kernel design,
+`docs/transformation_phase1.md` for the reconciliation decision,
+`docs/windows_acceptance.md` for the still-pending native Windows evidence
+pack, `docs/phase60.md` for the Linux idle/power sensors,
+`docs/phase59.md` for the Linux systemd
+scheduler, `docs/phase58.md` for the Windows lock hotfix,
+`docs/phase57.md` for live Debian/Ubuntu APT
 evidence, `docs/phase56.md` for background
 auto-upgrade, `docs/phase55.md` for Windows
 HTTPS update-feed hosting, `docs/phase54.md` for Linux
@@ -557,21 +738,21 @@ virtual environments and caches:
 ```powershell
 pc-agent release audit
 pc-agent release build
-pc-agent release verify workspace\self-healing-pc-agent-v0.60.0-portable.zip
+pc-agent release verify workspace\self-healing-pc-agent-v0.77.0-portable.zip
 pc-agent release installer-source
-pc-agent release installer-verify workspace\windows-installer-v0.60.0
+pc-agent release installer-verify workspace\windows-installer-v0.72.0
 pc-agent release installer-acceptance
-pc-agent release installer-acceptance-verify workspace\windows-installer-acceptance-v0.60.0\windows-installer-acceptance-report.json
+pc-agent release installer-acceptance-verify workspace\windows-installer-acceptance-v0.72.0\windows-installer-acceptance-report.json
 pc-agent release posix-source
-pc-agent release posix-verify workspace\posix-installer-v0.60.0
+pc-agent release posix-verify workspace\posix-installer-v0.72.0
 pc-agent release debian-package
-pc-agent release debian-verify workspace\self-healing-pc-agent_0.60.0-1_all.deb
+pc-agent release debian-verify workspace\self-healing-pc-agent_0.72.0-1_all.deb
 pc-agent release debian-repository
-pc-agent release debian-repository-verify workspace\apt-repository-v0.60.0
+pc-agent release debian-repository-verify workspace\apt-repository-v0.72.0
 pc-agent release rpm-package
-pc-agent release rpm-verify workspace\self-healing-pc-agent-0.60.0-1.noarch.rpm
+pc-agent release rpm-verify workspace\self-healing-pc-agent-0.72.0-1.noarch.rpm
 pc-agent release rpm-repository
-pc-agent release rpm-repository-verify workspace\rpm-repository-v0.60.0
+pc-agent release rpm-repository-verify workspace\rpm-repository-v0.72.0
 ```
 
 Use `pc-agent maintenance backup|list|verify|restore` for verified local
@@ -782,9 +963,12 @@ the foreground first, then `auto-install-schedule` to register the per-user
 Windows task. The default Background auto-upgrade mode is `stage-only`:
 it downloads, verifies and stages, but never applies.
 `apply-when-idle` may apply only inside the maintenance window with no
-active task, enough Windows idle time, AC power and a verified signature.
+active task, enough operating-system idle time, AC power and a verified
+signature. Windows uses Win32 idle/power APIs; Linux uses the Phase 60
+logind and power-supply sensors.
 State and every run report are retained under `data\updates`. Linux
-systemd-user and macOS LaunchAgent profiles remain planned. See
+systemd-user scheduler is implemented in Phase 59; the macOS LaunchAgent
+profile remains planned. See
 `docs/phase56.md`.
 
 ## Live Debian/Ubuntu APT Evidence (Phase 57)
@@ -805,6 +989,26 @@ Repeated Phase 56 Windows worker runs now lock and unlock the persistent
 `msvcrt.locking` `PermissionError` seen in the two real Windows Phase 56
 tests, without changing the signed-feed, staging or idle-apply policy.
 See `docs/phase58.md`.
+
+## Linux systemd-user Auto-Upgrade Scheduler (Phase 59)
+
+On Linux, the same `update auto-install-schedule`,
+`auto-schedule-status` and `auto-uninstall-schedule` commands manage a
+per-user systemd one-shot service and persistent hourly timer. It wakes
+the unchanged signed worker, refuses unmanaged same-named units, and
+rolls unit files back if enable fails. Linux `stage-only` remains the
+recommended first mode; Phase 60 supplies the sensors required by
+`apply-when-idle`. macOS LaunchAgent remains planned. See
+`docs/phase59.md`.
+
+## Linux Idle and AC Power Sensors (Phase 60)
+
+Linux `apply-when-idle` reads interactive systemd-logind session idle
+hints for the current UID and kernel `/sys/class/power_supply` state,
+falling back to logind `OnExternalPower` only when sysfs is inconclusive.
+Missing, malformed or ambiguous readings stay unknown and defer the apply
+gate; the same unknown-is-not-permission rule now applies on every
+platform. See `docs/phase60.md`.
 
 ## Direct Anthropic provider (Phase 19)
 
@@ -886,6 +1090,6 @@ See `docs/phase4.md`, `docs/phase5.md`, `docs/phase6.md`, `docs/phase7.md`,
 `docs/phase8.md`, `docs/phase9.md`, `docs/phase10.md`, `docs/phase11.md`,
 `docs/phase12.md`, `docs/phase13.md`, `docs/phase14.md`,
 `docs/phase15.md`,
-`docs/phase16.md`, `docs/phase17.md`, `docs/phase18.md`, `docs/phase19.md`, `docs/phase20.md`, `docs/phase21.md`, `docs/phase22.md`, `docs/phase23.md`, `docs/phase24.md`, `docs/providers.md`, `docs/tools.md`, `docs/tool_builder.md`,
+`docs/phase16.md`, `docs/phase17.md`, `docs/phase18.md`, `docs/phase19.md`, `docs/phase20.md`, `docs/phase21.md`, `docs/phase22.md`, `docs/phase23.md`, `docs/phase24.md`, `docs/transformation_phase1.md` … `docs/transformation_phase12.md`, `docs/providers.md`, `docs/tools.md`, `docs/tool_builder.md`,
 `docs/recovery.md`, `docs/architecture.md`, and `CHANGELOG.md` for detailed
 contracts and honest limitations.

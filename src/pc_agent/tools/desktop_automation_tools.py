@@ -183,6 +183,57 @@ def _focus(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
     return {"window": _window_dict(window), "focused": bool(window.is_foreground)}
 
 
+def _window_state(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    selector = _window_selector(arguments)
+    assert selector is not None
+    state = str(arguments.get("state") or "").strip().lower()
+    if state not in {"minimize", "maximize", "restore", "move", "resize"}:
+        raise ToolError("state must be one of: minimize, maximize, restore, move, resize.")
+    bounds_argument = arguments.get("bounds")
+    bounds: tuple[int, int, int, int] | None = None
+    if bounds_argument is not None:
+        if not isinstance(bounds_argument, list) or len(bounds_argument) != 4:
+            raise ToolError("bounds must be a list of four integers: left, top, right, bottom.")
+        values: list[int] = []
+        for item in bounds_argument:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ToolError("bounds must contain integers only.")
+            if not -32_000 <= item <= 32_000:
+                raise ToolError("bounds values must be within +/-32000.")
+            values.append(item)
+        bounds = (values[0], values[1], values[2], values[3])
+        if bounds[2] - bounds[0] < 120 or bounds[3] - bounds[1] < 120:
+            raise ToolError("Refusing to shrink a window below 120x120 pixels.")
+    if state in {"move", "resize"} and bounds is None:
+        raise ToolError("move/resize needs bounds as [left, top, right, bottom].")
+    change = _backend(context).set_window_state(selector, state, bounds=bounds)
+    recorder = context.automation_recorder
+    if recorder is not None:
+        recorder(
+            {
+                "kind": "desktop",
+                "tool_id": "desktop.window_state",
+                "action": state,
+                "target": str(change.window_before.title)[:200],
+                "status": "ok",
+                "detail": f"changed={change.changed}" + (f"; {change.note}" if change.note else ""),
+                "duration_ms": 0,
+                "allowed": True,
+            }
+        )
+    return {
+        "state": change.state,
+        "requested": change.requested,
+        "changed": bool(change.changed),
+        "note": change.note,
+        "bounds": list(bounds) if bounds is not None else None,
+        "window_before": _window_dict(change.window_before),
+        "window_after": (
+            _window_dict(change.window_after) if change.window_after is not None else None
+        ),
+    }
+
+
 def _click(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
     window_selector = _window_selector(arguments)
     assert window_selector is not None
@@ -651,6 +702,78 @@ def _specs() -> list[tuple[ToolSpec, ToolHandler]]:
                 timeout_seconds=120.0,
             ),
             _screenshot,
+        ),
+        (
+            ToolSpec(
+                id="desktop.window_state",
+                name="Desktop window state",
+                version="1.0.0",
+                description=(
+                    "Minimise, maximise, restore or move/resize one exact window. "
+                    "Bounds are clamped to the virtual screen and the result is read "
+                    "back from the OS; it never targets this app's own window."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "state": {
+                            "type": "string",
+                            "enum": ["minimize", "maximize", "restore", "move", "resize"],
+                        },
+                        "bounds": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "minItems": 4,
+                            "maxItems": 4,
+                        },
+                        "window_handle": {"type": ["string", "integer"]},
+                        "window_title": {"type": "string", "maxLength": 300},
+                        "window_title_contains": {"type": "string", "maxLength": 300},
+                        "window_class_name": {"type": "string", "maxLength": 200},
+                    },
+                    "required": ["state"],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "state": {"type": "string"},
+                        "requested": {"type": "string"},
+                        "changed": {"type": "boolean"},
+                        "note": {"type": "string"},
+                        "bounds": {"type": ["array", "null"]},
+                        "window_before": {
+                                "type": "object",
+                                "properties": {
+                                    "handle": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "class_name": {"type": "string"},
+                                    "process_id": {"type": "integer"},
+                                    "process_name": {"type": "string"},
+                                    "is_foreground": {"type": "boolean"},
+                                    "is_minimized": {"type": "boolean"},
+                                    "bounds": {
+                                        "type": "object",
+                                        "properties": {
+                                            "left": {"type": "integer"},
+                                            "top": {"type": "integer"},
+                                            "right": {"type": "integer"},
+                                            "bottom": {"type": "integer"},
+                                            "width": {"type": "integer"},
+                                            "height": {"type": "integer"},
+                                        },
+                                        "required": ["left", "top"],
+                                    },
+                                },
+                                "required": ["handle", "title"],
+                            },
+                        "window_after": {"type": ["object", "null"]},
+                    },
+                    "required": ["state", "changed"],
+                },
+                permissions=desktop_permission,
+                timeout_seconds=30.0,
+            ),
+            _window_state,
         ),
     ]
 

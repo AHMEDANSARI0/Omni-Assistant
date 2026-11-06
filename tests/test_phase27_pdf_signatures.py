@@ -294,7 +294,7 @@ def test_pdf_signature_encrypted_and_no_registered_tool_surface(
         inspect_pdf_signatures(encrypted)
 
     ids = {tool.spec.id for tool in build_default_registry().list_tools()}
-    assert len(ids) == 62
+    assert len(ids) == 69
     assert "pdf.inspect_signatures" not in ids
     assert "direct.pdf_inspect_signatures" not in ids
 
@@ -355,9 +355,9 @@ def test_pdf_signature_gui_controller_direct_method(tmp_path: Path) -> None:
         controller.pdf_inspect_signatures("../outside.pdf")
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.60.0"
-    assert summary.builtin_tools == 62
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
+    assert summary.version == __version__ == "0.81.2"
+    assert summary.builtin_tools == 69
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
 
 def test_phase27_scope_docs_schema_and_release_candidates() -> None:
@@ -365,9 +365,9 @@ def test_phase27_scope_docs_schema_and_release_candidates() -> None:
     candidates = {path.as_posix() for path in release_candidate_files(project_root)}
     ids = {item.spec.id for item in build_default_registry().list_tools()}
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(ids) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(ids) == 69
     assert "src/pc_agent/documents/pdf_signatures.py" in candidates
     assert "docs/phase27.md" in candidates
     assert "tests/test_phase27_pdf_signatures.py" in candidates

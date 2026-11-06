@@ -8,7 +8,7 @@ not forwarded; prompts and the caller's output-token ceiling remain explicit.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from ..errors import ProviderError
@@ -18,8 +18,11 @@ from .base import (
     HttpJsonRequest,
     JsonTransport,
     MessageRole,
+    StreamTransport,
     UrllibJsonTransport,
+    UrllibStreamTransport,
     ensure_nonempty_content,
+    parse_anthropic_sse_lines,
 )
 
 _ANTHROPIC_VERSION = "2026-10-21"
@@ -28,6 +31,7 @@ _ANTHROPIC_VERSION = "2026-10-21"
 class AnthropicProvider:
     implemented = True
     supports_vision = True
+    supports_streaming = True
 
     def __init__(
         self,
@@ -37,6 +41,7 @@ class AnthropicProvider:
         base_url: str,
         timeout_seconds: float,
         transport: JsonTransport | None = None,
+        stream_transport: StreamTransport | None = None,
     ) -> None:
         self.name = "anthropic"
         self._api_key = api_key
@@ -44,23 +49,20 @@ class AnthropicProvider:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._transport = transport or UrllibJsonTransport()
+        self._stream_transport = stream_transport or UrllibStreamTransport()
 
-    @property
-    def configured(self) -> bool:
-        return bool(self._api_key and self.model and self._base_url)
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "anthropic-version": _ANTHROPIC_VERSION,
+        }
 
-    def complete(self, request: CompletionRequest) -> CompletionResponse:
-        if not self.configured:
-            raise ProviderError(
-                "Anthropic is not configured. Set ANTHROPIC_API_KEY in .env "
-                "or Windows Credential Manager."
-            )
-
+    def _payload(self, request: CompletionRequest, *, stream: bool) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": request.max_output_tokens,
             "messages": _message_payloads(request),
-            "stream": False,
+            "stream": stream,
         }
         system_blocks = [
             {"type": "text", "text": message.content}
@@ -69,15 +71,26 @@ class AnthropicProvider:
         ]
         if system_blocks:
             payload["system"] = system_blocks
+        return payload
 
+    def _require_configured(self) -> None:
+        if not self.configured:
+            raise ProviderError(
+                "Anthropic is not configured. Set ANTHROPIC_API_KEY in .env "
+                "or Windows Credential Manager."
+            )
+
+    @property
+    def configured(self) -> bool:
+        return bool(self._api_key and self.model and self._base_url)
+
+    def complete(self, request: CompletionRequest) -> CompletionResponse:
+        self._require_configured()
         data = self._transport(
             HttpJsonRequest(
                 url=_messages_url(self._base_url),
-                payload=payload,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "anthropic-version": _ANTHROPIC_VERSION,
-                },
+                payload=self._payload(request, stream=False),
+                headers=self._headers(),
                 timeout_seconds=self._timeout_seconds,
             )
         )
@@ -89,6 +102,23 @@ class AnthropicProvider:
             model=str(data.get("model") or self.model),
             usage=dict(usage),
         )
+
+    def stream_complete(self, request: CompletionRequest) -> Iterator[str]:
+        self._require_configured()
+        lines = self._stream_transport(
+            HttpJsonRequest(
+                url=_messages_url(self._base_url),
+                payload=self._payload(request, stream=True),
+                headers=self._headers(),
+                timeout_seconds=self._timeout_seconds,
+            )
+        )
+        produced = False
+        for delta in parse_anthropic_sse_lines(lines):
+            produced = True
+            yield delta
+        if not produced:
+            raise ProviderError("Provider anthropic returned an empty stream.")
 
 
 def _messages_url(base_url: str) -> str:

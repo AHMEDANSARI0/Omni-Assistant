@@ -334,6 +334,18 @@ class ScreenshotCapture:
     bounds: tuple[int, int, int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class WindowStateChange:
+    """Placement result of a window-state request (Phase 11)."""
+
+    window_before: WindowInfo
+    window_after: WindowInfo | None
+    state: str
+    requested: str
+    changed: bool
+    note: str = ""
+
+
 class DesktopAutomationBackend(Protocol):
     def list_windows(
         self, *, max_windows: int = 100, include_untitled: bool = False
@@ -367,6 +379,14 @@ class DesktopAutomationBackend(Protocol):
     def screenshot_png(
         self, selector: WindowSelector | None = None
     ) -> ScreenshotCapture: ...
+
+    def set_window_state(
+        self,
+        selector: WindowSelector,
+        state: str,
+        *,
+        bounds: tuple[int, int, int, int] | None = None,
+    ) -> WindowStateChange: ...
 
 
 def parse_window_handle(value: str | int | None) -> int | None:
@@ -771,6 +791,81 @@ class WindowsDesktopAutomationBackend:
             bounds=window.bounds,
         )
 
+    def set_window_state(
+        self,
+        selector: WindowSelector,
+        state: str,
+        *,
+        bounds: tuple[int, int, int, int] | None = None,
+    ) -> WindowStateChange:
+        """Minimise, maximise, restore or move/resize one window.
+
+        Coordinates are clamped to the virtual screen so a window cannot be
+        moved somewhere it can never be found again; the command the OS
+        accepted is verified by re-reading the window afterwards.
+        """
+        self._require_windows()
+        window = self._resolve_window(selector)
+        self._refuse_own_window(window, "change the state of")
+        user32 = self._user32()
+        sw_restore = 9
+        sw_showminimized = 6
+        sw_showmaximized = 3
+        flags = 0x0004 | 0x0010  # SWP_NOZORDER | SWP_NOACTIVATE
+        requested = state.strip().lower()
+        note = ""
+
+        if requested in {"minimize", "minimise", "minimized", "minimised"}:
+            user32.ShowWindow(wintypes.HWND(window.handle), sw_showminimized)
+        elif requested in {"maximize", "maximise", "maximized", "maximised"}:
+            user32.ShowWindow(wintypes.HWND(window.handle), sw_showmaximized)
+        elif requested == "restore":
+            user32.ShowWindow(wintypes.HWND(window.handle), sw_restore)
+        elif requested in {"move", "resize"}:
+            if bounds is None:
+                raise ToolError("move/resize needs bounds as (left, top, right, bottom).")
+            left, top, right, bottom = bounds
+            if right - left < 120 or bottom - top < 120:
+                raise ToolError("Refusing to shrink a window below 120x120 pixels.")
+            screen_left, screen_top, screen_right, screen_bottom = (
+                self._virtual_screen_bounds()
+            )
+            clamped_left = max(screen_left, min(left, screen_right - 120))
+            clamped_top = max(screen_top, min(top, screen_bottom - 120))
+            clamped_right = max(clamped_left + 120, min(right, screen_right))
+            clamped_bottom = max(clamped_top + 120, min(bottom, screen_bottom))
+            if (clamped_left, clamped_top, clamped_right, clamped_bottom) != (
+                left,
+                top,
+                right,
+                bottom,
+            ):
+                note = "bounds were clamped to the virtual screen"
+            user32.SetWindowPos(
+                wintypes.HWND(window.handle),
+                0,
+                clamped_left,
+                clamped_top,
+                clamped_right - clamped_left,
+                clamped_bottom - clamped_top,
+                flags,
+            )
+        else:
+            raise ToolError(
+                "state must be one of: minimize, maximize, restore, move, resize."
+            )
+
+        after = self._window_by_handle(window.handle)
+        return WindowStateChange(
+            window_before=window,
+            window_after=after,
+            state=requested,
+            requested=requested,
+            changed=after is not None
+            and (after.bounds != window.bounds or after.is_minimized != window.is_minimized),
+            note=note,
+        )
+
     # -------------------------------------------------------------- Win32
 
     def _require_windows(self) -> None:
@@ -809,6 +904,18 @@ class WindowsDesktopAutomationBackend:
         user32.SetForegroundWindow.restype = wintypes.BOOL
         user32.GetSystemMetrics.argtypes = [ctypes.c_int]
         user32.GetSystemMetrics.restype = ctypes.c_int
+        # Phase 11: explicit signatures so 64-bit handles are never truncated
+        # when a window is moved or resized.
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
         return user32
 
     def _kernel32(self) -> Any:

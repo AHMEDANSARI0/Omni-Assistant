@@ -402,8 +402,8 @@ def test_cli_deeper_office_commands(
 
     assert main([*root, "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in doctor
-    assert "built-ins=62" in doctor and "office=11" in doctor
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in doctor
+    assert "built-ins=69" in doctor and "office=11" in doctor
 
 
 def test_gui_controller_deeper_office(tmp_path: Path) -> None:
@@ -427,5 +427,5 @@ def test_gui_controller_deeper_office(tmp_path: Path) -> None:
     assert verified.output["computed_count"] == 1
 
     summary = controller.doctor_summary()
-    assert summary.builtin_tools == 62
+    assert summary.builtin_tools == 69
     assert summary.office_tools == 11

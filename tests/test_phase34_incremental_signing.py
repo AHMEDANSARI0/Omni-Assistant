@@ -463,9 +463,9 @@ def test_incremental_signing_direct_cli_and_gui(
     assert PFX_PASSWORD not in json.dumps(result.output)
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.60.0"
-    assert summary.builtin_tools == 62
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
+    assert summary.version == __version__ == "0.81.2"
+    assert summary.builtin_tools == 69
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
 
 def test_phase34_scope_defaults_docs_and_no_registered_tool() -> None:
@@ -484,9 +484,9 @@ def test_phase34_scope_defaults_docs_and_no_registered_tool() -> None:
         ]
     )
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(ids) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(ids) == 69
     assert args.certify is None
     assert "pdf.sign" not in ids
     assert "direct.pdf_sign" not in ids

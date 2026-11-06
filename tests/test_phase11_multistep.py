@@ -427,7 +427,7 @@ def test_cli_multistep_text_json_and_workflow_show(
     assert "Multi-step plan: 2 step(s)" in capsys.readouterr().out
 
     assert main([*root, "doctor"]) == 0
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in capsys.readouterr().out
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in capsys.readouterr().out
 
 
 def test_gui_controller_multistep(tmp_path: Path) -> None:

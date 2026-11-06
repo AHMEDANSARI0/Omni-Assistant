@@ -229,7 +229,7 @@ def test_pdf_password_empty_user_password(tmp_path: Path) -> None:
 def test_pdf_passwords_have_no_registered_tool_surface() -> None:
     tools = build_default_registry().list_tools()
     ids = {tool.spec.id for tool in tools}
-    assert len(ids) == 62
+    assert len(ids) == 69
     assert not {
         "direct.pdf_security",
         "direct.pdf_protect",
@@ -374,9 +374,9 @@ def test_pdf_password_gui_controller_direct_methods(tmp_path: Path) -> None:
         controller.pdf_security("../outside.pdf")
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.60.0"
-    assert summary.builtin_tools == 62
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
+    assert summary.version == __version__ == "0.81.2"
+    assert summary.builtin_tools == 69
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
 
 def test_phase26_scope_docs_schema_and_release_candidates() -> None:
@@ -385,9 +385,9 @@ def test_phase26_scope_docs_schema_and_release_candidates() -> None:
     ids = {item.spec.id for item in build_default_registry().list_tools()}
     pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(ids) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(ids) == 69
     assert "pypdf[crypto]" in pyproject
     assert "src/pc_agent/documents/pdf_security.py" in candidates
     assert "docs/phase26.md" in candidates

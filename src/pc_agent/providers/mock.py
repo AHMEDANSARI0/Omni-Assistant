@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 
 from ..errors import ProviderError
 from .base import CompletionRequest, CompletionResponse
@@ -13,6 +14,7 @@ class MockProvider:
     model = "offline-mock"
     implemented = True
     supports_vision = False
+    supports_streaming = True
 
     @property
     def configured(self) -> bool:
@@ -51,3 +53,9 @@ class MockProvider:
             model=self.model,
             usage={"offline": True},
         )
+
+    def stream_complete(self, request: CompletionRequest) -> Iterator[str]:
+        text = self.complete(request).content
+        step = 24
+        for offset in range(0, len(text), step):
+            yield text[offset : offset + step]

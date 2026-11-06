@@ -82,6 +82,7 @@ from .recovery import (
     diagnose_tool_failure,
     diagnose_verification_failure,
 )
+from .safety import EMERGENCY_STOP_MESSAGE, SafetyKernel, arguments_digest
 from .storage.repositories import (
     ExecutionRepository,
     MemoryItemRecord,
@@ -392,6 +393,12 @@ class TaskOrchestrator:
             raise ValueError("recovery_backoff_seconds must be between 0 and 5.")
         self._recovery_backoff_seconds = backoff
         self._sleeper = sleeper
+        # Transformation Phase 2: every orchestrated tool call (including
+        # verification re-checks) goes through the Safety Kernel so hard
+        # timeouts, worker isolation and the emergency stop cannot be
+        # bypassed by a new call site.
+        self._safety = SafetyKernel(settings=settings, registry=tool_registry)
+        self._emergency_stop = self._safety.emergency_stop
 
     @staticmethod
     def _validate_recovery_limit(value: int) -> int:
@@ -458,6 +465,18 @@ class TaskOrchestrator:
         tracker = self._active_budget()
         return BudgetedModelRouter(router, tracker) if tracker else router
 
+    def _knowledge_service(self) -> Any:
+        # Transformation Phase 8: knowledge tools run in-process (the
+        # isolated worker cannot rebuild settings/database access), so
+        # the factory hands them a service over the same database the
+        # repositories already use.
+        from .knowledge import KnowledgeService
+        from .storage.db import Database
+
+        database = Database(self._settings.database_path)
+        database.initialize()
+        return KnowledgeService(self._settings, database)
+
     def _attach_budget(
         self, report: ExecutionReport, tracker: TaskBudgetTracker
     ) -> ExecutionReport:
@@ -520,18 +539,21 @@ class TaskOrchestrator:
         source_task_id: str | None = None,
         cancellation_requested: CancellationCallback | None = None,
     ) -> ExecutionReport:
-        with self._budget_scope(options) as tracker:
-            report = self._execute(
-                task_id,
-                options=options,
-                approval_callback=approval_callback,
-                use_ai=use_ai,
-                max_recovery_attempts=max_recovery_attempts,
-                resume_stored_plan=resume_stored_plan,
-                source_task_id=source_task_id,
-                cancellation_requested=cancellation_requested,
-            )
-            return self._attach_budget(report, tracker)
+        try:
+            with self._budget_scope(options) as tracker:
+                report = self._execute(
+                    task_id,
+                    options=options,
+                    approval_callback=approval_callback,
+                    use_ai=use_ai,
+                    max_recovery_attempts=max_recovery_attempts,
+                    resume_stored_plan=resume_stored_plan,
+                    source_task_id=source_task_id,
+                    cancellation_requested=cancellation_requested,
+                )
+                return self._attach_budget(report, tracker)
+        finally:
+            self._safety.close()
 
     def _execute(
         self,
@@ -559,6 +581,12 @@ class TaskOrchestrator:
         if self._is_cancellation_requested(task.id, cancellation_requested):
             return self._cancelled_report(
                 task, source_task_id=source_task_id
+            )
+        if self._emergency_stop_engaged():
+            return self._cancelled_report(
+                task,
+                source_task_id=source_task_id,
+                message=EMERGENCY_STOP_MESSAGE,
             )
 
         if task.status is TaskStatus.WAITING_FOR_APPROVAL:
@@ -814,17 +842,20 @@ class TaskOrchestrator:
         force: bool = False,
         cancellation_requested: CancellationCallback | None = None,
     ) -> ExecutionReport:
-        with self._budget_scope(options) as tracker:
-            report = self._resume(
-                task_id,
-                options=options,
-                approval_callback=approval_callback,
-                use_ai=use_ai,
-                max_recovery_attempts=max_recovery_attempts,
-                force=force,
-                cancellation_requested=cancellation_requested,
-            )
-            return self._attach_budget(report, tracker)
+        try:
+            with self._budget_scope(options) as tracker:
+                report = self._resume(
+                    task_id,
+                    options=options,
+                    approval_callback=approval_callback,
+                    use_ai=use_ai,
+                    max_recovery_attempts=max_recovery_attempts,
+                    force=force,
+                    cancellation_requested=cancellation_requested,
+                )
+                return self._attach_budget(report, tracker)
+        finally:
+            self._safety.close()
 
     def _resume(
         self,
@@ -858,6 +889,8 @@ class TaskOrchestrator:
                 f"Task {task.id} is already {task.status.value} and cannot be resumed. "
                 "Use 'task recover' for a failed task or create a new task."
             )
+        if self._emergency_stop_engaged():
+            return self._cancelled_report(task, message=EMERGENCY_STOP_MESSAGE)
         if task.status in {TaskStatus.QUEUED, TaskStatus.NEEDS_INPUT}:
             return self.execute(
                 task.id,
@@ -973,15 +1006,19 @@ class TaskOrchestrator:
             return True
         return self._execution.cancellation_requested(task_id)
 
-    def _mark_cancelled(self, task: Task) -> Task:
+    def _emergency_stop_engaged(self) -> bool:
+        return self._emergency_stop.engaged()
+
+    def _mark_cancelled(self, task: Task, *, message: str = _CANCELLED_MESSAGE) -> Task:
         cancelled = self._tasks.update_status(
             task.id,
             TaskStatus.CANCELLED,
-            message=_CANCELLED_MESSAGE,
-            error=_CANCELLED_MESSAGE,
+            message=message,
+            error=message,
         )
         self._execution.clear_cancellation(task.id)
-        self._tasks.record_event(task.id, "cancelled", _CANCELLED_MESSAGE)
+        event_type = "cancelled" if message == _CANCELLED_MESSAGE else "emergency_stop"
+        self._tasks.record_event(task.id, event_type, message)
         return cancelled
 
     def _cancelled_report(
@@ -1001,8 +1038,9 @@ class TaskOrchestrator:
         step_reports: tuple[StepReport, ...] = (),
         steps_total: int = 0,
         plan_summary: str = "",
+        message: str = _CANCELLED_MESSAGE,
     ) -> ExecutionReport:
-        cancelled = self._mark_cancelled(task)
+        cancelled = self._mark_cancelled(task, message=message)
         return ExecutionReport(
             task=cancelled,
             plan=plan,
@@ -1014,7 +1052,7 @@ class TaskOrchestrator:
             recovery_attempts=recovery_attempts,
             recovered=False,
             source_task_id=source_task_id,
-            error=_CANCELLED_MESSAGE,
+            error=message,
             verification_report=verification_report,
             resumed_from_checkpoint=resumed_from_checkpoint,
             step_reports=step_reports,
@@ -1079,10 +1117,14 @@ class TaskOrchestrator:
                 continue
             if list(record.scope.get("read_roots") or []) != expected_roots:
                 continue
-            if plan.tool_id in _TOOLS_REQUIRING_APPROVAL and record.scope.get(
-                "arguments"
-            ) != dict(plan.arguments):
-                continue
+            if plan.tool_id in _TOOLS_REQUIRING_APPROVAL:
+                stored_digest = record.scope.get("arguments_sha256")
+                if stored_digest is not None:
+                    if stored_digest != arguments_digest(plan.arguments):
+                        continue
+                elif record.scope.get("arguments") != dict(plan.arguments):
+                    # Legacy pre-Phase-2 records stored raw arguments.
+                    continue
             return True
         return False
 
@@ -1354,15 +1396,18 @@ class TaskOrchestrator:
         cancellation_requested: CancellationCallback | None = None,
         budget_options: PlannerOptions | None = None,
     ) -> ExecutionReport:
-        with self._budget_scope(budget_options) as tracker:
-            report = self._run_workflow(
-                task_id,
-                workflow_key,
-                approval_callback=approval_callback,
-                max_recovery_attempts=max_recovery_attempts,
-                cancellation_requested=cancellation_requested,
-            )
-            return self._attach_budget(report, tracker)
+        try:
+            with self._budget_scope(budget_options) as tracker:
+                report = self._run_workflow(
+                    task_id,
+                    workflow_key,
+                    approval_callback=approval_callback,
+                    max_recovery_attempts=max_recovery_attempts,
+                    cancellation_requested=cancellation_requested,
+                )
+                return self._attach_budget(report, tracker)
+        finally:
+            self._safety.close()
 
     def _run_workflow(
         self,
@@ -1389,6 +1434,8 @@ class TaskOrchestrator:
             )
         if self._is_cancellation_requested(task.id, cancellation_requested):
             return self._cancelled_report(task)
+        if self._emergency_stop_engaged():
+            return self._cancelled_report(task, message=EMERGENCY_STOP_MESSAGE)
         record = self.resolve_workflow(workflow_key)
         task = self._tasks.update_status(
             task.id, TaskStatus.PLANNING, message="Reusing verified workflow"
@@ -1583,10 +1630,76 @@ class TaskOrchestrator:
             raise PcAgentError(
                 f"Approval cannot be requested from task status {task.status.value}."
             )
+        digest = arguments_digest(plan.arguments)
+        root_strings = tuple(str(path) for path in plan.external_read_roots)
+        scope: dict[str, Any] = {
+            "tool_id": plan.tool_id,
+            "read_roots": list(root_strings),
+            "arguments_sha256": digest,
+            "permissions": (
+                "send exactly this one approved workspace image and question "
+                "to the configured vision-capable provider route"
+                if is_vision
+                else "perform exactly this approved action in one selected "
+                "Windows application window"
+                if is_desktop_automation
+                else "perform exactly this approved action in the user's "
+                "debug browser session"
+                if is_browser
+                else "execute exactly this approved command inside the "
+                "workspace; no shell; bounded time/output"
+                if is_command
+                else "read/list only; no write/delete outside workspace"
+            ),
+        }
         if approval_callback is None:
+            decided = self._execution.find_decided_approval_center_request(
+                task.id,
+                action=action,
+                tool_id=plan.tool_id,
+                arguments_sha256=digest,
+                read_roots=root_strings,
+            )
+            if decided is not None:
+                approved = decided.status == "approved"
+                self._execution.consume_approval_center_request(decided.request_key)
+                center_scope = dict(scope)
+                center_scope["via"] = "approval_center"
+                center_scope["request_key"] = decided.request_key
+                center_scope["decided_by"] = decided.decided_by
+                self._execution.record_approval(
+                    task.id, action, approved=approved, scope=center_scope
+                )
+                self._tasks.record_event(
+                    task.id,
+                    "approval_granted" if approved else "approval_denied",
+                    f"Approval Center request {decided.request_key} was "
+                    f"{decided.status} by {decided.decided_by or 'unknown'}; "
+                    "the exact-scope digest matched.",
+                )
+                return task, approved
+            pending = self._execution.create_approval_center_request(
+                task.id,
+                action=action,
+                tool_id=plan.tool_id,
+                arguments_sha256=digest,
+                read_roots=root_strings,
+                summary=f"{approval_label}: {plan.summary}",
+                expires_at=datetime.now(UTC)
+                + timedelta(minutes=self._settings.safety_approval_expiry_minutes),
+            )
+            self._tasks.record_event(
+                task.id,
+                "approval_requested",
+                f"Approval Center request {pending.request_key} is pending "
+                "a human decision.",
+            )
             raise ApprovalUnavailableError(
                 f"{approval_label}, but no approval prompt is available. "
-                "The task remains waiting_for_approval."
+                f"Approval Center request {pending.request_key} was recorded; "
+                f"decide it with 'pc-agent approvals approve {pending.request_key}' "
+                f"or 'pc-agent approvals deny {pending.request_key}', then resume "
+                "the task. The task remains waiting_for_approval."
             )
         request = ApprovalRequest(
             task.id, plan, plan.external_read_roots, action=action
@@ -1596,26 +1709,7 @@ class TaskOrchestrator:
             task.id,
             request.action,
             approved=approved,
-            scope={
-                "tool_id": plan.tool_id,
-                "read_roots": [str(path) for path in plan.external_read_roots],
-                "arguments": dict(plan.arguments),
-                "permissions": (
-                    "send exactly this one approved workspace image and question "
-                    "to the configured vision-capable provider route"
-                    if is_vision
-                    else "perform exactly this approved action in one selected "
-                    "Windows application window"
-                    if is_desktop_automation
-                    else "perform exactly this approved action in the user's "
-                    "debug browser session"
-                    if is_browser
-                    else "execute exactly this approved command inside the "
-                    "workspace; no shell; bounded time/output"
-                    if is_command
-                    else "read/list only; no write/delete outside workspace"
-                ),
-            },
+            scope=scope,
         )
         self._tasks.record_event(
             task.id,
@@ -1662,6 +1756,16 @@ class TaskOrchestrator:
         resumed_used = False
 
         while True:
+            if self._emergency_stop_engaged():
+                return _StepOutcome(
+                    kind="cancelled",
+                    task=self._mark_cancelled(task, message=EMERGENCY_STOP_MESSAGE),
+                    plan=plan,
+                    recovery_attempts=tuple(summaries),
+                    error=EMERGENCY_STOP_MESSAGE,
+                    resumed_from_checkpoint=resumed_used,
+                    attempts_used=attempt_number - 1,
+                )
             if self._is_cancellation_requested(task.id, cancellation_requested):
                 return _StepOutcome(
                     kind="cancelled",
@@ -1723,6 +1827,7 @@ class TaskOrchestrator:
                 vision_allowed=self._settings.allow_vision,
                 vision_max_image_bytes=self._settings.vision_max_image_bytes,
                 vision_router_factory=(lambda: self._budgeted_router()),
+                knowledge_service_factory=self._knowledge_service,
             )
             display_attempt = attempt_offset + attempt_number
             attempt_record = self._start_attempt(
@@ -1777,7 +1882,7 @@ class TaskOrchestrator:
                             resumed_from_checkpoint=resumed_used,
                             attempts_used=attempt_number,
                         )
-                result = self._tools.invoke(plan.tool_id, plan.arguments, context)
+                result = self._safety.invoke(plan.tool_id, plan.arguments, context)
                 self._execution.record_tool_invocation(task.id, plan.arguments, result)
                 if result.success and result.output is not None:
                     self._execution.save_checkpoint(
@@ -1788,6 +1893,17 @@ class TaskOrchestrator:
                         plan_fingerprint=self._plan_fingerprint(plan),
                         artifacts=self._artifact_paths(result.output),
                     )
+            if self._emergency_stop_engaged():
+                return _StepOutcome(
+                    kind="cancelled",
+                    task=self._mark_cancelled(task, message=EMERGENCY_STOP_MESSAGE),
+                    plan=plan,
+                    tool_result=result,
+                    recovery_attempts=tuple(summaries),
+                    error=EMERGENCY_STOP_MESSAGE,
+                    resumed_from_checkpoint=resumed_used,
+                    attempts_used=attempt_number,
+                )
             if self._is_cancellation_requested(task.id, cancellation_requested):
                 return _StepOutcome(
                     kind="cancelled",
@@ -2521,7 +2637,7 @@ class TaskOrchestrator:
             arguments: dict[str, Any] = {"path": output.get("output_path")}
             if isinstance(expected, int):
                 arguments["expected_pages"] = expected
-            verification = self._tools.invoke("pdf.verify", arguments, context)
+            verification = self._safety.invoke("pdf.verify", arguments, context)
             self._execution.record_tool_invocation(task_id, arguments, verification)
             if not verification.success or verification.output is None:
                 return verification, False, verification.error or "PDF verification tool failed."
@@ -2633,7 +2749,7 @@ class TaskOrchestrator:
                 "path": output.get("output_path"),
                 "expected_pages": output.get("page_count"),
             }
-            verification = self._tools.invoke("pdf.verify", arguments, context)
+            verification = self._safety.invoke("pdf.verify", arguments, context)
             self._execution.record_tool_invocation(task_id, arguments, verification)
             if not verification.success or verification.output is None:
                 return verification, False, verification.error or "PDF verification tool failed."
@@ -2745,7 +2861,7 @@ class TaskOrchestrator:
         self, task_id: str, context: ToolContext
     ) -> ToolResult:
         arguments: dict[str, Any] = {"max_windows": 200, "include_untitled": True}
-        fresh = self._tools.invoke("desktop.windows", arguments, context)
+        fresh = self._safety.invoke("desktop.windows", arguments, context)
         self._execution.record_tool_invocation(task_id, arguments, fresh)
         return fresh
 
@@ -2768,7 +2884,7 @@ class TaskOrchestrator:
         output: Mapping[str, Any],
         context: ToolContext,
     ) -> tuple[ToolResult | None, bool, str]:
-        fresh = self._tools.invoke(
+        fresh = self._safety.invoke(
             "desktop.windows", dict(plan.arguments), context
         )
         self._execution.record_tool_invocation(
@@ -2807,7 +2923,7 @@ class TaskOrchestrator:
         output: Mapping[str, Any],
         context: ToolContext,
     ) -> tuple[ToolResult | None, bool, str]:
-        fresh = self._tools.invoke(
+        fresh = self._safety.invoke(
             "desktop.window_inspect", dict(plan.arguments), context
         )
         self._execution.record_tool_invocation(
@@ -2932,7 +3048,7 @@ class TaskOrchestrator:
             return None, False, "Desktop type result has no target element evidence."
         arguments = self._desktop_window_selector_arguments(plan)
         arguments.update({"max_elements": 1000, "include_offscreen": True})
-        fresh = self._tools.invoke("desktop.window_inspect", arguments, context)
+        fresh = self._safety.invoke("desktop.window_inspect", arguments, context)
         self._execution.record_tool_invocation(task_id, arguments, fresh)
         if not fresh.success or fresh.output is None:
             return fresh, False, fresh.error or "Desktop text element re-inspection failed."
@@ -3006,7 +3122,7 @@ class TaskOrchestrator:
             "path": path,
             "include_color_stats": include_color_stats,
         }
-        fresh = self._tools.invoke("image.inspect", arguments, context)
+        fresh = self._safety.invoke("image.inspect", arguments, context)
         self._execution.record_tool_invocation(task_id, arguments, fresh)
         return fresh
 
@@ -3038,7 +3154,7 @@ class TaskOrchestrator:
         output: Mapping[str, Any],
         context: ToolContext,
     ) -> tuple[ToolResult | None, bool, str]:
-        fresh = self._tools.invoke("image.inspect", dict(plan.arguments), context)
+        fresh = self._safety.invoke("image.inspect", dict(plan.arguments), context)
         self._execution.record_tool_invocation(task_id, dict(plan.arguments), fresh)
         if not fresh.success or fresh.output is None:
             return fresh, False, fresh.error or "Image re-inspection failed."
@@ -3107,7 +3223,7 @@ class TaskOrchestrator:
         output: Mapping[str, Any],
         context: ToolContext,
     ) -> tuple[ToolResult | None, bool, str]:
-        fresh = self._tools.invoke("image.compare", dict(plan.arguments), context)
+        fresh = self._safety.invoke("image.compare", dict(plan.arguments), context)
         self._execution.record_tool_invocation(task_id, dict(plan.arguments), fresh)
         if not fresh.success or fresh.output is None:
             return fresh, False, fresh.error or "Image comparison re-check failed."
@@ -3167,7 +3283,7 @@ class TaskOrchestrator:
         result: ToolResult,
         context: ToolContext,
     ) -> tuple[ToolResult | None, bool, str]:
-        again = self._tools.invoke(plan.tool_id, dict(plan.arguments), context)
+        again = self._safety.invoke(plan.tool_id, dict(plan.arguments), context)
         self._execution.record_tool_invocation(
             task_id, dict(plan.arguments), again
         )
@@ -3208,7 +3324,7 @@ class TaskOrchestrator:
         self, task_id: str, plan: TaskPlan, context: ToolContext
     ) -> tuple[ToolResult | None, bool, str]:
         status_args = {"repository": plan.arguments.get("repository", ".")}
-        status = self._tools.invoke("git.status", status_args, context)
+        status = self._safety.invoke("git.status", status_args, context)
         self._execution.record_tool_invocation(task_id, status_args, status)
         if not status.success or status.output is None:
             return status, False, status.error or "Git status re-check failed."
@@ -3244,7 +3360,7 @@ class TaskOrchestrator:
             "repository": plan.arguments.get("repository", "."),
             "max_count": 1,
         }
-        log = self._tools.invoke("git.log", log_args, context)
+        log = self._safety.invoke("git.log", log_args, context)
         self._execution.record_tool_invocation(task_id, log_args, log)
         if not log.success or log.output is None:
             return log, False, log.error or "Git log re-check failed."
@@ -3308,14 +3424,14 @@ class TaskOrchestrator:
         target_id = output.get("target_id")
         if isinstance(target_id, str) and target_id:
             arguments["target_id"] = target_id
-        fresh = self._tools.invoke("browser.snapshot", arguments, context)
+        fresh = self._safety.invoke("browser.snapshot", arguments, context)
         self._execution.record_tool_invocation(task_id, arguments, fresh)
         return fresh
 
     def _verify_browser_status(
         self, task_id: str, output: Mapping[str, Any], context: ToolContext
     ) -> tuple[ToolResult | None, bool, str]:
-        fresh = self._tools.invoke("browser.status", {}, context)
+        fresh = self._safety.invoke("browser.status", {}, context)
         self._execution.record_tool_invocation(task_id, {}, fresh)
         if not fresh.success or fresh.output is None:
             return fresh, False, fresh.error or "Browser status re-check failed."
@@ -3448,7 +3564,7 @@ class TaskOrchestrator:
         last: ToolResult | None = None
         for item in outputs:
             arguments: dict[str, Any] = {"path": item, "expected_pages": 1}
-            verification = self._tools.invoke("pdf.verify", arguments, context)
+            verification = self._safety.invoke("pdf.verify", arguments, context)
             self._execution.record_tool_invocation(task_id, arguments, verification)
             last = verification
             if (
@@ -3457,7 +3573,7 @@ class TaskOrchestrator:
                 or not verification.output.get("valid")
             ):
                 return verification, False, f"Split page failed verification: {item}"
-        source = self._tools.invoke(
+        source = self._safety.invoke(
             "pdf.inspect", {"path": output.get("path")}, context
         )
         self._execution.record_tool_invocation(
@@ -3911,7 +4027,7 @@ class TaskOrchestrator:
         output: Mapping[str, Any],
         context: ToolContext,
     ) -> tuple[ToolResult | None, bool, str]:
-        fresh = self._tools.invoke("pdf.search_text", dict(plan.arguments), context)
+        fresh = self._safety.invoke("pdf.search_text", dict(plan.arguments), context)
         self._execution.record_tool_invocation(task_id, dict(plan.arguments), fresh)
         if not fresh.success or fresh.output is None:
             return fresh, False, fresh.error or "PDF text search re-check failed."
@@ -3939,7 +4055,7 @@ class TaskOrchestrator:
             "path": output.get("output_path"),
             "expected_pages": output.get("page_count"),
         }
-        verification = self._tools.invoke("pdf.verify", arguments, context)
+        verification = self._safety.invoke("pdf.verify", arguments, context)
         self._execution.record_tool_invocation(task_id, arguments, verification)
         if not verification.success or verification.output is None:
             return verification, False, verification.error or "Transformed PDF verification failed."

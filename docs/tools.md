@@ -328,6 +328,20 @@ Phase 58 likewise adds **no registered tool**. The
 Windows byte-range lock offset; it grants no planner, task or dynamic tool
 any update, lock or scheduler capability. See `docs/phase58.md`.
 
+Phase 59 likewise adds **no registered tool**. The
+**Linux systemd-user Auto-Upgrade Scheduler** is confined to the existing
+direct `pc-agent update auto-install-schedule|auto-uninstall-schedule|
+auto-schedule-status|auto-status` commands and GUI Signed Updates
+controls; no planner, task or dynamic tool can write systemd units, call
+`systemctl`, or wake the signed worker outside that schedule. See
+`docs/phase59.md`.
+
+Phase 60 likewise adds **no registered tool**. The
+**Linux Idle and AC Power Sensors** are internal readings consumed only
+by the direct signed auto-upgrade worker's apply gate; no planner, task or
+dynamic tool can query logind, read power state as a capability, fabricate
+a sensor value or bypass the gate. See `docs/phase60.md`.
+
 ## Approved dynamic tools
 
 Dynamic tools appear in `pc-agent tools list` only after approval. Their ids
@@ -445,6 +459,25 @@ re-extraction or page-fingerprint/rotation verification.
 Phase 16 does not add a tool. Provider credentials remain outside the tool
 registry and task/AI surfaces; only Settings and the dedicated local
 `pc-agent credentials` commands can access them.
+
+Transformation Phase 8 adds two tools, for **64 built-ins**:
+`knowledge.ingest` (policy-scoped `READ_FILE`; ingests one supported
+text/PDF/Office file into the local knowledge base) and
+`knowledge.search` (read-only hybrid vector+keyword search over
+knowledge documents and embedded memory notes). Both run only in the
+parent process (the `knowledge.` prefix is excluded from the isolated
+Safety Kernel worker because they need the parent-side knowledge
+service factory, like `browser.`/`desktop.`). There is deliberately
+**no** `knowledge.ask` tool: grounded RAG answers are user-invoked on
+the CLI/GUI/API surfaces only, never agent-initiated.
+
+Transformation Phase 9 adds **no** registered tool (still **64
+built-ins**). Transformation Phase 10 likewise adds **no** tool: voice is a
+user-initiated surface (`pc-agent voice ...`), so no agent and no plan can open
+a microphone, transcribe audio or speak on its own. Instead, Agent Studio runs tasks through *filtered*
+registries holding only a specialist's allow-listed builtin tools;
+dynamic tools are never visible to agents, and no agent/team
+capability is itself a tool.
 
 ## Known limitations
 

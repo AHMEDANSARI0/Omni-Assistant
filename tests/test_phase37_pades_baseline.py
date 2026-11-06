@@ -380,9 +380,9 @@ def test_pades_bb_direct_cli_and_gui(
         )
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.60.0"
-    assert summary.builtin_tools == 62
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
+    assert summary.version == __version__ == "0.81.2"
+    assert summary.builtin_tools == 69
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
 
 def test_phase37_scope_docs_schema_and_no_new_tool() -> None:
@@ -390,9 +390,9 @@ def test_phase37_scope_docs_schema_and_no_new_tool() -> None:
     candidates = {path.as_posix() for path in release_candidate_files(project_root)}
     ids = {item.spec.id for item in build_default_registry().list_tools()}
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(ids) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(ids) == 69
     assert "pdf.sign_pades" not in ids
     assert "direct.pdf_sign" not in ids
     assert "docs/phase37.md" in candidates

@@ -70,6 +70,9 @@ except ImportError as exc:  # pragma: no cover - depends on the Python build
 else:
     _TK_IMPORT_ERROR = None
 
+#: Notebook tabs the JARVIS Command Center exposes (Phase 17 raises this to 19).
+NOTEBOOK_TAB_COUNT = 20
+
 
 @dataclass(slots=True)
 class _WorkerEvent:
@@ -203,11 +206,17 @@ class PcAgentGuiApp:
 
         self.header_status_var = tk.StringVar(value="Loading local status...")
         self.status_var = tk.StringVar(value="Starting...")
+        self.cc_overview_var = tk.StringVar(value="Command Center loading...")
+        self.cc_safety_var = tk.StringVar(value="Safety: loading...")
+        self.cc_system_var = tk.StringVar(value="System: loading...")
+        self._cc_event_cursor = 0
+        self._cc_selected_mission: str | None = None
 
         self._build_style()
         self._build_layout()
         self.root.after(100, self._poll_events)
         self.root.after(150, self._refresh_all)
+        self.root.after(1200, self._poll_command_center)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -215,14 +224,50 @@ class PcAgentGuiApp:
     # ------------------------------------------------------------------
     # Layout construction
     # ------------------------------------------------------------------
+    def _ui(self) -> dict[str, Any]:
+        """Resolved Phase 17 interface settings (locale, scale, palette, RTL)."""
+
+        if getattr(self, "_ui_cache", None) is None:
+            from ..a11y import resolve_ui
+
+            self._ui_cache = resolve_ui(self.settings)
+        return self._ui_cache
+
     def _build_style(self) -> None:
         style = ttk.Style(self.root)
         if "clam" in style.theme_names():
             style.theme_use("clam")
-        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
-        style.configure("Subtitle.TLabel", font=("Segoe UI", 9))
-        style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        ui = self._ui()
+        scale = float(ui["scale"])
+        base = max(7, round(10 * scale))
+        palette = ui["palette"]
+        self.root.configure(background=palette["background"])
+        style.configure(".", font=("Segoe UI", base))
+        style.configure("Title.TLabel", font=("Segoe UI", base + 6, "bold"),
+                        foreground=palette["text"], background=palette["background"])
+        style.configure("Subtitle.TLabel", font=("Segoe UI", max(7, base - 1)),
+                        foreground=palette["muted"], background=palette["background"])
+        style.configure("Section.TLabelframe.Label", font=("Segoe UI", base, "bold"),
+                        foreground=palette["accent"], background=palette["background"])
+        style.configure("Section.TLabelframe", background=palette["background"])
+        style.configure("Accent.TButton", font=("Segoe UI", base, "bold"))
+        style.configure("Command.TLabel", foreground=palette["accent"],
+                        font=("Segoe UI", base, "bold"), background=palette["background"])
+        style.configure("CommandValue.TLabel", font=("Segoe UI", base),
+                        foreground=palette["text"], background=palette["background"])
+        self._apply_direction()
+
+    def _apply_direction(self) -> None:
+        """Mirror the header for right-to-left languages (real layout change)."""
+
+        ui = self._ui()
+        anchor = "e" if ui["rtl"] else "w"
+        try:
+            self.header_label.grid_configure(sticky=anchor)
+            self.header_version_label.grid_configure(sticky=anchor)
+            self.header_status_label.grid_configure(sticky="w" if ui["rtl"] else "e")
+        except (AttributeError, KeyError, Exception):  # noqa: BLE001 - layout is best effort
+            return
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -231,22 +276,26 @@ class PcAgentGuiApp:
         header = ttk.Frame(self.root, padding=(12, 10, 12, 6))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(
+        self.header_label = ttk.Label(
             header, text="Self-Healing PC Agent", style="Title.TLabel"
-        ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
+        )
+        self.header_label.grid(row=0, column=0, sticky="w")
+        self.header_version_label = ttk.Label(
             header,
             text=f"v{__version__}  |  Root: {self.settings.root_dir}",
             style="Subtitle.TLabel",
-        ).grid(row=1, column=0, sticky="w")
-        ttk.Label(
+        )
+        self.header_version_label.grid(row=1, column=0, sticky="w")
+        self.header_status_label = ttk.Label(
             header, textvariable=self.header_status_var, style="Subtitle.TLabel"
-        ).grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
+        )
+        self.header_status_label.grid(row=0, column=1, rowspan=2, sticky="e", padx=(12, 0))
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
 
         self.dashboard_tab = ttk.Frame(self.notebook, padding=10)
+        self.command_tab = ttk.Frame(self.notebook, padding=10)
         self.tasks_tab = ttk.Frame(self.notebook, padding=10)
         self.documents_tab = ttk.Frame(self.notebook, padding=10)
         self.images_tab = ttk.Frame(self.notebook, padding=10)
@@ -254,8 +303,20 @@ class PcAgentGuiApp:
         self.desktop_tab = ttk.Frame(self.notebook, padding=10)
         self.tools_tab = ttk.Frame(self.notebook, padding=10)
         self.providers_tab = ttk.Frame(self.notebook, padding=10)
+        self.knowledge_tab = ttk.Frame(self.notebook, padding=10)
+        self.agents_tab = ttk.Frame(self.notebook, padding=10)
+        self.voice_tab = ttk.Frame(self.notebook, padding=10)
+        self.automation_tab = ttk.Frame(self.notebook, padding=10)
+        self.flows_tab = ttk.Frame(self.notebook, padding=10)
+        self.connectors_tab = ttk.Frame(self.notebook, padding=10)
+        self.proactive_tab = ttk.Frame(self.notebook, padding=10)
+        self.plugins_tab = ttk.Frame(self.notebook, padding=10)
+        self.sync_tab = ttk.Frame(self.notebook, padding=10)
+        self.accessibility_tab = ttk.Frame(self.notebook, padding=10)
+        self.production_tab = ttk.Frame(self.notebook, padding=10)
 
         self.notebook.add(self.dashboard_tab, text="Dashboard")
+        self.notebook.add(self.command_tab, text="Command Center")
         self.notebook.add(self.tasks_tab, text="Tasks")
         self.notebook.add(self.documents_tab, text="Documents")
         self.notebook.add(self.images_tab, text="Images")
@@ -263,6 +324,17 @@ class PcAgentGuiApp:
         self.notebook.add(self.desktop_tab, text="Desktop")
         self.notebook.add(self.tools_tab, text="Tools")
         self.notebook.add(self.providers_tab, text="Providers")
+        self.notebook.add(self.knowledge_tab, text="Knowledge")
+        self.notebook.add(self.agents_tab, text="Agents")
+        self.notebook.add(self.voice_tab, text="Voice")
+        self.notebook.add(self.automation_tab, text="Automation")
+        self.notebook.add(self.flows_tab, text="Workflows")
+        self.notebook.add(self.connectors_tab, text="Connectors")
+        self.notebook.add(self.proactive_tab, text="Proactive")
+        self.notebook.add(self.plugins_tab, text="Plugins")
+        self.notebook.add(self.sync_tab, text="Sync")
+        self.notebook.add(self.accessibility_tab, text="Accessibility")
+        self.notebook.add(self.production_tab, text="Production")
 
         status = ttk.Frame(self.root, padding=(10, 4, 10, 8))
         status.grid(row=2, column=0, sticky="ew")
@@ -276,6 +348,7 @@ class PcAgentGuiApp:
         self.progress.grid(row=0, column=1, sticky="e")
 
         self._build_dashboard_tab()
+        self._build_command_center_tab()
         self._build_tasks_tab()
         self._build_documents_tab()
         self._build_images_tab()
@@ -283,6 +356,960 @@ class PcAgentGuiApp:
         self._build_desktop_tab()
         self._build_tools_tab()
         self._build_providers_tab()
+        self._build_knowledge_tab()
+        self._build_agents_tab()
+        self._build_voice_tab()
+        self._build_automation_tab()
+        self._build_flows_tab()
+        self._build_connectors_tab()
+        self._build_proactive_tab()
+        self._build_plugins_tab()
+        self._build_sync_tab()
+        self._build_accessibility_tab()
+        self._build_production_tab()
+
+    def _build_proactive_tab(self) -> None:
+        tab = self.proactive_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        self.proactive_status_var = tk.StringVar(value="Proactive: loading...")
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top, textvariable=self.proactive_status_var, justify="left").pack(
+            side="left"
+        )
+        ttk.Button(top, text="Refresh", command=self._refresh_proactive).pack(side="right")
+        ttk.Button(top, text="Tick now", command=self._proactive_tick).pack(
+            side="right", padx=(0, 6)
+        )
+        ttk.Button(top, text="Run briefing", command=self._proactive_briefing).pack(
+            side="right", padx=(0, 6)
+        )
+
+        self.proactive_list_text = self._make_text(tab, height=8, width=96)
+        self.proactive_list_text.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+
+        editor = ttk.LabelFrame(
+            tab, text="Reminders", style="Section.TLabelframe", padding=8
+        )
+        editor.grid(row=2, column=0, sticky="ew")
+        editor.columnconfigure(1, weight=1)
+        self.reminder_title_var = tk.StringVar()
+        self.reminder_due_var = tk.StringVar(value="+15m")
+        self.reminder_severity_var = tk.StringVar(value="normal")
+        self.reminder_reference_var = tk.StringVar()
+        ttk.Label(editor, text="Title").grid(row=0, column=0, sticky="w")
+        ttk.Entry(editor, textvariable=self.reminder_title_var).grid(
+            row=0, column=1, sticky="ew", padx=(6, 6)
+        )
+        ttk.Label(editor, text="Due").grid(row=0, column=2, sticky="w")
+        ttk.Entry(editor, textvariable=self.reminder_due_var, width=16).grid(
+            row=0, column=3, sticky="w", padx=(6, 6)
+        )
+        ttk.Combobox(
+            editor,
+            textvariable=self.reminder_severity_var,
+            values=["low", "normal", "high", "critical"],
+            width=9,
+            state="readonly",
+        ).grid(row=0, column=4, sticky="w")
+        ttk.Button(editor, text="Add reminder", command=self._add_reminder).grid(
+            row=0, column=5, padx=(6, 0)
+        )
+
+        row = ttk.Frame(editor)
+        row.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        ttk.Label(row, text="Reminder id").pack(side="left")
+        ttk.Entry(row, textvariable=self.reminder_reference_var, width=14).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Button(row, text="Done", command=self._reminder_done).pack(side="left")
+        ttk.Button(row, text="Snooze 15m", command=self._reminder_snooze).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(row, text="Delete", command=self._reminder_delete).pack(
+            side="left", padx=(6, 0)
+        )
+
+        self.proactive_output_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.proactive_output_var, justify="left").grid(
+            row=3, column=0, sticky="w", pady=(8, 4)
+        )
+        ttk.Label(tab, text="Recent notifications").grid(row=4, column=0, sticky="nw")
+        self.proactive_notifications_text = self._make_text(tab, height=6, width=96)
+        self.proactive_notifications_text.grid(row=4, column=0, sticky="nsew", pady=(20, 0))
+
+    def _build_plugins_tab(self) -> None:
+        tab = self.plugins_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        self.plugins_status_var = tk.StringVar(value="Plugins: loading...")
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top, textvariable=self.plugins_status_var, justify="left").pack(
+            side="left"
+        )
+        ttk.Button(top, text="Refresh", command=self._refresh_plugins).pack(side="right")
+        ttk.Button(top, text="Runs", command=self._plugins_runs).pack(
+            side="right", padx=(0, 6)
+        )
+
+        self.plugins_list_text = self._make_text(tab, height=10, width=96)
+        self.plugins_list_text.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+
+        editor = ttk.LabelFrame(
+            tab, text="Install, run and remove", style="Section.TLabelframe", padding=8
+        )
+        editor.grid(row=2, column=0, sticky="ew")
+        editor.columnconfigure(1, weight=1)
+        self.plugin_bundle_var = tk.StringVar()
+        self.plugin_run_var = tk.StringVar()
+        self.plugin_tool_var = tk.StringVar()
+        self.plugin_args_var = tk.StringVar(value="{}")
+        ttk.Label(editor, text="Bundle (.zip)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(editor, textvariable=self.plugin_bundle_var).grid(
+            row=0, column=1, sticky="ew", padx=(6, 6)
+        )
+        ttk.Button(editor, text="Verify", command=self._plugin_verify).grid(
+            row=0, column=2, padx=(0, 6)
+        )
+        ttk.Button(editor, text="Install", command=self._plugin_install).grid(
+            row=0, column=3
+        )
+
+        row = ttk.Frame(editor)
+        row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(row, text="Plugin id").pack(side="left")
+        ttk.Entry(row, textvariable=self.plugin_run_var, width=22).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Label(row, text="Tool").pack(side="left")
+        ttk.Entry(row, textvariable=self.plugin_tool_var, width=18).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Label(row, text="Args JSON").pack(side="left")
+        ttk.Entry(row, textvariable=self.plugin_args_var, width=22).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Button(row, text="Run sandboxed", command=self._plugin_run).pack(side="left")
+
+        row2 = ttk.Frame(editor)
+        row2.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Button(row2, text="Enable", command=self._plugin_enable).pack(side="left")
+        ttk.Button(row2, text="Disable", command=self._plugin_disable).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(row2, text="Rollback", command=self._plugin_rollback).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(row2, text="Remove", command=self._plugin_remove).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(row2, text="Skills", command=self._plugin_skills).pack(
+            side="left", padx=(6, 0)
+        )
+        self.plugins_output_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.plugins_output_var, justify="left").grid(
+            row=3, column=0, sticky="ew", pady=(8, 0)
+        )
+
+    def _build_sync_tab(self) -> None:
+        tab = self.sync_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        self.sync_status_var = tk.StringVar(value="Sync: loading...")
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top, textvariable=self.sync_status_var, justify="left").pack(side="left")
+        ttk.Button(top, text="Refresh", command=self._refresh_sync).pack(side="right")
+        ttk.Button(top, text="Tick", command=self._sync_tick).pack(side="right", padx=(0, 6))
+        ttk.Button(top, text="Export", command=self._sync_export).pack(
+            side="right", padx=(0, 6)
+        )
+
+        self.sync_list_text = self._make_text(tab, height=9, width=96)
+        self.sync_list_text.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+
+        editor = ttk.LabelFrame(
+            tab, text="Pair and coordinate", style="Section.TLabelframe", padding=8
+        )
+        editor.grid(row=2, column=0, sticky="ew")
+        editor.columnconfigure(1, weight=1)
+        self.sync_peer_name_var = tk.StringVar()
+        self.sync_sign_var = tk.StringVar()
+        self.sync_encrypt_var = tk.StringVar()
+        ttk.Label(editor, text="Peer name").grid(row=0, column=0, sticky="w")
+        ttk.Entry(editor, textvariable=self.sync_peer_name_var, width=18).grid(
+            row=0, column=1, sticky="w", padx=(6, 6)
+        )
+        ttk.Label(editor, text="Ed25519 key").grid(row=0, column=2, sticky="w")
+        ttk.Entry(editor, textvariable=self.sync_sign_var).grid(
+            row=0, column=3, sticky="ew", padx=(6, 6)
+        )
+        ttk.Label(editor, text="X25519 key").grid(row=0, column=4, sticky="w")
+        ttk.Entry(editor, textvariable=self.sync_encrypt_var).grid(
+            row=0, column=5, sticky="ew", padx=(6, 6)
+        )
+        ttk.Button(editor, text="Pair", command=self._sync_pair).grid(row=0, column=6)
+
+        row = ttk.Frame(editor)
+        row.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(8, 0))
+        self.sync_bundle_var = tk.StringVar()
+        self.sync_request_var = tk.StringVar()
+        ttk.Label(row, text="Bundle path").pack(side="left")
+        ttk.Entry(row, textvariable=self.sync_bundle_var, width=32).pack(
+            side="left", padx=(6, 6)
+        )
+        ttk.Button(row, text="Import", command=self._sync_import).pack(side="left")
+        ttk.Label(row, text="Request id").pack(side="left", padx=(12, 0))
+        ttk.Entry(row, textvariable=self.sync_request_var, width=14).pack(
+            side="left", padx=(6, 6)
+        )
+        ttk.Button(row, text="Accept", command=self._sync_accept).pack(side="left")
+        ttk.Button(row, text="Deny", command=self._sync_deny).pack(side="left", padx=(6, 0))
+
+        self.sync_output_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.sync_output_var, justify="left").grid(
+            row=3, column=0, sticky="ew", pady=(8, 0)
+        )
+
+    def _build_accessibility_tab(self) -> None:
+        tab = self.accessibility_tab
+        tab.columnconfigure(0, weight=1)
+
+        self.a11y_status_var = tk.StringVar(value="Accessibility: loading...")
+        ttk.Label(tab, textvariable=self.a11y_status_var, style="Subtitle.TLabel").grid(
+            row=0, column=0, sticky="ew"
+        )
+
+        controls = ttk.LabelFrame(
+            tab, text="Reading and input", style="Section.TLabelframe", padding=8
+        )
+        controls.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        controls.columnconfigure(5, weight=1)
+
+        from ..i18n import LOCALE_NAMES, LOCALES
+
+        self.a11y_locale_var = tk.StringVar(value=self.settings.ui_locale)
+        ttk.Label(controls, text="Language").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            controls,
+            textvariable=self.a11y_locale_var,
+            values=[f"{code} - {LOCALE_NAMES[code]}" for code in LOCALES],
+            state="readonly",
+            width=18,
+        ).grid(row=0, column=1, sticky="w", padx=(6, 12))
+
+        self.a11y_scale_var = tk.DoubleVar(value=float(self.settings.ui_scale) * 100.0)
+        ttk.Label(controls, text="Text size (%)").grid(row=0, column=2, sticky="w")
+        ttk.Spinbox(
+            controls,
+            from_=80,
+            to=200,
+            increment=10,
+            textvariable=self.a11y_scale_var,
+            width=6,
+        ).grid(row=0, column=3, sticky="w", padx=(6, 12))
+
+        self.a11y_contrast_var = tk.BooleanVar(value=bool(self.settings.ui_high_contrast))
+        ttk.Checkbutton(
+            controls, text="High contrast", variable=self.a11y_contrast_var
+        ).grid(row=0, column=4, sticky="w")
+
+        self.a11y_motion_var = tk.BooleanVar(value=bool(self.settings.ui_reduce_motion))
+        ttk.Checkbutton(
+            controls, text="Reduce motion", variable=self.a11y_motion_var
+        ).grid(row=0, column=5, sticky="w", padx=(12, 0))
+
+        buttons = ttk.Frame(tab)
+        buttons.grid(row=2, column=0, sticky="ew")
+        ttk.Button(
+            buttons, text="Apply and save", command=self._apply_a11y
+        ).pack(side="left")
+        ttk.Button(buttons, text="Refresh report", command=self._refresh_a11y).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(buttons, text="Run a11y check", command=self._a11y_check).pack(
+            side="left", padx=(8, 0)
+        )
+
+        self.a11y_text = self._make_text(tab, height=16, width=100)
+        self.a11y_text.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        tab.rowconfigure(3, weight=1)
+
+        self.a11y_output_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.a11y_output_var, justify="left").grid(
+            row=4, column=0, sticky="ew", pady=(6, 0)
+        )
+
+    def _refresh_a11y(self) -> None:
+        self._run_async("Load a11y", self.controller.a11y_report, self._apply_a11y_report)
+
+    def _apply_a11y_report(self, report: dict[str, Any]) -> None:
+        self.a11y_text.delete("1.0", "end")
+        contrast = report["contrast"]
+        self.a11y_status_var.set(
+            f"language={report['locale']} ({report['language_name']}) "
+            f"direction={report['direction']} text={int(report['scale'] * 100)}% "
+            f"theme={report['theme']} coverage={report['coverage']['percent']}% "
+            f"contrast={contrast['passing']}/{contrast['total']} {contrast['wcag_level']}"
+        )
+        lines = [f"Supported languages ({len(report['locales'])}):"]
+        for row in report["locales"]:
+            lines.append(
+                f"  {row['locale']:<3} {row['name']:<10} {row['direction']:<3} "
+                f"{row['translated_keys']}/{row['total_keys']} keys ({row['percent']}%)"
+            )
+        lines.append("")
+        lines.append("Keyboard shortcuts:")
+        for entry in report["shortcuts"]:
+            lines.append(f"  {entry['keys']:<18} {entry['action']}")
+        lines.append("")
+        lines.append("Claims this build can make:")
+        for claim in report["claims"]:
+            lines.append(f"  - {claim['statement']}")
+        lines.append("")
+        lines.append("Measured contrast (WCAG 2.1):")
+        for pair in contrast["pairs"]:
+            verdict = "pass" if pair["passes"] else "FAIL"
+            lines.append(
+                f"  {pair['pair']:<22} {pair['ratio']:>6} : 1  "
+                f"needs {pair['minimum']}  {verdict}"
+            )
+        lines.append("")
+        lines.append("Known limits (reported, not hidden):")
+        for limitation in report["limitations"]:
+            lines.append(f"  - {limitation}")
+        if report["fallback_notice"]:
+            lines.append("")
+            lines.append(report["fallback_notice"])
+        self.a11y_text.insert("1.0", "\n".join(lines))
+
+    def _apply_a11y(self) -> None:
+        raw = self.a11y_locale_var.get().strip()
+        locale = raw.split(" - ", 1)[0].strip() or self.settings.ui_locale
+        scale = float(self.a11y_scale_var.get()) / 100.0
+        self._run_async(
+            "Save accessibility",
+            lambda: self.controller.a11y_apply(
+                locale=locale,
+                scale=scale,
+                high_contrast=bool(self.a11y_contrast_var.get()),
+                reduce_motion=bool(self.a11y_motion_var.get()),
+            ),
+            self._a11y_saved,
+        )
+
+    def _a11y_saved(self, message: str) -> None:
+        self.a11y_output_var.set(message + " Restart the app to apply the theme.")
+        self._refresh_a11y()
+
+    def _a11y_check(self) -> None:
+        self._run_async("a11y check", self.controller.a11y_check_text, self._apply_a11y_report_text)
+
+    def _build_production_tab(self) -> None:
+        """Release hardening: CI coverage and the real end-to-end chain check."""
+
+        tab = self.production_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(3, weight=1)
+
+        self.production_status_var = tk.StringVar(value="Release chain: not run yet")
+        ttk.Label(
+            tab, textvariable=self.production_status_var, style="Subtitle.TLabel"
+        ).grid(row=0, column=0, sticky="ew")
+
+        ttk.Label(
+            tab,
+            text=(
+                "The check builds a release bundle from this install, verifies it, "
+                "proves a tampered archive is refused, signs with a throw-away key, "
+                "then stages, applies and rolls back the update in a temporary copy. "
+                "This install is never modified."
+            ),
+            justify="left",
+            wraplength=760,
+        ).grid(row=1, column=0, sticky="ew", pady=(6, 6))
+
+        buttons = ttk.Frame(tab)
+        buttons.grid(row=2, column=0, sticky="ew")
+        ttk.Button(
+            buttons, text="Run release chain check", command=self._run_production_check
+        ).pack(side="left")
+        ttk.Button(
+            buttons, text="Refresh last result", command=self._refresh_production
+        ).pack(side="left", padx=(8, 0))
+
+        self.production_text = self._make_text(tab, height=16, width=100)
+        self.production_text.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+
+        self.production_output_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.production_output_var, justify="left").grid(
+            row=4, column=0, sticky="ew", pady=(6, 0)
+        )
+
+    def _refresh_production(self) -> None:
+        self._run_async(
+            "Load release chain", self.controller.production_report, self._apply_production
+        )
+
+    def _run_production_check(self) -> None:
+        self._run_async(
+            "Run release chain check",
+            self.controller.production_check,
+            self._apply_production,
+        )
+
+    def _apply_production(self, report: dict[str, Any]) -> None:
+        self.production_text.delete("1.0", "end")
+        steps = report.get("steps") or []
+        passed = sum(1 for step in steps if step.get("status") == "pass")
+        state = "READY" if report.get("ok") else "ATTENTION"
+        self.production_status_var.set(
+            f"Release chain: {state} - {passed}/{len(steps)} steps passed, "
+            f"{report.get('failures', 0)} failed"
+        )
+        environment = report.get("environment") or {}
+        lines = [f"Version: {report.get('version', 'unknown')}"]
+        if report.get("generated_at"):
+            lines.append(f"Generated: {report['generated_at']}")
+        for key in ("platform", "python", "signing_key", "source_root"):
+            if environment.get(key):
+                lines.append(f"{key}: {environment[key]}")
+        lines.append("")
+        for step in steps:
+            marker = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP"}.get(
+                step.get("status", ""), str(step.get("status", "")).upper()
+            )
+            lines.append(
+                f"[{marker}] {step.get('name')} ({step.get('duration_ms', 0)} ms): "
+                f"{step.get('detail')}"
+            )
+        if not steps:
+            lines.append(
+                "No stored result yet. Press \"Run release chain check\" to produce one."
+            )
+        self.production_text.insert("1.0", "\n".join(lines))
+        self.production_output_var.set(
+            "Nothing outside the temporary work directory was modified."
+            if steps
+            else "Run the check to create real evidence."
+        )
+
+    def _apply_a11y_report_text(self, text: str) -> None:
+        self.a11y_text.delete("1.0", "end")
+        self.a11y_text.insert("1.0", text)
+
+    def _refresh_sync(self) -> None:
+        self._run_async("Refresh sync", self.controller.sync_status_text, self._apply_sync)
+
+    def _apply_sync(self, summary: str) -> None:
+        self.sync_status_var.set(summary)
+        self.sync_list_text.delete("1.0", "end")
+        self.sync_list_text.insert("1.0", summary)
+
+        def load() -> str:
+            return self.controller.sync_overview_text()
+
+        self._run_async("Load sync", load, self._apply_sync_rows)
+
+    def _apply_sync_rows(self, text: str) -> None:
+        self.sync_list_text.delete("1.0", "end")
+        self.sync_list_text.insert("1.0", text)
+
+    def _sync_report(self, message: str) -> None:
+        self.sync_output_var.set(message)
+        self._refresh_sync()
+
+    def _sync_pair(self) -> None:
+        name = self.sync_peer_name_var.get().strip()
+        sign = self.sync_sign_var.get().strip()
+        encrypt = self.sync_encrypt_var.get().strip()
+        if not name or not sign or not encrypt:
+            self.sync_output_var.set("A peer name and both public keys are required.")
+            return
+        self._run_async(
+            "Pair device",
+            lambda: self.controller.sync_pair(name, sign, encrypt),
+            self._sync_report,
+        )
+
+    def _sync_export(self) -> None:
+        self._run_async("Export bundle", self.controller.sync_export, self._sync_report)
+
+    def _sync_import(self) -> None:
+        path = self.sync_bundle_var.get().strip()
+        if not path:
+            self.sync_output_var.set("Type the path to a .pcasync bundle first.")
+            return
+        self._run_async(
+            "Import bundle",
+            lambda: self.controller.sync_import(path),
+            self._sync_report,
+        )
+
+    def _sync_tick(self) -> None:
+        self._run_async("Sync tick", self.controller.sync_tick, self._sync_report)
+
+    def _sync_accept(self) -> None:
+        reference = self.sync_request_var.get().strip()
+        if not reference:
+            self.sync_output_var.set("Type a coordination request id first.")
+            return
+        self._run_async(
+            "Accept request",
+            lambda: self.controller.sync_decide(reference, True),
+            self._sync_report,
+        )
+
+    def _sync_deny(self) -> None:
+        reference = self.sync_request_var.get().strip()
+        if not reference:
+            self.sync_output_var.set("Type a coordination request id first.")
+            return
+        self._run_async(
+            "Deny request",
+            lambda: self.controller.sync_decide(reference, False),
+            self._sync_report,
+        )
+
+    def _refresh_plugins(self) -> None:
+        self._run_async(
+            "Refresh plugins", self.controller.plugins_status_text, self._apply_plugins
+        )
+
+    def _apply_plugins(self, summary: str) -> None:
+        self.plugins_status_var.set(summary)
+        self.plugins_list_text.delete("1.0", "end")
+        self.plugins_list_text.insert("1.0", summary)
+
+        def load() -> str:
+            return self.controller.plugins_list_text()
+
+        self._run_async("Load plugins", load, self._apply_plugin_rows)
+
+    def _apply_plugin_rows(self, text: str) -> None:
+        self.plugins_list_text.delete("1.0", "end")
+        self.plugins_list_text.insert("1.0", text)
+
+    def _plugins_report(self, message: str) -> None:
+        self.plugins_output_var.set(message)
+        self._refresh_plugins()
+
+    def _plugin_reference(self) -> str:
+        reference = self.plugin_run_var.get().strip()
+        if not reference:
+            self.plugins_output_var.set("Type a plugin id first.")
+        return reference
+
+    def _plugin_verify(self) -> None:
+        bundle = self.plugin_bundle_var.get().strip()
+        if not bundle:
+            self.plugins_output_var.set("Type the path to a .zip bundle first.")
+            return
+        self._run_async(
+            "Verify plugin", lambda: self.controller.plugin_verify(bundle), self._plugins_report
+        )
+
+    def _plugin_install(self) -> None:
+        bundle = self.plugin_bundle_var.get().strip()
+        if not bundle:
+            self.plugins_output_var.set("Type the path to a .zip bundle first.")
+            return
+        self._run_async(
+            "Install plugin",
+            lambda: self.controller.plugin_install(bundle),
+            self._plugins_report,
+        )
+
+    def _plugin_run(self) -> None:
+        reference = self._plugin_reference()
+        if not reference:
+            return
+        tool = self.plugin_tool_var.get().strip()
+        if not tool:
+            self.plugins_output_var.set("Type the declared tool name first.")
+            return
+        raw = self.plugin_args_var.get().strip() or "{}"
+        self._run_async(
+            "Run plugin tool",
+            lambda: self.controller.plugin_run(reference, tool, raw),
+            self._plugins_report,
+        )
+
+    def _plugin_enable(self) -> None:
+        reference = self._plugin_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Enable plugin",
+            lambda: self.controller.plugin_set_enabled(reference, True),
+            self._plugins_report,
+        )
+
+    def _plugin_disable(self) -> None:
+        reference = self._plugin_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Disable plugin",
+            lambda: self.controller.plugin_set_enabled(reference, False),
+            self._plugins_report,
+        )
+
+    def _plugin_rollback(self) -> None:
+        reference = self._plugin_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Rollback plugin",
+            lambda: self.controller.plugin_rollback(reference),
+            self._plugins_report,
+        )
+
+    def _plugin_remove(self) -> None:
+        reference = self._plugin_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Remove plugin",
+            lambda: self.controller.plugin_uninstall(reference),
+            self._plugins_report,
+        )
+
+    def _plugin_skills(self) -> None:
+        reference = self._plugin_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Plugin skills",
+            lambda: self.controller.plugin_skills(reference),
+            self._plugins_report,
+        )
+
+    def _plugins_runs(self) -> None:
+        self._run_async(
+            "Plugin runs", self.controller.plugin_runs_text, self._plugins_report
+        )
+
+    def _refresh_proactive(self) -> None:
+        self._run_async(
+            "Refresh proactive", self.controller.proactive_status_text, self._apply_proactive
+        )
+
+    def _apply_proactive(self, summary: str) -> None:
+        self.proactive_status_var.set(summary)
+        self.proactive_list_text.delete("1.0", "end")
+        self.proactive_list_text.insert("1.0", summary)
+
+        def load() -> str:
+            return (
+                self.controller.proactive_reminders_text()
+                + "\n\n--- notifications ---\n"
+                + self.controller.proactive_notifications_text()
+            )
+
+        def apply(text: str) -> None:
+            self.proactive_notifications_text.delete("1.0", "end")
+            self.proactive_notifications_text.insert("1.0", text)
+
+        self._run_async("Load proactive ledger", load, apply)
+
+    def _proactive_report(self, message: str) -> None:
+        self.proactive_output_var.set(message)
+        self._refresh_proactive()
+
+    def _proactive_tick(self) -> None:
+        self._run_async("Proactive tick", self.controller.proactive_tick, self._proactive_report)
+
+    def _proactive_briefing(self) -> None:
+        self._run_async(
+            "Generate briefing", lambda: self.controller.run_briefing(True), self._proactive_report
+        )
+
+    def _add_reminder(self) -> None:
+        title = self.reminder_title_var.get().strip()
+        due = self.reminder_due_var.get().strip()
+        if not title or not due:
+            self.proactive_output_var.set("A title and a due time (+15m, 09:30, ISO) are required.")
+            return
+        severity = self.reminder_severity_var.get().strip() or "normal"
+        self._run_async(
+            "Add reminder",
+            lambda: self.controller.add_reminder(title, due, severity),
+            self._proactive_report,
+        )
+
+    def _reminder_reference(self) -> str:
+        reference = self.reminder_reference_var.get().strip()
+        if not reference:
+            self.proactive_output_var.set("Type a reminder id (or id prefix) first.")
+        return reference
+
+    def _reminder_done(self) -> None:
+        reference = self._reminder_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Complete reminder",
+            lambda: self.controller.resolve_reminder(reference),
+            self._proactive_report,
+        )
+
+    def _reminder_snooze(self) -> None:
+        reference = self._reminder_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Snooze reminder",
+            lambda: self.controller.snooze_reminder(reference, "+15m"),
+            self._proactive_report,
+        )
+
+    def _reminder_delete(self) -> None:
+        reference = self._reminder_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Delete reminder",
+            lambda: self.controller.delete_reminder(reference),
+            self._proactive_report,
+        )
+
+    def _build_connectors_tab(self) -> None:
+        tab = self.connectors_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        self.connectors_status_var = tk.StringVar(value="Connectors: loading...")
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top, textvariable=self.connectors_status_var, justify="left").pack(
+            side="left"
+        )
+        ttk.Button(top, text="Refresh", command=self._refresh_connectors).pack(side="right")
+        ttk.Button(top, text="Probe local", command=self._connectors_probe).pack(
+            side="right", padx=(0, 6)
+        )
+
+        self.connectors_state_text = self._make_text(tab, height=8, width=96)
+        self.connectors_state_text.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+
+        calendar = ttk.LabelFrame(
+            tab, text="Calendar (.ics file)", style="Section.TLabelframe", padding=8
+        )
+        calendar.grid(row=2, column=0, sticky="ew")
+        calendar.columnconfigure(0, weight=1)
+        row = ttk.Frame(calendar)
+        row.grid(row=0, column=0, sticky="ew")
+        self.connector_calendar_days_var = tk.StringVar(value="7")
+        self.connector_summary_var = tk.StringVar()
+        self.connector_start_var = tk.StringVar()
+        ttk.Label(row, text="Days").pack(side="left")
+        ttk.Entry(row, textvariable=self.connector_calendar_days_var, width=5).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Button(row, text="List events", command=self._connectors_calendar_list).pack(
+            side="left"
+        )
+        row2 = ttk.Frame(calendar)
+        row2.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(row2, text="Summary").pack(side="left")
+        ttk.Entry(row2, textvariable=self.connector_summary_var, width=30).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Label(row2, text="Start (ISO-8601)").pack(side="left")
+        ttk.Entry(row2, textvariable=self.connector_start_var, width=22).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Button(row2, text="Add event", command=self._connectors_calendar_add).pack(
+            side="left"
+        )
+        self.connectors_calendar_text = self._make_text(calendar, height=5, width=96)
+        self.connectors_calendar_text.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+
+        others = ttk.LabelFrame(
+            tab, text="Drive, mail and chat", style="Section.TLabelframe", padding=8
+        )
+        others.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        others.columnconfigure(1, weight=1)
+        self.connector_mail_limit_var = tk.StringVar(value="5")
+        self.connector_chat_text_var = tk.StringVar()
+        ttk.Button(others, text="Sync drive folder", command=self._connectors_drive_sync).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Button(others, text="Read mail headers", command=self._connectors_mail_inbox).grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(others, textvariable=self.connector_mail_limit_var, width=5).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0)
+        )
+        ttk.Entry(others, textvariable=self.connector_chat_text_var, width=50).grid(
+            row=2, column=1, sticky="ew", padx=(8, 0), pady=(6, 0)
+        )
+        ttk.Button(others, text="Send chat message", command=self._connectors_chat_send).grid(
+            row=2, column=0, sticky="w", pady=(6, 0)
+        )
+
+        webhook = ttk.LabelFrame(
+            tab, text="Inbound webhook (HMAC verified)", style="Section.TLabelframe", padding=8
+        )
+        webhook.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        webhook.columnconfigure(1, weight=1)
+        self.connector_webhook_file_var = tk.StringVar()
+        self.connector_webhook_ts_var = tk.StringVar()
+        self.connector_webhook_sig_var = tk.StringVar()
+        ttk.Label(webhook, text="Body file").grid(row=0, column=0, sticky="w")
+        ttk.Entry(webhook, textvariable=self.connector_webhook_file_var).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Label(webhook, text="Timestamp").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(webhook, textvariable=self.connector_webhook_ts_var, width=16).grid(
+            row=1, column=1, sticky="w", padx=(6, 0), pady=(6, 0)
+        )
+        ttk.Label(webhook, text="Signature").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(webhook, textvariable=self.connector_webhook_sig_var).grid(
+            row=2, column=1, sticky="ew", padx=(6, 0), pady=(6, 0)
+        )
+        ttk.Button(webhook, text="Verify and record", command=self._connectors_webhook).grid(
+            row=3, column=0, sticky="w", pady=(6, 0)
+        )
+
+        self.connectors_output_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.connectors_output_var, justify="left").grid(
+            row=5, column=0, sticky="w", pady=(8, 4)
+        )
+        self.connectors_ledger_text = self._make_text(tab, height=6, width=96)
+        self.connectors_ledger_text.grid(row=6, column=0, sticky="nsew")
+        tab.rowconfigure(6, weight=1)
+
+    def _refresh_connectors(self, *, probe: bool = False) -> None:
+        self._run_async(
+            "Refresh connectors",
+            lambda: self.controller.connectors_status_text()
+            if not probe
+            else self._connectors_probe_text(),
+            self._apply_connectors,
+        )
+
+    def _connectors_probe_text(self) -> str:
+        payload = self.controller.connectors_status(probe=True)
+        gate = "on" if payload["allow_connectors"] else "off"
+        email_gate = "on" if payload["allow_email_connector"] else "off"
+        lines = [f"connectors={gate} email_gate={email_gate}"]
+        for entry in payload["connectors"]:
+            state = "ready" if entry["enabled"] else "off"
+            lines.append(
+                f"  {entry['connector']:<9} {state:<6} configured={entry['configured']}"
+                f" target={entry.get('target', '-')}"
+            )
+            probe_data = entry.get("probe") or {}
+            if probe_data:
+                lines.append(f"    probe: {probe_data}")
+        return "\n".join(lines)
+
+    def _apply_connectors(self, summary: str) -> None:
+        self.connectors_status_var.set(summary)
+        self.connectors_state_text.delete("1.0", "end")
+        self.connectors_state_text.insert("1.0", summary)
+
+        def load_ledger() -> str:
+            return (
+                self.controller.connectors_events_text(limit=12)
+                + "\n\n--- deliveries ---\n"
+                + self.controller.connectors_deliveries_text(limit=8)
+            )
+
+        def apply(text: str) -> None:
+            self.connectors_ledger_text.delete("1.0", "end")
+            self.connectors_ledger_text.insert("1.0", text)
+
+        self._run_async("Load connector ledger", load_ledger, apply)
+
+    def _connectors_report(self, message: str) -> None:
+        self.connectors_output_var.set(message)
+        self._refresh_connectors()
+
+    def _connectors_probe(self) -> None:
+        self._refresh_connectors(probe=True)
+
+    def _connectors_calendar_list(self) -> None:
+        days = self._positive_int(self.connector_calendar_days_var.get(), default=7)
+        self._run_async(
+            "List calendar events",
+            lambda: self.controller.connectors_calendar_text(days),
+            lambda text: self._set_connector_text(self.connectors_calendar_text, text),
+        )
+
+    def _connectors_calendar_add(self) -> None:
+        summary = self.connector_summary_var.get().strip()
+        start = self.connector_start_var.get().strip()
+        if not summary or not start:
+            self.connectors_output_var.set("A summary and an ISO-8601 start are required.")
+            return
+        self._run_async(
+            "Add calendar event",
+            lambda: self.controller.add_calendar_event(summary, start),
+            self._connectors_report,
+        )
+
+    def _connectors_drive_sync(self) -> None:
+        self._run_async(
+            "Sync drive folder", self.controller.connector_drive_sync, self._connectors_report
+        )
+
+    def _connectors_mail_inbox(self) -> None:
+        limit = self._positive_int(self.connector_mail_limit_var.get(), default=5)
+        self._run_async(
+            "Read mail headers",
+            lambda: self.controller.connector_mail_inbox(limit),
+            self._connectors_report,
+        )
+
+    def _connectors_chat_send(self) -> None:
+        text = self.connector_chat_text_var.get().strip()
+        if not text:
+            self.connectors_output_var.set("Type the chat message first.")
+            return
+        self._run_async(
+            "Send chat message",
+            lambda: self.controller.connector_chat_send(text),
+            self._connectors_report,
+        )
+
+    def _connectors_webhook(self) -> None:
+        from pathlib import Path as _Path
+
+        path = self.connector_webhook_file_var.get().strip()
+        timestamp = self.connector_webhook_ts_var.get().strip()
+        signature = self.connector_webhook_sig_var.get().strip()
+        if not path or not timestamp or not signature:
+            self.connectors_output_var.set("Body file, timestamp and signature are required.")
+            return
+        body_file = _Path(path).expanduser()
+        self._run_async(
+            "Verify webhook",
+            lambda: self.controller.connector_webhook_receive(
+                body_file, timestamp, signature
+            ),
+            self._connectors_report,
+        )
+
+    @staticmethod
+    def _set_connector_text(widget: Any, text: str) -> None:
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+
+    @staticmethod
+    def _positive_int(raw: str, *, default: int) -> int:
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
 
     def _build_dashboard_tab(self) -> None:
         tab = self.dashboard_tab
@@ -467,6 +1494,257 @@ class PcAgentGuiApp:
 
         self.doctor_text = self._make_text(tab, height=24, width=96)
         self.doctor_text.grid(row=3, column=0, sticky="nsew")
+
+    def _build_command_center_tab(self) -> None:
+        tab = self.command_tab
+        tab.columnconfigure(0, weight=3)
+        tab.columnconfigure(1, weight=2)
+        tab.rowconfigure(2, weight=1)
+
+        overview = ttk.LabelFrame(tab, text="Live Overview (auto-refresh 4s)", padding=8)
+        overview.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(
+            overview,
+            textvariable=self.cc_overview_var,
+            style="CommandValue.TLabel",
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            overview,
+            textvariable=self.cc_system_var,
+            style="CommandValue.TLabel",
+            justify="left",
+        ).grid(row=1, column=0, sticky="w")
+
+        missions = ttk.LabelFrame(tab, text="Mission Center", padding=8)
+        missions.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
+        missions.columnconfigure(0, weight=1)
+        self.cc_mission_tree = ttk.Treeview(
+            missions,
+            columns=("status", "progress"),
+            show="tree headings",
+            height=7,
+            selectmode="browse",
+        )
+        self.cc_mission_tree.heading("#0", text="Mission")
+        self.cc_mission_tree.heading("status", text="Status")
+        self.cc_mission_tree.heading("progress", text="Progress")
+        self.cc_mission_tree.column("status", width=110)
+        self.cc_mission_tree.column("progress", width=170)
+        self.cc_mission_tree.grid(row=0, column=0, sticky="nsew")
+        self.cc_mission_tree.bind("<<TreeviewSelect>>", self._cc_mission_selected)
+        mission_buttons = ttk.Frame(missions)
+        mission_buttons.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(mission_buttons, text="Run Mission", command=self._cc_run_mission).pack(
+            side="left"
+        )
+        ttk.Button(
+            mission_buttons, text="Cancel Mission", command=self._cc_cancel_mission
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(mission_buttons, text="Refresh", command=self._cc_refresh).pack(
+            side="left", padx=(6, 0)
+        )
+        self.cc_mission_text = tk.Text(missions, height=9, wrap="word")
+        self.cc_mission_text.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+
+        safety = ttk.LabelFrame(tab, text="Safety and Approval Center", padding=8)
+        safety.grid(row=1, column=1, sticky="nsew", pady=(0, 8))
+        safety.columnconfigure(0, weight=1)
+        ttk.Label(safety, textvariable=self.cc_safety_var, style="Command.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        safety_buttons = ttk.Frame(safety)
+        safety_buttons.grid(row=1, column=0, sticky="ew", pady=(6, 8))
+        ttk.Button(
+            safety_buttons, text="Emergency Stop", command=self._cc_engage_stop
+        ).pack(side="left")
+        ttk.Button(safety_buttons, text="Clear Stop", command=self._cc_clear_stop).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Label(safety, text="Pending Approval Center requests:").grid(
+            row=2, column=0, sticky="w"
+        )
+        self.cc_approvals_list = tk.Listbox(safety, height=6)
+        self.cc_approvals_list.grid(row=3, column=0, sticky="nsew")
+        approval_buttons = ttk.Frame(safety)
+        approval_buttons.grid(row=4, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(approval_buttons, text="Approve", command=self._cc_approve).pack(
+            side="left"
+        )
+        ttk.Button(approval_buttons, text="Deny", command=self._cc_deny).pack(
+            side="left", padx=(6, 0)
+        )
+
+        events_frame = ttk.LabelFrame(tab, text="Live Events", padding=8)
+        events_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        events_frame.rowconfigure(0, weight=1)
+        events_frame.columnconfigure(0, weight=1)
+        self.cc_events_text = tk.Text(events_frame, height=11, wrap="word", state="disabled")
+        self.cc_events_text.grid(row=0, column=0, sticky="nsew")
+
+    def _poll_command_center(self) -> None:
+        try:
+            if not self._busy:
+                self._cc_refresh()
+        except tk.TclError:
+            return
+        self.root.after(4000, self._poll_command_center)
+
+    def _cc_refresh(self) -> None:
+        overview = self.controller.command_center_overview()
+        self.cc_overview_var.set(overview.to_text())
+        self.cc_system_var.set("System: " + self.controller.system_status_text())
+        self.cc_safety_var.set("Safety: " + overview.emergency_stop)
+
+        selected = self._cc_selected_mission
+        for item in self.cc_mission_tree.get_children():
+            self.cc_mission_tree.delete(item)
+        for row in self.controller.list_mission_rows():
+            progress = (
+                f"{row.succeeded}/{row.total} ok, {row.failed} failed, "
+                f"{row.active} active"
+            )
+            self.cc_mission_tree.insert(
+                "", "end", iid=row.id, text=row.name, values=(row.status, progress)
+            )
+        if selected:
+            try:
+                self.cc_mission_tree.selection_set(selected)
+                self._set_text(
+                    self.cc_mission_text, self.controller.mission_detail(selected).text
+                )
+            except Exception:  # noqa: BLE001 - mission may have been deleted.
+                self._cc_selected_mission = None
+
+        self.cc_approvals_list.delete(0, "end")
+        for request in self.controller.pending_approval_center_requests():
+            self.cc_approvals_list.insert(
+                "end", f"{request.request_key} {request.tool_id} {request.action}"
+            )
+
+        events, cursor = self.controller.events_since(self._cc_event_cursor)
+        if events:
+            self._cc_event_cursor = cursor
+            self.cc_events_text.configure(state="normal")
+            for event in events:
+                stamp = event.created_at.strftime("%H:%M:%S")
+                self.cc_events_text.insert(
+                    "end",
+                    f"#{event.id} {stamp} {event.event_type} [{event.source}] "
+                    f"{event.summary}\n",
+                )
+            self.cc_events_text.see("end")
+            self.cc_events_text.configure(state="disabled")
+
+    def _cc_mission_selected(self, _event: Any = None) -> None:
+        selection = self.cc_mission_tree.selection()
+        if not selection:
+            return
+        self._cc_selected_mission = str(selection[0])
+        self._set_text(
+            self.cc_mission_text,
+            self.controller.mission_detail(self._cc_selected_mission).text,
+        )
+
+    def _cc_selected_or_warn(self) -> str | None:
+        if not self._cc_selected_mission:
+            messagebox.showinfo(
+                "No mission selected", "Select a mission first.", parent=self.root
+            )
+            return None
+        return self._cc_selected_mission
+
+    def _cc_run_mission(self) -> None:
+        mission_id = self._cc_selected_or_warn()
+        if mission_id is None:
+            return
+        self._run_async(
+            "Run mission",
+            lambda: self.controller.run_mission(mission_id),
+            lambda detail: self._set_text(self.cc_mission_text, detail.text),
+        )
+
+    def _cc_cancel_mission(self) -> None:
+        mission_id = self._cc_selected_or_warn()
+        if mission_id is None:
+            return
+        if not messagebox.askyesno(
+            "Cancel mission",
+            "Cancel this mission and its unfinished tasks?",
+            parent=self.root,
+        ):
+            return
+        self._run_async(
+            "Cancel mission",
+            lambda: self.controller.cancel_mission(mission_id),
+            lambda detail: self._set_text(self.cc_mission_text, detail.text),
+        )
+
+    def _cc_selected_approval_key(self) -> str | None:
+        selection = self.cc_approvals_list.curselection()
+        if not selection:
+            messagebox.showinfo(
+                "No request selected",
+                "Select a pending Approval Center request first.",
+                parent=self.root,
+            )
+            return None
+        return str(self.cc_approvals_list.get(selection[0])).split()[0]
+
+    def _cc_approve(self) -> None:
+        key = self._cc_selected_approval_key()
+        if key is None:
+            return
+        if not messagebox.askyesno(
+            "Approve request",
+            f"Approve {key} for its exact scope (consumed once)?",
+            icon="warning",
+            parent=self.root,
+        ):
+            return
+        self._run_async(
+            "Approve request",
+            lambda: self.controller.decide_approval_center(key, approve=True),
+            lambda message: self.status_var.set(str(message)),
+        )
+
+    def _cc_deny(self) -> None:
+        key = self._cc_selected_approval_key()
+        if key is None:
+            return
+        self._run_async(
+            "Deny request",
+            lambda: self.controller.decide_approval_center(key, approve=False),
+            lambda message: self.status_var.set(str(message)),
+        )
+
+    def _cc_engage_stop(self) -> None:
+        if not messagebox.askyesno(
+            "Emergency stop",
+            "Engage the emergency stop? All orchestrated tool execution will halt.",
+            icon="warning",
+            parent=self.root,
+        ):
+            return
+        self._run_async(
+            "Emergency stop",
+            lambda: self.controller.set_emergency_stop(engaged=True),
+            lambda summary: self.cc_safety_var.set("Safety: " + str(summary)),
+        )
+
+    def _cc_clear_stop(self) -> None:
+        if not messagebox.askyesno(
+            "Clear emergency stop",
+            "Clear the stop so orchestrated tool execution can run again?",
+            icon="warning",
+            parent=self.root,
+        ):
+            return
+        self._run_async(
+            "Clear emergency stop",
+            lambda: self.controller.set_emergency_stop(engaged=False),
+            lambda summary: self.cc_safety_var.set("Safety: " + str(summary)),
+        )
 
     def _build_tasks_tab(self) -> None:
         tab = self.tasks_tab
@@ -1602,6 +2880,948 @@ class PcAgentGuiApp:
         self.tool_output_text = self._make_text(invoke_frame, height=5, width=66)
         self.tool_output_text.grid(row=3, column=0, sticky="ew", pady=(6, 0))
 
+    def _build_voice_tab(self) -> None:
+        tab = self.voice_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=1)
+        tab.rowconfigure(5, weight=1)
+
+        self.voice_status_var = tk.StringVar(value="Voice: loading...")
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            top, textvariable=self.voice_status_var, justify="left"
+        ).pack(side="left")
+        ttk.Button(top, text="Refresh", command=self._refresh_voice).pack(
+            side="right"
+        )
+
+        controls = ttk.LabelFrame(
+            tab, text="Microphone control", style="Section.TLabelframe", padding=8
+        )
+        controls.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        self.voice_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Microphone enabled (persisted, explicit)",
+            variable=self.voice_enabled_var,
+            command=self._voice_toggle_enabled,
+        ).grid(row=0, column=0, sticky="w")
+        self.voice_wake_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            controls,
+            text="Optional wake word (second opt-in)",
+            variable=self.voice_wake_var,
+            command=self._voice_toggle_wake_word,
+        ).grid(row=0, column=1, sticky="w", padx=(16, 0))
+        ttk.Button(
+            controls, text="Push to talk (start)", command=self._voice_start
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(
+            controls, text="Stop and transcribe", command=self._voice_stop
+        ).grid(row=1, column=1, sticky="w", padx=(16, 0), pady=(8, 0))
+        ttk.Button(
+            controls, text="Cancel", command=self._voice_cancel
+        ).grid(row=1, column=2, sticky="w", padx=(16, 0), pady=(8, 0))
+        ttk.Button(
+            controls, text="Purge retained audio", command=self._voice_purge
+        ).grid(row=1, column=3, sticky="w", padx=(16, 0), pady=(8, 0))
+
+        self.voice_output_text = self._make_text(tab, height=8, width=90)
+        self.voice_output_text.grid(row=2, column=0, sticky="nsew")
+
+        speak = ttk.LabelFrame(
+            tab, text="Speak", style="Section.TLabelframe", padding=8
+        )
+        speak.grid(row=3, column=0, sticky="ew", pady=(8, 8))
+        speak.columnconfigure(0, weight=1)
+        self.voice_speak_var = tk.StringVar()
+        ttk.Entry(speak, textvariable=self.voice_speak_var).grid(
+            row=0, column=0, sticky="ew"
+        )
+        ttk.Button(speak, text="Say it", command=self._voice_speak).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+
+        self.voice_privacy_var = tk.StringVar(value="Privacy: unknown")
+        ttk.Label(tab, textvariable=self.voice_privacy_var).grid(
+            row=4, column=0, sticky="w"
+        )
+        ttk.Label(tab, text="Recent voice sessions").grid(
+            row=5, column=0, sticky="nw"
+        )
+        self.voice_sessions_text = self._make_text(tab, height=6, width=90)
+        self.voice_sessions_text.grid(row=5, column=0, sticky="nsew", pady=(20, 0))
+
+    def _build_automation_tab(self) -> None:
+        tab = self.automation_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=1)
+        tab.rowconfigure(5, weight=1)
+
+        self.automation_status_var = tk.StringVar(value="Automation: loading...")
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            top, textvariable=self.automation_status_var, justify="left"
+        ).pack(side="left")
+        ttk.Button(top, text="Refresh", command=self._refresh_automation).pack(
+            side="right"
+        )
+
+        vision = ttk.LabelFrame(
+            tab, text="Local vision (offline, bounded)", style="Section.TLabelframe", padding=8
+        )
+        vision.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        vision.columnconfigure(1, weight=1)
+        vision.columnconfigure(4, weight=1)
+        ttk.Label(vision, text="Screenshot path (blank = live screen)").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.automation_screen_path_var = tk.StringVar()
+        ttk.Entry(vision, textvariable=self.automation_screen_path_var).grid(
+            row=0, column=1, sticky="ew", padx=(8, 8)
+        )
+        ttk.Label(vision, text="Grid").grid(row=0, column=2, sticky="e")
+        self.automation_grid_var = tk.StringVar(value="4")
+        ttk.Spinbox(
+            vision, from_=1, to=12, width=4, textvariable=self.automation_grid_var
+        ).grid(row=0, column=3, sticky="w", padx=(6, 8))
+        ttk.Button(
+            vision, text="Analyse screen", command=self._automation_analyse
+        ).grid(row=0, column=4, sticky="e")
+        ttk.Label(vision, text="Template path").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.automation_template_var = tk.StringVar()
+        ttk.Entry(vision, textvariable=self.automation_template_var).grid(
+            row=1, column=1, sticky="ew", padx=(8, 8), pady=(8, 0)
+        )
+        ttk.Label(vision, text="Threshold").grid(row=1, column=2, sticky="e", pady=(8, 0))
+        self.automation_threshold_var = tk.StringVar(value="0.90")
+        ttk.Spinbox(
+            vision,
+            from_=0.5,
+            to=1.0,
+            increment=0.01,
+            width=6,
+            textvariable=self.automation_threshold_var,
+        ).grid(row=1, column=3, sticky="w", padx=(6, 8), pady=(8, 0))
+        ttk.Button(
+            vision, text="Locate template", command=self._automation_locate
+        ).grid(row=1, column=4, sticky="e", pady=(8, 0))
+
+        self.automation_output_text = self._make_text(tab, height=8, width=90)
+        self.automation_output_text.grid(row=2, column=0, sticky="nsew")
+
+        browser = ttk.LabelFrame(
+            tab, text="Browser wait (real wait, bounded)", style="Section.TLabelframe", padding=8
+        )
+        browser.grid(row=3, column=0, sticky="ew", pady=(8, 8))
+        browser.columnconfigure(1, weight=1)
+        browser.columnconfigure(4, weight=1)
+        ttk.Label(browser, text="Wait for selector").grid(row=0, column=0, sticky="w")
+        self.automation_selector_var = tk.StringVar()
+        ttk.Entry(browser, textvariable=self.automation_selector_var).grid(
+            row=0, column=1, sticky="ew", padx=(8, 8)
+        )
+        ttk.Label(browser, text="Timeout (s)").grid(row=0, column=2, sticky="e")
+        self.automation_timeout_var = tk.StringVar(value="20")
+        ttk.Spinbox(
+            browser, from_=1, to=120, width=5, textvariable=self.automation_timeout_var
+        ).grid(row=0, column=3, sticky="w", padx=(6, 8))
+        ttk.Button(browser, text="Wait", command=self._automation_browser_wait).grid(
+            row=0, column=4, sticky="e"
+        )
+
+        self.automation_ledger_var = tk.StringVar(value="Automation ledger: unknown")
+        ttk.Label(tab, textvariable=self.automation_ledger_var).grid(
+            row=4, column=0, sticky="w"
+        )
+        ttk.Label(tab, text="Recent automation runs").grid(row=5, column=0, sticky="nw")
+        self.automation_runs_text = self._make_text(tab, height=6, width=90)
+        self.automation_runs_text.grid(row=5, column=0, sticky="nsew", pady=(20, 0))
+
+    def _build_flows_tab(self) -> None:
+        tab = self.flows_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(4, weight=1)
+
+        self.flows_status_var = tk.StringVar(value="Flows: loading...")
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew")
+        ttk.Label(top, textvariable=self.flows_status_var, justify="left").pack(side="left")
+        ttk.Button(top, text="Refresh", command=self._refresh_flows).pack(side="right")
+
+        self.flows_list_text = self._make_text(tab, height=7, width=90)
+        self.flows_list_text.grid(row=1, column=0, sticky="nsew", pady=(8, 8))
+
+        editor = ttk.LabelFrame(
+            tab, text="Flow document (JSON) and controls",
+            style="Section.TLabelframe", padding=8,
+        )
+        editor.grid(row=2, column=0, sticky="ew")
+        editor.columnconfigure(0, weight=1)
+        self.flow_reference_var = tk.StringVar()
+        self.flow_interval_var = tk.StringVar(value="3600")
+        self.flow_event_var = tk.StringVar(value="task.completed")
+        row = ttk.Frame(editor)
+        row.grid(row=0, column=0, sticky="ew")
+        ttk.Label(row, text="Flow (id or name)").pack(side="left")
+        ttk.Entry(row, textvariable=self.flow_reference_var, width=28).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Button(row, text="Show", command=self._flows_show).pack(side="left")
+        ttk.Button(row, text="Run", command=self._flows_run).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="Export", command=self._flows_export).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="Tick triggers", command=self._flows_tick).pack(
+            side="left", padx=(6, 0)
+        )
+        row2 = ttk.Frame(editor)
+        row2.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Label(row2, text="Interval (s)").pack(side="left")
+        ttk.Entry(row2, textvariable=self.flow_interval_var, width=8).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Button(row2, text="Add schedule", command=self._flows_add_schedule).pack(side="left")
+        ttk.Label(row2, text="Event").pack(side="left", padx=(12, 0))
+        ttk.Entry(row2, textvariable=self.flow_event_var, width=22).pack(
+            side="left", padx=(6, 10)
+        )
+        ttk.Button(row2, text="Add event trigger", command=self._flows_add_event).pack(side="left")
+
+        document = ttk.Frame(editor)
+        document.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        document.columnconfigure(0, weight=1)
+        self.flow_document_text = self._make_text(document, height=10, width=90)
+        self.flow_document_text.grid(row=0, column=0, sticky="nsew")
+        buttons = ttk.Frame(document)
+        buttons.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Button(buttons, text="Validate", command=self._flows_validate).pack(side="left")
+        ttk.Button(buttons, text="Save new flow", command=self._flows_save).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(buttons, text="Update flow", command=self._flows_update).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(buttons, text="Import document", command=self._flows_import).pack(
+            side="left", padx=(6, 0)
+        )
+
+        self.flows_output_var = tk.StringVar(value="")
+        ttk.Label(tab, textvariable=self.flows_output_var, justify="left").grid(
+            row=3, column=0, sticky="w", pady=(8, 4)
+        )
+        ttk.Label(tab, text="Recent flow runs").grid(row=4, column=0, sticky="nw")
+        self.flow_runs_text = self._make_text(tab, height=6, width=90)
+        self.flow_runs_text.grid(row=4, column=0, sticky="nsew", pady=(20, 0))
+
+    def _refresh_flows(self) -> None:
+        self._run_async("Refresh flows", self.controller.flows_summary_text, self._apply_flows)
+
+    def _apply_flows(self, summary: str) -> None:
+        self.flows_status_var.set(summary)
+        try:
+            flows = self.controller.flows_list(limit=50)
+        except Exception as exc:  # noqa: BLE001 - surface the message, never crash the tab
+            self.flows_list_text.delete("1.0", "end")
+            self.flows_list_text.insert("1.0", f"Flow list failed: {exc}")
+            return
+        self.flows_list_text.delete("1.0", "end")
+        if not flows:
+            self.flows_list_text.insert("1.0", "No flows stored yet.")
+            return
+        self.flows_list_text.insert(
+            "1.0",
+            "\n".join(
+                f"{flow['id'][:8]} v{flow['version']} "
+                f"{'enabled' if flow['enabled'] else 'DISABLED'} "
+                f"{flow['node_count']} node(s) {flow['name']}"
+                for flow in flows
+            ),
+        )
+        runs = self.controller.flow_runs(limit=20)
+        self.flow_runs_text.delete("1.0", "end")
+        if not runs:
+            self.flow_runs_text.insert("1.0", "No flow runs recorded yet.")
+        else:
+            self.flow_runs_text.insert(
+                "1.0",
+                "\n".join(
+                    f"{run['created_at'][:19]} {run['status']:<9} {run['flow_name']} "
+                    f"v{run['flow_version']} via {run['trigger_kind']}"
+                    for run in runs
+                ),
+            )
+
+    def _flows_report(self, message: str) -> None:
+        self.flows_output_var.set(message)
+        self._refresh_flows()
+
+    def _flow_reference(self) -> str:
+        reference = self.flow_reference_var.get().strip()
+        if not reference:
+            self.status_var.set("Type a flow id or exact name first.")
+        return reference
+
+    def _flow_document(self) -> str:
+        return self.flow_document_text.get("1.0", "end").strip()
+
+    def _flows_show(self) -> None:
+        reference = self._flow_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Show flow",
+            lambda: self.controller.flow_show_text(reference),
+            lambda text: self.flows_output_var.set(text),
+        )
+
+    def _flows_run(self) -> None:
+        reference = self._flow_reference()
+        if not reference:
+            return
+        self._run_async(
+            "Run flow", lambda: self.controller.flow_run(reference), self._flows_report
+        )
+
+    def _flows_tick(self) -> None:
+        self._run_async("Tick triggers", self.controller.flow_tick, self._flows_report)
+
+    def _flows_export(self) -> None:
+        reference = self._flow_reference()
+        if not reference:
+            return
+
+        def export() -> str:
+            document = self.controller.flow_export_text(reference)
+            self.root.after(0, lambda: self._set_flow_document(document))
+            return "exported to the document box"
+
+        self._run_async("Export flow", export, self._flows_report)
+
+    def _set_flow_document(self, document: str) -> None:
+        self.flow_document_text.delete("1.0", "end")
+        self.flow_document_text.insert("1.0", document)
+
+    def _flows_validate(self) -> None:
+        document = self._flow_document()
+        if not document:
+            self.status_var.set("Paste a flow JSON document first.")
+            return
+        self._run_async(
+            "Validate flow",
+            lambda: self.controller.flow_validate(document),
+            self._flows_report,
+        )
+
+    def _flows_save(self) -> None:
+        document = self._flow_document()
+        if not document:
+            self.status_var.set("Paste a flow JSON document first.")
+            return
+        self._run_async(
+            "Save flow",
+            lambda: self.controller.flow_save(document),
+            self._flows_report,
+        )
+
+    def _flows_update(self) -> None:
+        reference = self._flow_reference()
+        document = self._flow_document()
+        if not reference or not document:
+            if not document:
+                self.status_var.set("Paste a flow JSON document first.")
+            return
+        self._run_async(
+            "Update flow",
+            lambda: self.controller.flow_save(document, reference=reference),
+            self._flows_report,
+        )
+
+    def _flows_import(self) -> None:
+        document = self._flow_document()
+        if not document:
+            self.status_var.set("Paste a flow JSON document first.")
+            return
+        self._run_async(
+            "Import flow",
+            lambda: self.controller.flow_import(document),
+            self._flows_report,
+        )
+
+    def _flows_add_schedule(self) -> None:
+        reference = self._flow_reference()
+        if not reference:
+            return
+        try:
+            interval = int(self.flow_interval_var.get().strip() or "0")
+        except ValueError:
+            self.status_var.set("Interval must be whole seconds (minimum 60).")
+            return
+        self._run_async(
+            "Add schedule trigger",
+            lambda: self.controller.flow_add_trigger(
+                reference, kind="schedule", interval_seconds=interval
+            ),
+            self._flows_report,
+        )
+
+    def _flows_add_event(self) -> None:
+        reference = self._flow_reference()
+        if not reference:
+            return
+        event_type = self.flow_event_var.get().strip()
+        self._run_async(
+            "Add event trigger",
+            lambda: self.controller.flow_add_trigger(
+                reference, kind="event", event_type=event_type
+            ),
+            self._flows_report,
+        )
+
+    def _refresh_automation(self) -> None:
+        self._run_async(
+            "Refresh automation",
+            self.controller.automation_capabilities_text,
+            self._apply_automation_status,
+        )
+
+    def _apply_automation_status(self, summary: str) -> None:
+        self.automation_status_var.set(summary)
+        self.automation_ledger_var.set("Automation ledger: " + summary.split("ledger: ")[-1])
+        runs = self.controller.automation_runs(limit=25)
+        self.automation_runs_text.delete("1.0", "end")
+        if not runs:
+            self.automation_runs_text.insert("1.0", "No automation runs recorded yet.")
+            return
+        lines = [
+            f"{run['created_at'][:19]}  {run['kind']:<8} {run['action']:<18}"
+            f" {'allowed' if run['allowed'] else 'refused'}  {run['status']}"
+            f"  {(run['target'] or '')[:48]}"
+            for run in runs
+        ]
+        self.automation_runs_text.insert("1.0", "\n".join(lines))
+
+    def _automation_analyse(self) -> None:
+        path = self.automation_screen_path_var.get()
+        try:
+            grid = int(self.automation_grid_var.get() or 4)
+        except ValueError:
+            self.status_var.set("Grid must be a whole number between 1 and 12.")
+            return
+        self._run_async(
+            "Analyse screen",
+            lambda: self.controller.automation_screen_text(path, grid),
+            self._automation_report,
+        )
+
+    def _automation_locate(self) -> None:
+        template = self.automation_template_var.get().strip()
+        screen = self.automation_screen_path_var.get().strip()
+        if not template:
+            self.status_var.set("Pick a template image first.")
+            return
+        if not screen:
+            self.status_var.set("Pick a screenshot path first (a template needs a screen).")
+            return
+        try:
+            threshold = float(self.automation_threshold_var.get() or 0.9)
+        except ValueError:
+            self.status_var.set("Threshold must be a number like 0.90.")
+            return
+        self._run_async(
+            "Locate template",
+            lambda: self.controller.automation_locate_text(screen, template, threshold),
+            self._automation_report,
+        )
+
+    def _automation_browser_wait(self) -> None:
+        selector = self.automation_selector_var.get().strip()
+        if not selector:
+            self.status_var.set("Enter a CSS selector to wait for.")
+            return
+        try:
+            timeout = int(self.automation_timeout_var.get() or 20)
+        except ValueError:
+            self.status_var.set("Timeout must be whole seconds between 1 and 120.")
+            return
+        payload = {"selector": selector, "timeout_seconds": timeout}
+        self._run_async(
+            "Browser wait",
+            lambda: self.controller.browser_wait(payload),
+            lambda result: self._automation_report(
+                f"matched={result.get('matched')} attempts={result.get('attempts')} "
+                f"waited_ms={result.get('waited_ms')} url={result.get('url')}"
+            ),
+        )
+
+    def _automation_report(self, message: str) -> None:
+        self.automation_output_text.delete("1.0", "end")
+        self.automation_output_text.insert("1.0", message)
+        self._refresh_automation()
+
+    def _refresh_voice(self) -> None:
+        self._run_async("Refresh voice", self.controller.voice_status, self._apply_voice_status)
+
+    def _apply_voice_status(self, status: dict[str, Any]) -> None:
+        microphone = status["microphone"]
+        self.voice_status_var.set(
+            "Microphone "
+            + str(microphone["indicator"])
+            + " | STT "
+            + (status["stt"]["engine"] or "unavailable")
+            + " | TTS "
+            + (status["tts"]["engine"] or "unavailable")
+            + " | devices in/out "
+            + f"{status['input_devices']['count']}/{status['output_devices']['count']}"
+        )
+        self.voice_enabled_var.set(bool(microphone["enabled"]))
+        self.voice_wake_var.set(bool(microphone["wake_word_enabled"]))
+        notes = [microphone["backend_reason"]] if microphone["backend_reason"] else []
+        if not status["stt"]["available"] and status["stt"]["reason"]:
+            notes.append("STT: " + status["stt"]["reason"])
+        if not status["tts"]["available"] and status["tts"]["reason"]:
+            notes.append("TTS: " + status["tts"]["reason"])
+        if status["emergency_stop"]:
+            notes.append("Emergency stop is ENGAGED: voice is blocked.")
+        self.voice_output_text.delete("1.0", "end")
+        self.voice_output_text.insert(
+            "1.0", "\n".join(notes) if notes else "Voice pipeline ready."
+        )
+        self.voice_privacy_var.set(self.controller.voice_privacy_text())
+
+    def _voice_toggle_enabled(self) -> None:
+        wanted = bool(self.voice_enabled_var.get())
+        self._run_async(
+            "Microphone consent",
+            lambda: self.controller.voice_set_enabled(wanted),
+            self._voice_report,
+        )
+
+    def _voice_toggle_wake_word(self) -> None:
+        wanted = bool(self.voice_wake_var.get())
+        self._run_async(
+            "Wake word",
+            lambda: self.controller.voice_set_wake_word(wanted),
+            self._voice_report,
+        )
+
+    def _voice_start(self) -> None:
+        self._run_async("Start capture", self.controller.voice_capture_start, self._voice_report)
+
+    def _voice_stop(self) -> None:
+        self._run_async(
+            "Stop capture", self.controller.voice_capture_stop, self._voice_report
+        )
+
+    def _voice_cancel(self) -> None:
+        self._run_async("Cancel capture", self.controller.voice_capture_cancel, self._voice_report)
+
+    def _voice_purge(self) -> None:
+        self._run_async("Purge audio", self.controller.voice_purge_audio, self._voice_report)
+
+    def _voice_speak(self) -> None:
+        text = self.voice_speak_var.get().strip()
+        if not text:
+            self._voice_report("Type something to speak first.")
+            return
+        self._run_async(
+            "Speak", lambda: self.controller.voice_speak(text), self._voice_report
+        )
+
+    def _voice_report(self, message: str) -> None:
+        self.voice_output_text.delete("1.0", "end")
+        self.voice_output_text.insert("1.0", str(message))
+        self._refresh_voice()
+
+    def _build_agents_tab(self) -> None:
+        tab = self.agents_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(3, weight=1)
+
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(top, text="Refresh Agents", command=self._refresh_agents).pack(
+            side="left"
+        )
+        self.agents_stats_var = tk.StringVar(value="Agents: loading...")
+        ttk.Label(top, textvariable=self.agents_stats_var).pack(side="left", padx=(10, 0))
+
+        self.agents_tree = ttk.Treeview(
+            tab,
+            columns=("name", "role", "tools", "state"),
+            show="headings",
+            selectmode="browse",
+            height=7,
+        )
+        self.agents_tree.heading("name", text="Agent")
+        self.agents_tree.heading("role", text="Role")
+        self.agents_tree.heading("tools", text="Tools")
+        self.agents_tree.heading("state", text="State")
+        self.agents_tree.column("name", width=170)
+        self.agents_tree.column("role", width=170)
+        self.agents_tree.column("tools", width=60, stretch=False)
+        self.agents_tree.column("state", width=110, stretch=False)
+        self.agents_tree.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        self.agents_tree.bind("<<TreeviewSelect>>", self._agent_selected)
+
+        editor = ttk.LabelFrame(
+            tab, text="Agent Studio", style="Section.TLabelframe", padding=8
+        )
+        editor.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        editor.columnconfigure(1, weight=1)
+        editor.columnconfigure(3, weight=1)
+        ttk.Label(editor, text="Name:").grid(row=0, column=0, sticky="w")
+        self.agent_name_var = tk.StringVar()
+        ttk.Entry(editor, textvariable=self.agent_name_var).grid(
+            row=0, column=1, sticky="ew", padx=6
+        )
+        ttk.Label(editor, text="Role:").grid(row=0, column=2, sticky="w")
+        self.agent_role_var = tk.StringVar()
+        ttk.Entry(editor, textvariable=self.agent_role_var).grid(
+            row=0, column=3, sticky="ew", padx=6
+        )
+        ttk.Label(editor, text="Tools (comma list or *):").grid(
+            row=1, column=0, sticky="w", pady=(6, 0)
+        )
+        self.agent_tools_var = tk.StringVar()
+        ttk.Entry(editor, textvariable=self.agent_tools_var).grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=(6, 0)
+        )
+        ttk.Label(editor, text="System prompt:").grid(
+            row=2, column=0, sticky="w", pady=(6, 0)
+        )
+        self.agent_prompt_var = tk.StringVar()
+        ttk.Entry(editor, textvariable=self.agent_prompt_var).grid(
+            row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=(6, 0)
+        )
+        buttons = ttk.Frame(editor)
+        buttons.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Button(buttons, text="Save agent", command=self._agent_save).pack(side="left")
+        ttk.Button(
+            buttons, text="Enable/Disable", command=self._agent_toggle
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons, text="Delete custom", command=self._agent_delete).pack(
+            side="left", padx=(6, 0)
+        )
+        self.agent_ai_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            buttons, text="AI planning (persona)", variable=self.agent_ai_var
+        ).pack(side="left", padx=(12, 0))
+
+        runner = ttk.Frame(editor)
+        runner.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        runner.columnconfigure(1, weight=1)
+        ttk.Label(runner, text="Instruction / team goal:").grid(row=0, column=0, sticky="w")
+        self.agent_instruction_var = tk.StringVar()
+        ttk.Entry(runner, textvariable=self.agent_instruction_var).grid(
+            row=0, column=1, sticky="ew", padx=6
+        )
+        ttk.Button(runner, text="Run agent", command=self._agent_run).grid(row=0, column=2)
+        ttk.Button(runner, text="Run team", command=self._agent_team).grid(
+            row=0, column=3, padx=(6, 0)
+        )
+        ttk.Button(runner, text="Recent runs", command=self._agent_runs).grid(
+            row=0, column=4, padx=(6, 0)
+        )
+
+        self.agents_output_text = self._make_text(tab, height=9, width=90)
+        self.agents_output_text.grid(row=3, column=0, sticky="nsew")
+        self._agents_cache: dict[str, Any] = {}
+
+    def _refresh_agents(self) -> None:
+        self._run_async(
+            "Refresh agents", self.controller.agents_list, self._populate_agents
+        )
+
+    def _populate_agents(self, agents: list[Any]) -> None:
+        self._agents_cache = {agent["name"]: agent for agent in agents}
+        for item in self.agents_tree.get_children():
+            self.agents_tree.delete(item)
+        for agent in agents:
+            state = "enabled" if agent["enabled"] else "disabled"
+            if agent["builtin"]:
+                state += " · builtin"
+            self.agents_tree.insert(
+                "",
+                "end",
+                iid=agent["name"],
+                values=(
+                    agent["name"],
+                    agent["role"],
+                    len(agent["allowed_tools"]),
+                    state,
+                ),
+            )
+        self.agents_stats_var.set(self.controller.agents_stats_text())
+
+    def _agent_selected(self, _event: Any = None) -> None:
+        selection = self.agents_tree.selection()
+        if not selection:
+            return
+        agent = self._agents_cache.get(selection[0])
+        if agent is None:
+            return
+        self.agent_name_var.set(agent["name"])
+        self.agent_role_var.set(agent["role"])
+        self.agent_tools_var.set(", ".join(agent["allowed_tools"]))
+        self.agent_prompt_var.set(agent["system_prompt"])
+
+    def _selected_agent_name(self) -> str:
+        selection = self.agents_tree.selection()
+        if selection:
+            return selection[0]
+        return self.agent_name_var.get().strip()
+
+    def _agent_save(self) -> None:
+        payload = {
+            "name": self.agent_name_var.get().strip(),
+            "role": self.agent_role_var.get().strip(),
+            "system_prompt": self.agent_prompt_var.get(),
+            "allowed_tools": self.agent_tools_var.get(),
+        }
+        if not payload["name"]:
+            self._set_text(self.agents_output_text, "Give the agent a name first.")
+            return
+        self._run_async(
+            "Save agent",
+            lambda: self.controller.agent_save(payload),
+            lambda saved: (
+                self._set_text(
+                    self.agents_output_text,
+                    f"Saved agent {saved['name']} with "
+                    f"{len(saved['allowed_tools'])} tool(s).",
+                ),
+                self._refresh_agents(),
+            ),
+        )
+
+    def _agent_toggle(self) -> None:
+        name = self._selected_agent_name()
+        agent = self._agents_cache.get(name)
+        if agent is None:
+            self._set_text(self.agents_output_text, "Select an agent first.")
+            return
+        self._run_async(
+            "Toggle agent",
+            lambda: self.controller.agent_set_enabled(name, not agent["enabled"]),
+            lambda saved: (
+                self._set_text(
+                    self.agents_output_text,
+                    f"Agent {saved['name']}: enabled={saved['enabled']}",
+                ),
+                self._refresh_agents(),
+            ),
+        )
+
+    def _agent_delete(self) -> None:
+        name = self._selected_agent_name()
+        if not name:
+            self._set_text(self.agents_output_text, "Select an agent first.")
+            return
+        self._run_async(
+            "Delete agent",
+            lambda: self.controller.agent_delete(name),
+            lambda deleted: (
+                self._set_text(
+                    self.agents_output_text, f"Deleted agent {deleted['deleted']}."
+                ),
+                self._refresh_agents(),
+            ),
+        )
+
+    def _agent_run(self) -> None:
+        name = self._selected_agent_name()
+        instruction = self.agent_instruction_var.get().strip()
+        if not name or not instruction:
+            self._set_text(
+                self.agents_output_text, "Select an agent and type an instruction."
+            )
+            return
+        self._run_async(
+            f"Run agent {name}",
+            lambda: self.controller.agent_run_text(
+                name, instruction, use_ai=bool(self.agent_ai_var.get())
+            ),
+            lambda text: self._set_text(self.agents_output_text, text),
+        )
+
+    def _agent_team(self) -> None:
+        goal = self.agent_instruction_var.get().strip()
+        if not goal:
+            self._set_text(self.agents_output_text, "Type a team goal first.")
+            return
+        self._run_async(
+            "Run agent team",
+            lambda: self.controller.agent_team_text(
+                goal, use_ai=bool(self.agent_ai_var.get())
+            ),
+            lambda text: self._set_text(self.agents_output_text, text),
+        )
+
+    def _agent_runs(self) -> None:
+        self._run_async(
+            "Agent runs",
+            self.controller.agent_runs_text,
+            lambda text: self._set_text(self.agents_output_text, text),
+        )
+
+    def _build_knowledge_tab(self) -> None:
+        tab = self.knowledge_tab
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+        tab.rowconfigure(3, weight=1)
+
+        top = ttk.Frame(tab)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Button(
+            top, text="Refresh Knowledge", command=self._refresh_knowledge
+        ).pack(side="left")
+        self.knowledge_stats_var = tk.StringVar(value="Knowledge: loading...")
+        ttk.Label(top, textvariable=self.knowledge_stats_var).pack(
+            side="left", padx=(10, 0)
+        )
+
+        self.knowledge_tree = ttk.Treeview(
+            tab,
+            columns=("id", "title", "kind", "chunks", "source"),
+            show="headings",
+            selectmode="browse",
+            height=7,
+        )
+        self.knowledge_tree.heading("id", text="ID")
+        self.knowledge_tree.heading("title", text="Title")
+        self.knowledge_tree.heading("kind", text="Kind")
+        self.knowledge_tree.heading("chunks", text="Chunks")
+        self.knowledge_tree.heading("source", text="Source")
+        self.knowledge_tree.column("id", width=45, stretch=False)
+        self.knowledge_tree.column("title", width=320)
+        self.knowledge_tree.column("kind", width=70, stretch=False)
+        self.knowledge_tree.column("chunks", width=65, stretch=False)
+        self.knowledge_tree.column("source", width=220)
+        self.knowledge_tree.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+
+        ingest = ttk.LabelFrame(
+            tab, text="Ingest / Search / Ask", style="Section.TLabelframe", padding=8
+        )
+        ingest.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        ingest.columnconfigure(1, weight=1)
+        ttk.Label(ingest, text="Workspace file:").grid(row=0, column=0, sticky="w")
+        self.knowledge_path_var = tk.StringVar()
+        ttk.Entry(ingest, textvariable=self.knowledge_path_var).grid(
+            row=0, column=1, sticky="ew", padx=6
+        )
+        ttk.Button(ingest, text="Ingest", command=self._knowledge_ingest).grid(
+            row=0, column=2
+        )
+        ttk.Button(
+            ingest, text="Remove selected", command=self._knowledge_remove
+        ).grid(row=0, column=3, padx=(6, 0))
+        ttk.Label(ingest, text="Query / question:").grid(row=1, column=0, sticky="w")
+        self.knowledge_query_var = tk.StringVar()
+        ttk.Entry(ingest, textvariable=self.knowledge_query_var).grid(
+            row=1, column=1, sticky="ew", padx=6, pady=(6, 0)
+        )
+        ttk.Button(ingest, text="Search", command=self._knowledge_search).grid(
+            row=1, column=2, pady=(6, 0)
+        )
+        ttk.Button(ingest, text="Ask (RAG)", command=self._knowledge_ask).grid(
+            row=1, column=3, padx=(6, 0), pady=(6, 0)
+        )
+
+        self.knowledge_output_text = self._make_text(tab, height=10, width=90)
+        self.knowledge_output_text.grid(row=3, column=0, sticky="nsew")
+
+    def _refresh_knowledge(self) -> None:
+        self._run_async(
+            "Refresh knowledge",
+            self.controller.knowledge_documents,
+            self._populate_knowledge,
+        )
+
+    def _populate_knowledge(self, documents: list[Any]) -> None:
+        for item in self.knowledge_tree.get_children():
+            self.knowledge_tree.delete(item)
+        for document in documents:
+            self.knowledge_tree.insert(
+                "",
+                "end",
+                iid=str(document["id"]),
+                values=(
+                    document["id"],
+                    document["title"],
+                    document["kind"],
+                    document["chunk_count"],
+                    document["source_name"],
+                ),
+            )
+        self.knowledge_stats_var.set(self.controller.knowledge_stats_text())
+
+    def _knowledge_ingest(self) -> None:
+        raw_path = self.knowledge_path_var.get().strip()
+        if not raw_path:
+            self._set_text(
+                self.knowledge_output_text,
+                "Type a workspace-relative file path first (for example notes.md).",
+            )
+            return
+        self._run_async(
+            "Ingest knowledge document",
+            lambda: self.controller.knowledge_ingest(raw_path),
+            lambda result: (
+                self._set_text(
+                    self.knowledge_output_text,
+                    f"Ingested #{result['id']}: {result['title']} "
+                    f"(chunks={result['chunk_count']}, "
+                    f"already_ingested={result.get('already_ingested')})",
+                ),
+                self._refresh_knowledge(),
+            ),
+        )
+
+    def _knowledge_remove(self) -> None:
+        selection = self.knowledge_tree.selection()
+        if not selection:
+            self._set_text(
+                self.knowledge_output_text, "Select a document in the list first."
+            )
+            return
+        document_id = int(selection[0])
+        self._run_async(
+            "Remove knowledge document",
+            lambda: self.controller.knowledge_remove(document_id),
+            lambda result: (
+                self._set_text(
+                    self.knowledge_output_text,
+                    f"Removed knowledge document #{result['removed']}: {result['title']}",
+                ),
+                self._refresh_knowledge(),
+            ),
+        )
+
+    def _knowledge_search(self) -> None:
+        query = self.knowledge_query_var.get().strip()
+        if not query:
+            self._set_text(self.knowledge_output_text, "Type a search query first.")
+            return
+        self._run_async(
+            "Search knowledge",
+            lambda: self.controller.knowledge_search_text(query),
+            lambda text: self._set_text(self.knowledge_output_text, text),
+        )
+
+    def _knowledge_ask(self) -> None:
+        question = self.knowledge_query_var.get().strip()
+        if not question:
+            self._set_text(self.knowledge_output_text, "Type a question first.")
+            return
+        self._run_async(
+            "Ask knowledge (RAG)",
+            lambda: self.controller.knowledge_ask_text(question),
+            lambda text: self._set_text(self.knowledge_output_text, text),
+        )
+
     def _build_providers_tab(self) -> None:
         tab = self.providers_tab
         tab.columnconfigure(0, weight=1)
@@ -1613,6 +3833,9 @@ class PcAgentGuiApp:
         ttk.Button(
             top, text="Refresh Providers", command=self._refresh_providers
         ).pack(side="left")
+        ttk.Button(
+            top, text="Run Provider Evaluations", command=self._run_provider_evaluations
+        ).pack(side="left", padx=(8, 0))
         ttk.Label(
             top, text="Keys are never displayed or edited in the GUI."
         ).pack(side="left", padx=(10, 0))
@@ -1860,6 +4083,11 @@ class PcAgentGuiApp:
             self._populate_providers(providers)
 
         self._run_async("Load dashboard", load, done)
+        # Voice state is loaded once at startup too: the microphone indicator
+        # must reflect persisted consent immediately, never a default guess.
+        self.root.after(400, self._refresh_voice)
+        self.root.after(700, self._refresh_automation)
+        self.root.after(900, self._refresh_flows)
 
     def _refresh_doctor(self) -> None:
         self._run_async(
@@ -2126,15 +4354,16 @@ class PcAgentGuiApp:
             )
 
         self._run_async(
-            "Show Windows auto-upgrade schedule",
+            "Show auto-upgrade schedule",
             self.controller.auto_upgrade_schedule_status,
             done,
         )
 
     def _install_auto_upgrade_schedule(self) -> None:
         if not messagebox.askokcancel(
-            "Install Windows auto-upgrade schedule",
-            "Register the per-user Windows Scheduled Task?\n\n"
+            "Install auto-upgrade schedule",
+            "Register the per-user operating-system schedule?\n\n"
+            "Windows uses Scheduled Task; Linux uses a systemd user timer.\n"
             "It wakes at logon and hourly, but the worker itself enforces "
             ".env opt-in, signed HTTPS, interval, maintenance-window, "
             "active-task, idle and AC-power gates.",
@@ -2148,15 +4377,15 @@ class PcAgentGuiApp:
             )
 
         self._run_async(
-            "Install Windows auto-upgrade schedule",
+            "Install auto-upgrade schedule",
             self.controller.install_auto_upgrade_schedule,
             done,
         )
 
     def _uninstall_auto_upgrade_schedule(self) -> None:
         if not messagebox.askokcancel(
-            "Remove Windows auto-upgrade schedule",
-            "Remove the Windows Scheduled Task? Existing state, reports, "
+            "Remove auto-upgrade schedule",
+            "Remove the operating-system auto-upgrade schedule? Existing state, reports, "
             "staged updates and .env settings are kept.",
             parent=self.root,
         ):
@@ -2168,7 +4397,7 @@ class PcAgentGuiApp:
             )
 
         self._run_async(
-            "Remove Windows auto-upgrade schedule",
+            "Remove auto-upgrade schedule",
             self.controller.uninstall_auto_upgrade_schedule,
             done,
         )
@@ -3719,6 +5948,28 @@ class PcAgentGuiApp:
             lambda result: self._show_tool_result(self.tool_output_text, result),
         )
 
+    def _run_provider_evaluations(self) -> None:
+        self._run_async(
+            "Run provider evaluations",
+            self.controller.run_provider_evaluations,
+            self._show_provider_evaluations,
+        )
+
+    def _show_provider_evaluations(self, report: dict[str, Any]) -> None:
+        lines = [
+            (
+                f"Evaluations: {report.get('passed')}/{report.get('total')} passed "
+                f"(route: {' -> '.join(report.get('route') or [])})"
+            )
+        ]
+        for case in report.get("cases") or []:
+            state = "PASS" if case.get("passed") else "FAIL"
+            lines.append(
+                f"[{state}] {case.get('id')}: {case.get('latency_ms')}ms "
+                f"via {case.get('provider')}/{case.get('model')} - {case.get('detail')}"
+            )
+        self._set_text(self.provider_output_text, "\n".join(lines))
+
     def _refresh_providers(self) -> None:
         self._run_async(
             "Refresh providers",
@@ -3743,7 +5994,10 @@ class PcAgentGuiApp:
                 ),
             )
         self._set_text(
-            self.provider_output_text, format_provider_statuses(statuses)
+            self.provider_output_text,
+            self.controller.provider_platform_summary()
+            + "\n\n"
+            + format_provider_statuses(statuses),
         )
 
     def _ask_provider(self) -> None:

@@ -52,11 +52,15 @@ when every local gate passes:
 
 - local time is inside the optional maintenance window;
 - no task is in `planning`, `running`, `verifying` or `retrying` state;
-- Windows Last Input Info reports at least the configured idle minutes;
-- Windows reports AC power when `PC_AGENT_AUTO_UPGRADE_REQUIRE_AC_POWER=1`;
+- the operating-system idle sensor reports at least the configured idle
+  minutes (Windows Last Input Info, or Linux logind since Phase 60);
+- the operating-system power sensor reports AC power when
+  `PC_AGENT_AUTO_UPGRADE_REQUIRE_AC_POWER=1` (Windows power status, or
+  Linux power-supply/logind state since Phase 60);
 - the staged receipt says `signature_status=verified` with the configured key.
 
-Unknown idle/power state on Windows defers application. If a verified update
+Unknown required idle/power state defers application on every platform.
+If a verified update
 is already staged, later hourly wake-ups re-check the gates before making a
 new network request. Application uses the existing backed-up apply path and
 sets `restart_required=true` in state/report evidence.
@@ -188,3 +192,20 @@ persistent lock file could be locked at its EOF byte and then incorrectly
 unlocked at byte 0, raising `PermissionError` on a later run. Phase 58
 normalizes Windows `msvcrt.locking` to byte 0 for both operations and adds
 an offset-faithful regression. See `docs/phase58.md`.
+
+## Phase 59 follow-up — **Linux systemd-user Auto-Upgrade Scheduler**
+
+Phase 59 later implements this document's reserved Linux profile with a
+per-user systemd one-shot service and hourly persistent timer behind the
+same direct CLI/GUI schedule controls. The signed worker policy is
+unchanged; Linux `stage-only` is functional, while Linux
+`apply-when-idle` remains conservative until its sensor readings are
+available. The macOS LaunchAgent remains planned. See
+`docs/phase59.md`.
+
+## Phase 60 follow-up — **Linux Idle and AC Power Sensors**
+
+Phase 60 implements Linux idle readings from systemd-logind interactive
+sessions and AC readings from `/sys/class/power_supply` with logind's
+external-power fallback. Unknown required readings now defer on every
+platform. See `docs/phase60.md`.

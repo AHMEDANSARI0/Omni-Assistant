@@ -407,8 +407,8 @@ def test_cli_doctor_reports_phase7_memory(
 ) -> None:
     assert main(["--root", str(tmp_path), "doctor"]) == 0
     out = capsys.readouterr().out
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in out
-    assert "schema v6" in out
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in out
+    assert "schema v18" in out
     assert "Memory: preferences=0" in out
 
 
@@ -442,7 +442,7 @@ def test_gui_controller_cancel_details_and_resume_queued(tmp_path: Path) -> None
     assert resumed.success, resumed.error
 
 
-def test_schema_v5_upgrades_to_v6_without_losing_task(
+def test_schema_v5_upgrades_to_latest_without_losing_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = Database(tmp_path / "data" / "upgrade.db")
@@ -452,7 +452,7 @@ def test_schema_v5_upgrades_to_v6_without_losing_task(
     created = TaskRepository(database).create(Task(instruction="Keep me"))
 
     monkeypatch.setattr(db_module, "_MIGRATIONS", original)
-    assert database.initialize() == 6
+    assert database.initialize() == 18
     assert TaskRepository(database).get(created.id) is not None
     execution = ExecutionRepository(database)
     assert execution.count_checkpoints() == 0

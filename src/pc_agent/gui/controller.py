@@ -26,12 +26,13 @@ from ..auto_upgrade import (
     AutoUpgradeRunReport,
     AutoUpgradeSchedulerResult,
     AutoUpgradeStatus,
+    get_auto_upgrade_schedule,
     get_auto_upgrade_status,
-    get_windows_auto_upgrade_schedule,
-    install_windows_auto_upgrade_schedule,
+    install_auto_upgrade_schedule,
     run_auto_upgrade,
-    uninstall_windows_auto_upgrade_schedule,
+    uninstall_auto_upgrade_schedule,
 )
+from ..baseline import TRANSFORMATION_LABEL
 from ..browser_cdp import probe_browser
 from ..config import Settings
 from ..credentials import CredentialStore, build_credential_store
@@ -52,6 +53,7 @@ from ..documents.pdf_trust import validate_pdf_signature_trust
 from ..domain.task import Task, TaskStatus
 from ..errors import ApprovalUnavailableError, PcAgentError, ToolError
 from ..http_tls import tls_trust_info
+from ..knowledge import KnowledgeError
 from ..licensing import (
     FEATURE_CORE_RECOVERY,
     FEATURE_CORE_TASKS,
@@ -64,6 +66,7 @@ from ..licensing import (
     LicenseStatus,
 )
 from ..maintenance import DatabaseMaintenanceService
+from ..missions import MissionRunner, execution_levels
 from ..online_updates import (
     DownloadedUpdate,
     OnlineStageResult,
@@ -79,6 +82,14 @@ from ..orchestrator import (
     TaskOrchestrator,
 )
 from ..planning import DeterministicPlanner, PlannerOptions
+from ..provider_platform import (
+    capability_catalog,
+    load_latest_evaluation,
+    load_usage_records,
+    provider_platform_line,
+    run_evaluations,
+    usage_stats,
+)
 from ..providers import (
     CompletionRequest,
     ProviderStatus,
@@ -88,14 +99,17 @@ from ..providers import (
 from ..providers.router import RoutedCompletion
 from ..recovery import RecoveryOutcome, RecoveryScan, RecoveryService, TaskDiagnosis
 from ..release import ReleaseAudit, audit_install
+from ..safety import EmergencyStop
 from ..self_repair import SelfRepairDiagnosis, SelfRepairService
 from ..storage.db import Database
 from ..storage.repositories import (
     ApprovalRecord,
     DynamicToolRecord,
     DynamicToolRepository,
+    EventRepository,
     ExecutionRepository,
     MemoryRepository,
+    MissionRepository,
     PreferenceRepository,
     RecoveryAttemptRecord,
     RecoveryLinkRecord,
@@ -106,6 +120,7 @@ from ..storage.repositories import (
     TaskVerificationRecord,
     ToolInvocationRecord,
 )
+from ..system_monitor import SystemMonitor, system_summary_line
 from ..tooling.service import build_runtime_registry
 from ..tools import RegisteredTool, ToolContext, ToolResult, build_default_registry
 from ..updates import (
@@ -168,6 +183,9 @@ class DoctorSummary:
     self_repair_enabled: bool = False
     self_repair_summary: str = ""
     task_budgets_summary: str = ""
+    safety_summary: str = ""
+    service_summary: str = ""
+    mission_summary: str = ""
     release_audit_summary: str = ""
     database_backup_summary: str = ""
     signed_updates_summary: str = ""
@@ -192,10 +210,7 @@ class DoctorSummary:
         )
         return "\n".join(
             [
-                (
-                    f"Self-Healing PC Agent {self.version} "
-                    "(PHASE 58 Windows Auto-Upgrade Lock Hotfix)"
-                ),
+                f"Self-Healing PC Agent {self.version} ({TRANSFORMATION_LABEL})",
                 f"Python: {self.python_version}",
                 f"Environment: {self.environment}",
                 f"Root: {self.root}",
@@ -210,6 +225,9 @@ class DoctorSummary:
                     f"sources={self.provider_credential_sources}"
                 ),
                 f"Task budgets: {self.task_budgets_summary}",
+                f"Safety kernel: {self.safety_summary}",
+                f"Local service: {self.service_summary}",
+                f"Mission center: {self.mission_summary}",
                 (
                     "Self-repair: "
                     f"{'enabled' if self.self_repair_enabled else 'disabled'}; "
@@ -391,6 +409,53 @@ class WebFetchOutcome:
     saved_path: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CommandCenterOverview:
+    """Real live state for the Phase 5 Command Center tab."""
+
+    tasks_total: int
+    tasks_running: int
+    tasks_succeeded: int
+    tasks_failed: int
+    missions_total: int
+    missions_running: int
+    events_total: int
+    pending_approvals: int
+    schedules_enabled: int
+    emergency_stop: str
+    api_line: str
+
+    def to_text(self) -> str:
+        return (
+            f"Tasks: {self.tasks_total} (running {self.tasks_running}, "
+            f"succeeded {self.tasks_succeeded}, failed {self.tasks_failed})   "
+            f"Missions: {self.missions_total} (running {self.missions_running})   "
+            f"Events: {self.events_total}   Pending approvals: {self.pending_approvals}   "
+            f"Schedules on: {self.schedules_enabled}\n"
+            f"Emergency stop: {self.emergency_stop}\n"
+            f"Local API: {self.api_line}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MissionRow:
+    id: str
+    name: str
+    status: str
+    total: int
+    succeeded: int
+    failed: int
+    active: int
+
+
+@dataclass(frozen=True, slots=True)
+class MissionDetail:
+    id: str
+    name: str
+    status: str
+    text: str
+
+
 @dataclass(eq=False, slots=True)
 class ApprovalTicket:
     request: ApprovalRequest
@@ -472,6 +537,9 @@ class GuiController:
         self._memory = MemoryRepository(self.database)
         self._preferences = PreferenceRepository(self.database)
         self._cancel_event = threading.Event()
+        self._system_monitor = SystemMonitor(
+            root_dir=settings.root_dir, workspace_dir=settings.workspace_dir
+        )
         self._active_task_id: str | None = None
         self._router = build_model_router(settings)
         self._licenses = LicenseService(settings, self.database)
@@ -604,6 +672,9 @@ class GuiController:
             self_repair_enabled=self.settings.allow_self_repair,
             self_repair_summary=self.self_repair_summary(),
             task_budgets_summary=self.task_budgets_summary(),
+            safety_summary=self.safety_summary(),
+            service_summary=self.service_summary(),
+            mission_summary=self.mission_summary(),
             release_audit_summary=self.release_audit().summary(),
             database_backup_summary=self.database_backup_summary(),
             signed_updates_summary=self.signed_updates_summary(),
@@ -620,6 +691,212 @@ class GuiController:
             f"tools={settings.task_tool_budget}, steps={settings.task_step_budget}, "
             f"time={settings.task_time_budget_seconds:.0f}s"
         )
+
+    def safety_summary(self) -> str:
+        settings = self.settings
+        return (
+            f"hard_timeouts={'on' if settings.safety_hard_timeouts else 'OFF'}, "
+            f"worker_isolation={'on' if settings.safety_worker_isolation else 'off'}, "
+            f"max_tool_seconds={settings.safety_max_tool_seconds:g}, "
+            f"{EmergencyStop(settings.data_dir).status().summary()}, "
+            f"pending_approvals={self._execution.pending_approval_center_count()}"
+        )
+
+    def service_summary(self) -> str:
+        settings = self.settings
+        return (
+            f"api={'enabled' if settings.api_enabled else 'disabled'} "
+            f"http://{settings.api_host}:{settings.api_port} (loopback), "
+            f"log_format={settings.log_format}, "
+            f"profile={settings.active_profile or 'none'}, "
+            f"events={EventRepository(self.database).count()}"
+        )
+
+    def mission_summary(self) -> str:
+        settings = self.settings
+        repository = MissionRepository(self.database)
+        return (
+            f"missions={repository.count_missions()}, "
+            f"max_parallel={settings.mission_max_parallel}, "
+            f"schedules={repository.count_schedules()} "
+            f"(enabled={repository.count_schedules(enabled_only=True)})"
+        )
+
+    # -- Command Center (Transformation Phase 5) ------------------------------
+    def command_center_overview(self) -> CommandCenterOverview:
+        missions = MissionRepository(self.database)
+        running = sum(
+            self._tasks.count(status=status)
+            for status in (
+                TaskStatus.RUNNING,
+                TaskStatus.PLANNING,
+                TaskStatus.VERIFYING,
+                TaskStatus.RETRYING,
+            )
+        )
+        mission_rows = missions.list_missions(limit=200)
+        return CommandCenterOverview(
+            tasks_total=self._tasks.count(),
+            tasks_running=running,
+            tasks_succeeded=self._tasks.count(status=TaskStatus.SUCCEEDED),
+            tasks_failed=self._tasks.count(status=TaskStatus.FAILED),
+            missions_total=len(mission_rows),
+            missions_running=sum(1 for row in mission_rows if row.status == "running"),
+            events_total=EventRepository(self.database).count(),
+            pending_approvals=self._execution.pending_approval_center_count(),
+            schedules_enabled=missions.count_schedules(enabled_only=True),
+            emergency_stop=EmergencyStop(self.settings.data_dir).status().summary(),
+            api_line=(
+                f"{'enabled' if self.settings.api_enabled else 'disabled'} "
+                f"http://{self.settings.api_host}:{self.settings.api_port}/ (loopback)"
+            ),
+        )
+
+    def list_mission_rows(self, *, limit: int = 100) -> list[MissionRow]:
+        missions = MissionRepository(self.database)
+        rows: list[MissionRow] = []
+        for mission in missions.list_missions(limit=limit):
+            statuses = []
+            for task_id in missions.list_task_ids(mission.id):
+                task = self._tasks.get(task_id)
+                if task is not None:
+                    statuses.append(task.status)
+            rows.append(
+                MissionRow(
+                    id=mission.id,
+                    name=mission.name,
+                    status=mission.status,
+                    total=len(statuses),
+                    succeeded=sum(1 for s in statuses if s is TaskStatus.SUCCEEDED),
+                    failed=sum(
+                        1
+                        for s in statuses
+                        if s in {TaskStatus.FAILED, TaskStatus.NEEDS_INPUT}
+                    ),
+                    active=sum(
+                        1
+                        for s in statuses
+                        if s
+                        in {
+                            TaskStatus.RUNNING,
+                            TaskStatus.PLANNING,
+                            TaskStatus.VERIFYING,
+                            TaskStatus.RETRYING,
+                        }
+                    ),
+                )
+            )
+        return rows
+
+    def mission_detail(self, mission_id: str) -> MissionDetail:
+        missions = MissionRepository(self.database)
+        mission = missions.get_mission(mission_id)
+        if mission is None:
+            raise PcAgentError(f"Mission not found: {mission_id}")
+        task_ids = missions.list_task_ids(mission.id)
+        dependencies = missions.list_dependencies(mission.id)
+        lines = [f"Mission {mission.id} [{mission.status}] {mission.name}"]
+        for task_id in task_ids:
+            task = self._tasks.get(task_id)
+            if task is None:
+                continue
+            deps = ", ".join(dep[:8] for dep in dependencies.get(task_id, [])) or "-"
+            lines.append(
+                f"- {task_id[:8]} [{task.status.value}] after={deps} {task.instruction}"
+            )
+        try:
+            levels = execution_levels(task_ids, dependencies)
+        except PcAgentError:
+            levels = []
+        if levels:
+            lines.append("Execution graph levels:")
+            for index, level in enumerate(levels):
+                lines.append(
+                    f"  level {index}: {', '.join(item[:8] for item in level)}"
+                )
+        return MissionDetail(
+            id=mission.id, name=mission.name, status=mission.status, text="\n".join(lines)
+        )
+
+    def run_mission(self, mission_id: str, *, use_ai: bool = False) -> MissionDetail:
+        """Blocking mission run for GUI worker threads (real Safety Kernel)."""
+        cancel_event = getattr(self, "_mission_cancel_event", None)
+        if cancel_event is None:
+            cancel_event = threading.Event()
+            self._mission_cancel_event = cancel_event
+        cancel_event.clear()
+        runner = MissionRunner(
+            settings=self.settings,
+            database=self.database,
+            emit=lambda event_type, **kwargs: EventRepository(self.database).record(
+                event_type,
+                source=str(kwargs.get("source", "gui")),
+                summary=str(kwargs.get("summary", "")),
+                task_id=kwargs.get("task_id"),
+                payload=kwargs.get("payload"),
+            ),
+        )
+        runner.run(mission_id, use_ai=use_ai, cancel_event=cancel_event, source="gui")
+        return self.mission_detail(mission_id)
+
+    def cancel_mission(self, mission_id: str) -> MissionDetail:
+        cancel_event = getattr(self, "_mission_cancel_event", None)
+        if cancel_event is not None:
+            cancel_event.set()
+        missions = MissionRepository(self.database)
+        for task_id in missions.list_task_ids(mission_id):
+            task = self._tasks.get(task_id)
+            if task is not None and not task.is_terminal:
+                try:
+                    self._orchestrator.request_cancellation(
+                        task_id, reason="Mission cancelled from the GUI."
+                    )
+                except PcAgentError:
+                    pass
+        mission = missions.get_mission(mission_id)
+        if mission is not None and mission.status == "draft":
+            missions.update_mission_status(mission_id, "cancelled")
+        return self.mission_detail(mission_id)
+
+    def pending_approval_center_requests(self, *, limit: int = 50):
+        return self._execution.list_approval_center_requests(
+            status="pending", limit=limit
+        )
+
+    def decide_approval_center(self, request_key: str, *, approve: bool) -> str:
+        decided = self._execution.decide_approval_center_request(
+            request_key, approve=approve, decided_by="gui"
+        )
+        return f"Approval Center request {decided.request_key} {decided.status}."
+
+    def system_status_text(self) -> str:
+        return system_summary_line(self._system_monitor.snapshot())
+
+    def emergency_stop_status_text(self) -> str:
+        return EmergencyStop(self.settings.data_dir).status().summary()
+
+    def set_emergency_stop(self, *, engaged: bool, reason: str = "") -> str:
+        stop = EmergencyStop(self.settings.data_dir)
+        events = EventRepository(self.database)
+        if engaged:
+            state = stop.engage(reason=reason or "Engaged from the GUI.", engaged_by="gui")
+            events.record(
+                "safety.emergency_stop_engaged",
+                source="gui",
+                summary=f"Emergency stop engaged from GUI: {reason[:140]}",
+            )
+        else:
+            state = stop.clear(cleared_by="gui")
+            events.record(
+                "safety.emergency_stop_released",
+                source="gui",
+                summary="Emergency stop cleared from GUI.",
+            )
+        return state.summary()
+
+    def events_since(self, cursor: int, *, limit: int = 100):
+        events = EventRepository(self.database).list(since_id=cursor, limit=limit)
+        return events, (events[-1].id if events else cursor)
 
     def _self_repair_service(self) -> SelfRepairService:
         return SelfRepairService(self.settings.root_dir, self.settings.data_dir)
@@ -776,13 +1053,13 @@ class GuiController:
         return run_auto_upgrade(self.settings, force=True)
 
     def auto_upgrade_schedule_status(self) -> AutoUpgradeSchedulerResult:
-        return get_windows_auto_upgrade_schedule()
+        return get_auto_upgrade_schedule()
 
     def install_auto_upgrade_schedule(self) -> AutoUpgradeSchedulerResult:
-        return install_windows_auto_upgrade_schedule(self.settings)
+        return install_auto_upgrade_schedule(self.settings)
 
     def uninstall_auto_upgrade_schedule(self) -> AutoUpgradeSchedulerResult:
-        return uninstall_windows_auto_upgrade_schedule()
+        return uninstall_auto_upgrade_schedule()
 
     def database_backup_summary(self) -> str:
         backups = DatabaseMaintenanceService(
@@ -866,6 +1143,1033 @@ class GuiController:
             system_instruction=system_instruction.strip() if system_instruction else None,
         )
         return self._router.complete(request, allow_fallback=allow_fallback)
+
+    def provider_platform_summary(self) -> str:
+        lines = [
+            "Provider Platform v2: " + provider_platform_line(self.settings, self._router)
+        ]
+        for row in capability_catalog(self.settings, self._router):
+            flags = [
+                label
+                for label, active in (
+                    ("local", row["local"]),
+                    ("streaming", row["streaming"]),
+                    ("vision", row["vision"]),
+                    ("priced", row["priced"]),
+                )
+                if active
+            ]
+            lines.append(
+                f"  {row['provider']}/{row['model']}: {', '.join(flags) or 'remote'}"
+            )
+        stats = usage_stats(load_usage_records(self.settings))
+        for row in stats["by_model"]:
+            lines.append(
+                f"  usage {row['provider']}/{row['model']}: calls={row['calls']} "
+                f"median={row['median_latency_ms']}ms"
+            )
+        evaluation = load_latest_evaluation(self.settings)
+        if evaluation:
+            lines.append(
+                f"  latest evaluation: {evaluation.get('passed')}/"
+                f"{evaluation.get('total')} passed"
+            )
+        return "\n".join(lines)
+
+    def run_provider_evaluations(self) -> dict[str, Any]:
+        self._require_license(FEATURE_PROVIDERS)
+        return run_evaluations(self.settings, self._router)
+
+    # -- Agent Studio & multi-agent runtime (Transformation Phase 9) ---------
+    def _agent_studio(self) -> Any:
+        from ..agents import AgentStudio
+
+        return AgentStudio(self.settings, self.database, router=self._router)
+
+    def agents_list(self) -> list[dict[str, Any]]:
+        return list(self._agent_studio().list_agents()["agents"])
+
+    def agent_save(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from ..errors import AgentError
+
+        try:
+            return self._agent_studio().save_agent(payload)
+        except AgentError as exc:
+            raise PcAgentError(str(exc)) from exc
+
+    def agent_set_enabled(self, name: str, enabled: bool) -> dict[str, Any]:
+        from ..errors import AgentError
+
+        try:
+            return self._agent_studio().set_agent_enabled(name, enabled)
+        except AgentError as exc:
+            raise PcAgentError(str(exc)) from exc
+
+    def agent_delete(self, name: str) -> dict[str, Any]:
+        from ..errors import AgentError
+
+        try:
+            return self._agent_studio().delete_agent(name)
+        except AgentError as exc:
+            raise PcAgentError(str(exc)) from exc
+
+    def agent_run_text(self, name: str, instruction: str, *, use_ai: bool) -> str:
+        from ..errors import AgentError
+
+        if use_ai:
+            self._require_license(FEATURE_PROVIDERS)
+        try:
+            result = self._agent_studio().run_agent(
+                name,
+                instruction,
+                use_ai=use_ai,
+                approval_callback=self._approval_callback,
+            )
+        except AgentError as exc:
+            raise PcAgentError(str(exc)) from exc
+        return (
+            f"Agent {result['agent']} run #{result['run_id']}: {result['status']}"
+            f" (task {result['task_id']})\n{result['summary']}"
+        )
+
+    def agent_team_text(self, goal: str, *, use_ai: bool) -> str:
+        from ..errors import AgentError
+
+        # Coordinator decomposition (and optional AI planning) uses providers.
+        self._require_license(FEATURE_PROVIDERS)
+        try:
+            result = self._agent_studio().run_team(
+                goal,
+                use_ai=use_ai,
+                approval_callback=self._approval_callback,
+            )
+        except AgentError as exc:
+            raise PcAgentError(str(exc)) from exc
+        lines = [
+            (
+                f"Team {result['team_run_id']}: "
+                f"{result['succeeded']}/{result['total']} succeeded"
+            )
+        ]
+        lines.extend(
+            f"  {item['agent']}: {item['status']} - {item['summary'][:160]}"
+            for item in result["results"]
+        )
+        return "\n".join(lines)
+
+    def agent_runs_text(self, limit: int = 20) -> str:
+        runs = self._agent_studio().list_runs(limit=limit)["runs"]
+        if not runs:
+            return "No agent runs yet."
+        return "\n".join(
+            f"#{run['id']} {run['agent']} [{run['status']}] "
+            f"{run['instruction'][:70]}"
+            + (f" (team {run['team_run_id']})" if run["team_run_id"] else "")
+            for run in runs
+        )
+
+    def agents_stats_text(self) -> str:
+        stats = self._agent_studio().stats()
+        return (
+            f"agents={stats['agents']} enabled={stats['agents_enabled']} "
+            f"runs={stats['agent_runs']}"
+        )
+
+    # -- Visual Workflow Builder (Transformation Phase 12) -------------------
+    def _flow_service(self) -> Any:
+        from ..service import LocalService
+
+        service = getattr(self, "_flows_service_cache", None)
+        if service is None:
+            service = LocalService(self.settings)
+            self._flows_service_cache = service
+        return service
+
+    def flows_summary_text(self) -> str:
+        from ..diagnostics import flows_summary_line
+
+        return flows_summary_line(self.settings, self.database)
+
+    def flows_list(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self._flow_service().list_flows(limit=limit)["flows"]
+
+    def flow_show_text(self, reference: str) -> str:
+        payload = self._flow_service().get_flow(reference)
+        edges = payload["flow"]["edges"]
+        header = (
+            f"{payload['name']} v{payload['version']} "
+            f"({'enabled' if payload['enabled'] else 'DISABLED'}) "
+            f"levels={len(payload['levels'])}"
+        )
+        lines = [header]
+        for node in payload["flow"]["nodes"]:
+            after = [edge["from"] for edge in edges if edge["to"] == node["id"]]
+            lines.append(
+                f"  {node['id']}: {node['title'] or '(no title)'} "
+                f"after={after or 'none'} -> {node['instruction'][:70]}"
+            )
+        for trigger in payload["triggers"]:
+            lines.append(
+                f"  trigger {trigger['id'][:8]} {trigger['kind']} "
+                f"enabled={trigger['enabled']} next={trigger['next_run_at'] or '-'}"
+            )
+        for run in payload["runs"][:5]:
+            lines.append(
+                f"  run {run['id'][:8]} {run['status']} via {run['trigger_kind']}"
+            )
+        return "\n".join(lines)
+
+    def flow_validate(self, document: str) -> str:
+        from ..errors import FlowError
+
+        del FlowError
+        payload = self._flow_document(document)
+        result = self._flow_service().validate_flow(payload)
+        return (
+            f"valid: {result['name']} with {len(result['nodes'])} node(s); "
+            f"levels={result['levels']}"
+        )
+
+    def flow_save(self, document: str, *, reference: str = "") -> str:
+        payload = self._flow_document(document)
+        service = self._flow_service()
+        if reference.strip():
+            saved = service.update_flow(reference.strip(), payload)
+            return f"updated {saved['name']} to v{saved['version']}"
+        saved = service.create_flow(payload)
+        return f"created {saved['name']} v{saved['version']}"
+
+    def flow_run(self, reference: str) -> str:
+        result = self._flow_service().run_flow(reference.strip())
+        return (
+            f"started mission {result['mission_id']} for "
+            f"{result['flow']['name']} v{result['flow']['version']} "
+            f"(levels={result['levels']})"
+        )
+
+    # -- accessibility / i18n (Transformation Phase 17) ----------------------
+    def production_report(self) -> dict[str, Any]:
+        """The stored end-to-end release-chain report, or an empty state."""
+
+        from ..production_check import stored_production_report
+
+        stored = stored_production_report(self.settings)
+        if stored is None:
+            return {
+                "ok": False,
+                "failures": 0,
+                "steps": [],
+                "version": self.settings_identity_version(),
+                "environment": {},
+            }
+        return stored
+
+    def production_check(self) -> dict[str, Any]:
+        """Run the real release chain check (build, verify, sign, apply, rollback)."""
+
+        from ..production_check import run_production_check
+
+        return run_production_check(self.settings).to_dict()
+
+    def settings_identity_version(self) -> str:
+        from .. import __version__
+
+        return __version__
+
+    def a11y_report(self) -> dict[str, Any]:
+        from ..a11y import a11y_status
+
+        return a11y_status(self.settings)
+
+    def a11y_check_text(self) -> str:
+        report = self.a11y_report()
+        contrast = report["contrast"]
+        checks = [
+            ("language_supported", report["locale"] in report["supported_locales"]),
+            ("coverage_complete", report["coverage"]["percent"] >= 100.0),
+            ("contrast_aa", contrast["passing"] == contrast["total"]),
+            ("text_scale_in_range", 0.8 <= report["scale"] <= 2.0),
+            ("direction_declared", report["direction"] in {"ltr", "rtl"}),
+            ("keyboard_shortcuts_documented", len(report["shortcuts"]) >= 4),
+            ("limits_disclosed", len(report["limitations"]) >= 3),
+        ]
+        lines = ["Accessibility check (measured, not asserted):"]
+        for name, passes in checks:
+            lines.append(f"  [{'PASS' if passes else 'FAIL'}] {name}")
+        failed = [name for name, passes in checks if not passes]
+        lines.append("")
+        lines.append(
+            "result: " + ("all checks pass" if not failed else "failures: " + ", ".join(failed))
+        )
+        lines.append("")
+        lines.append("Known limits:")
+        for limitation in report["limitations"]:
+            lines.append(f"  - {limitation}")
+        return "\n".join(lines)
+
+    def a11y_apply(
+        self,
+        *,
+        locale: str,
+        scale: float,
+        high_contrast: bool,
+        reduce_motion: bool,
+    ) -> str:
+        from ..service import LocalService
+
+        result = LocalService(self.settings).i18n_set(
+            locale=locale,
+            scale=scale,
+            high_contrast=high_contrast,
+            reduce_motion=reduce_motion,
+        )
+        changed = ", ".join(f"{key}={value}" for key, value in sorted(result["saved"].items()))
+        return f"saved {changed}"
+
+    def i18n_status_text(self) -> str:
+        from ..i18n import Translator
+
+        translator = Translator(self.settings.ui_locale)
+        return (
+            f"language {translator.locale} ({translator.language_name}) "
+            f"direction {translator.direction} "
+            f"coverage {translator.coverage()['percent']}%"
+        )
+
+    # -- sync (Transformation Phase 16) -------------------------------------
+    def _sync_service(self) -> Any:
+        from ..service import LocalService
+
+        service = getattr(self, "_sync_service_cache", None)
+        if service is None:
+            service = LocalService(self.settings)
+            self._sync_service_cache = service
+        return service
+
+    def sync_status_text(self) -> str:
+        from ..diagnostics import sync_summary_line
+
+        return sync_summary_line(self.settings, self.database)
+
+    def sync_status(self) -> dict[str, Any]:
+        return self._sync_service().sync_status()
+
+    def sync_identity_text(self) -> str:
+        payload = self._sync_service().sync_identity()
+        return (
+            f"device id {payload['device_id']}\nfingerprint {payload['fingerprint']}\n"
+            f"sign (Ed25519) {payload['sign_public']}\n"
+            f"encrypt (X25519) {payload['encrypt_public']}"
+        )
+
+    def sync_overview_text(self) -> str:
+        service = self._sync_service()
+        status = service.sync_status()
+        lines = [
+            (
+                f"device {status['device']['device_id'][:12]} ({status['device_name']}) "
+                f"fp={status['device']['fingerprint']}"
+            ),
+            (
+                f"transport {status['transport']} dir={status['sync_dir'] or 'none'} "
+                f"({status['sync_dir_state']}) policy={status['conflict_policy']}"
+            ),
+        ]
+        peers = service.sync_peers()["peers"]
+        lines.append(f"peers: {len(peers)}")
+        for peer in peers:
+            lines.append(
+                f"  {peer['device_id'][:12]} {peer['name']} [{peer['status']}] "
+                f"bundles={peer['bundle_count']}"
+            )
+        bundles = service.sync_bundles(limit=6)["bundles"]
+        lines.append(f"bundles: {len(bundles)} recent")
+        for entry in bundles:
+            lines.append(
+                f"  {entry['created_at'][:19]} {entry['direction']} {entry['status']} "
+                f"seq={entry['seq']} records={entry['record_count']}"
+            )
+        pending = service.sync_requests(status="pending", limit=10)["requests"]
+        lines.append(f"pending coordination requests: {len(pending)}")
+        for item in pending:
+            body = item.get("payload") or {}
+            lines.append(
+                f"  {item['id'][:12]} {item['kind']} from {item['device'][:10]} "
+                f"{str(body.get('title', ''))[:44]}"
+            )
+        return "\n".join(lines)
+
+    def sync_pair(self, name: str, sign_public: str, encrypt_public: str) -> str:
+        payload = self._sync_service().sync_pair(
+            name=name.strip(),
+            sign_public=sign_public.strip(),
+            encrypt_public=encrypt_public.strip(),
+            confirm="PAIR",
+        )
+        return f"paired {payload['name']} ({payload['device_id'][:12]})"
+
+    def sync_export(self) -> str:
+        payload = self._sync_service().sync_export()
+        return (
+            f"exported {payload['records']} record(s), {payload['size_bytes']} bytes "
+            f"for {len(payload['recipients'])} device(s)"
+        )
+
+    def sync_import(self, path: str) -> str:
+        payload = self._sync_service().sync_import(path.strip())
+        return (
+            f"imported seq {payload['seq']}: applied={payload['applied']} "
+            f"skipped={payload['skipped']} conflicts={len(payload['conflicts'])}"
+        )
+
+    def sync_tick(self) -> str:
+        payload = self._sync_service().sync_tick()
+        return (
+            f"exported 1 bundle; imported={len(payload['imported'])} "
+            f"refused={len(payload['refused'])}"
+        )
+
+    def sync_decide(self, request_id: str, accept: bool) -> str:
+        payload = self._sync_service().sync_decide(request_id.strip(), accept=accept)
+        return f"{payload['request']['id'][:12]} {payload['status']}: {payload['detail']}"
+
+    # -- plugins (Transformation Phase 15) ----------------------------------
+    def _plugin_service(self) -> Any:
+        from ..service import LocalService
+
+        service = getattr(self, "_plugin_service_cache", None)
+        if service is None:
+            service = LocalService(self.settings)
+            self._plugin_service_cache = service
+        return service
+
+    def plugins_status_text(self) -> str:
+        from ..diagnostics import plugins_summary_line
+
+        return plugins_summary_line(self.settings, self.database)
+
+    def plugins_status(self) -> dict[str, Any]:
+        return self._plugin_service().plugin_status()
+
+    def plugins_list_text(self) -> str:
+        payload = self._plugin_service().plugins()
+        if not payload["plugins"]:
+            return "No plugins installed. Verify and install a signed .zip bundle."
+        return "\n".join(
+            f"{entry['id']:<26} {entry['version']:<9} {entry['status']:<9} "
+            f"tools={len(entry['tools'])} skills={len(entry['skills'])} "
+            f"key={entry['signature_key'] or 'unsigned'}"
+            for entry in payload["plugins"]
+        )
+
+    def plugin_verify(self, bundle: str) -> str:
+        payload = self._plugin_service().plugin_verify(bundle.strip())
+        manifest = payload["manifest"]
+        return (
+            f"{manifest['name']} {manifest['version']}: files={payload['file_count']} "
+            f"signature={payload['signature_status']} "
+            f"key={payload['signature_key'] or '-'}"
+        )
+
+    def plugin_install(self, bundle: str) -> str:
+        payload = self._plugin_service().plugin_install(bundle.strip())
+        return (
+            f"installed {payload['name']} {payload['version']} "
+            f"({payload['signature_status']}); enable it to run tools"
+        )
+
+    def plugin_set_enabled(self, reference: str, enabled: bool) -> str:
+        payload = self._plugin_service().plugin_set_enabled(
+            reference.strip(), enabled=enabled
+        )
+        return f"{payload['id']} is now {payload['status']}"
+
+    def plugin_uninstall(self, reference: str) -> str:
+        payload = self._plugin_service().plugin_uninstall(reference.strip())
+        return f"removed {payload['name']}; {payload['total']} plugin(s) remain"
+
+    def plugin_rollback(self, reference: str, version: str | None = None) -> str:
+        payload = self._plugin_service().plugin_rollback(
+            reference.strip(), version=version
+        )
+        return f"{payload['id']} rolled back to {payload['version']}"
+
+    def plugin_run(self, reference: str, tool: str, arguments: str = "{}") -> str:
+        from ..errors import PluginError
+
+        try:
+            values = json.loads(arguments or "{}")
+        except ValueError as exc:
+            raise PluginError("Tool arguments must be a JSON object.") from exc
+        if not isinstance(values, dict):
+            raise PluginError("Tool arguments must be a JSON object.")
+        plugin_id = reference.strip()
+        payload = self._plugin_service().plugin_run_tool(
+            plugin_id, tool.strip(), values=values, confirm=plugin_id
+        )
+        lines = [
+            "{} in {}ms ({})".format(
+                payload["status"],
+                payload["duration_ms"],
+                payload["sandbox"]["mechanism"],
+            )
+        ]
+        if payload["detail"]:
+            lines.append(f"  {payload['detail']}")
+        if payload["result"] is not None:
+            lines.append(f"  {json.dumps(payload['result'], default=str)[:2000]}")
+        return "\n".join(lines)
+
+    def plugin_skills(self, reference: str) -> str:
+        payload = self._plugin_service().plugin_skills(reference.strip())
+        if not payload["skills"]:
+            return "This plugin ships no skills."
+        return "\n\n".join(
+            f"--- {item['path']} ---\n{item['text']}" for item in payload["skills"]
+        )
+
+    def plugin_runs_text(self, limit: int = 20) -> str:
+        payload = self._plugin_service().plugin_runs(limit=limit)
+        if not payload["runs"]:
+            return "No plugin runs recorded yet."
+        return "\n".join(
+            f"{item['created_at'][:19]} {item['plugin_id']:<24} {item['tool']:<18} "
+            f"{item['status']:<8} {item['duration_ms']}ms"
+            + (f" - {item['detail']}" if item["detail"] else "")
+            for item in payload["runs"]
+        )
+
+    # -- proactive (Transformation Phase 14) --------------------------------
+    def _proactive_service(self) -> Any:
+        from ..service import LocalService
+
+        service = getattr(self, "_proactive_service_cache", None)
+        if service is None:
+            service = LocalService(self.settings)
+            self._proactive_service_cache = service
+        return service
+
+    def proactive_status_text(self) -> str:
+        from ..diagnostics import proactive_summary_line
+
+        return proactive_summary_line(self.settings, self.database)
+
+    def proactive_status(self) -> dict[str, Any]:
+        return self._proactive_service().proactive_status()
+
+    def proactive_reminders_text(self, limit: int = 20) -> str:
+        rows = self._proactive_service().reminders(limit=limit)["reminders"]
+        if not rows:
+            return "No reminders stored yet."
+        return "\n".join(
+            f"{item['id'][:8]} {item['status']:<9} {item['due_at'][:19]} "
+            f"{item['severity']:<8} {item['title'][:46]}"
+            + (f" (x{item['fired_count']})" if item["fired_count"] else "")
+            for item in rows
+        )
+
+    def proactive_notifications_text(self, limit: int = 15) -> str:
+        rows = self._proactive_service().notifications(limit=limit)["notifications"]
+        if not rows:
+            return "No notifications recorded yet."
+        return "\n".join(
+            f"{item['created_at'][:19]} {item['kind']:<9} {item['status']:<9} "
+            f"{item['title'][:44]}" + (f" - {item['detail']}" if item["detail"] else "")
+            for item in rows
+        )
+
+    def add_reminder(self, title: str, due: str, severity: str = "normal") -> str:
+        payload = self._proactive_service().add_reminder(
+            title=title.strip(), due=due.strip(), severity=severity, source="gui"
+        )
+        return (
+            f"reminder {payload['id'][:8]} '{payload['title']}' due "
+            f"{payload['due_at'][:19]} ({payload['severity']})"
+        )
+
+    def resolve_reminder(self, reference: str) -> str:
+        payload = self._proactive_service().resolve_reminder(reference.strip(), source="gui")
+        return f"{payload['id'][:8]} {payload['status']}"
+
+    def snooze_reminder(self, reference: str, for_spec: str = "+15m") -> str:
+        payload = self._proactive_service().snooze_reminder(
+            reference.strip(), for_spec=for_spec.strip() or "+15m"
+        )
+        return f"{payload['id'][:8]} snoozed to {payload['due_at'][:19]}"
+
+    def delete_reminder(self, reference: str) -> str:
+        payload = self._proactive_service().delete_reminder(reference.strip())
+        return f"deleted reminder {payload['reminder_id'][:8]}"
+
+    def proactive_tick(self) -> str:
+        payload = self._proactive_service().proactive_tick(source="gui")
+        lines = [f"delivered {payload['total']}, deferred {len(payload['deferred'])}"]
+        for item in payload["fired"]:
+            lines.append(f"  fired: {item['reminder']['title']}")
+        for item in payload["deferred"]:
+            lines.append(f"  deferred: {item['title']} - {item['reason']}")
+        briefing = payload.get("briefing")
+        if isinstance(briefing, dict) and "briefing" in briefing:
+            lines.append(f"  briefing: {briefing['briefing']['item_count']} item(s)")
+        return "\n".join(lines)
+
+    def run_briefing(self, force: bool = True) -> str:
+        payload = self._proactive_service().run_briefing(force=force, source="gui")
+        briefing = payload["briefing"]
+        body = [f"briefing {briefing['local_date']} ({briefing['item_count']} item(s))"]
+        body += [
+            f"  {name}: {section.get('summary', '')}"
+            for name, section in payload["sections"].items()
+        ]
+        return "\n".join(body)
+
+    def notify_user(self, title: str, body: str, severity: str = "normal") -> str:
+        payload = self._proactive_service().notify_user(
+            title=title.strip(),
+            body=body.strip(),
+            kind="manual",
+            severity=severity,
+            source="gui",
+        )
+        return f"{payload['status']} [{payload['channels']}] {payload['title']}"
+
+    # -- connectors (Transformation Phase 13) --------------------------------
+    def _connector_service(self) -> Any:
+        from ..service import LocalService
+
+        service = getattr(self, "_connectors_service_cache", None)
+        if service is None:
+            service = LocalService(self.settings)
+            self._connectors_service_cache = service
+        return service
+
+    def connectors_status_text(self) -> str:
+        from ..diagnostics import connectors_summary_line
+
+        return connectors_summary_line(self.settings, self.database)
+
+    def connectors_status(self, *, probe: bool = False) -> dict[str, Any]:
+        return self._connector_service().connector_status(probe=probe)
+
+    def connectors_events_text(self, limit: int = 15) -> str:
+        rows = self._connector_service().connector_events(limit=limit)["events"]
+        if not rows:
+            return "No connector events recorded yet."
+        return "\n".join(
+            f"{item['received_at'][:19]} {item['connector']:<9} {item['kind']:<12} "
+            f"{item['summary'][:60]}"
+            for item in rows
+        )
+
+    def connectors_deliveries_text(self, limit: int = 10) -> str:
+        rows = self._connector_service().connector_deliveries(limit=limit)["deliveries"]
+        if not rows:
+            return "No connector deliveries recorded yet."
+        return "\n".join(
+            f"{item['created_at'][:19]} {item['connector']:<9} {item['status']:<7} "
+            f"{item['payload_bytes']}B {item['target'][:40]}"
+            for item in rows
+        )
+
+    def add_calendar_event(self, summary: str, start: str) -> str:
+        payload = self._connector_service().connector_calendar_add(
+            summary=summary.strip(), start=start.strip()
+        )
+        event = payload["event"]
+        return f"added '{event['summary']}' at {event['start']} (uid {event['uid'][:16]})"
+
+    def connector_drive_sync(self) -> str:
+        payload = self._connector_service().connector_drive_sync()
+        return (
+            f"{payload['files']} file(s) indexed, {payload['total_bytes']} bytes; "
+            f"added={payload['added']} modified={payload['modified']} "
+            f"removed={payload['removed']} skipped={payload['skipped']}"
+            + (" (truncated)" if payload["truncated"] else "")
+        )
+
+    def connector_mail_inbox(self, limit: int = 5) -> str:
+        payload = self._connector_service().connector_mail_inbox(limit=limit)
+        messages = payload["messages"]
+        if not messages:
+            return "The mailbox returned no message headers."
+        return "\n".join(
+            f"{message['date'][:28]:<28} {message['from'][:30]:<30} "
+            f"{message['subject'][:50]}"
+            for message in messages
+        )
+
+    def connector_chat_send(self, text: str) -> str:
+        payload = self._connector_service().connector_chat_send(text)
+        result = payload["result"]
+        return (
+            f"{'delivered' if result['ok'] else 'failed'} "
+            f"HTTP {result['status_code']} {result['payload_bytes']}B "
+            f"{result['duration_ms']}ms -> {result['target']}"
+        )
+
+    def connector_webhook_receive(self, body_file: Any, timestamp: str, signature: str) -> str:
+        from pathlib import Path as _Path
+
+        body = _Path(body_file).expanduser().read_bytes()
+        payload = self._connector_service().connector_webhook_receive(
+            body, timestamp=timestamp.strip(), signature=signature.strip()
+        )
+        receipt = payload["receipt"]
+        if not receipt["accepted"]:
+            return f"refused: {receipt['reason']}"
+        return (
+            f"accepted {receipt['kind']} event "
+            f"{receipt['external_id'] or '(no id)'}: {receipt['summary'][:60]}"
+        )
+
+    def connectors_calendar_text(self, days: int = 7) -> str:
+        payload = self._connector_service().connector_calendar_events(days_ahead=days)
+        events = payload["events"]
+        if not events:
+            return f"No events in the next {payload['days_ahead']} day(s)."
+        return "\n".join(
+            f"{event['start'][:16]} -> {event['end'][11:16]} {event['summary'][:60]}"
+            for event in events
+        )
+
+    def flow_tick(self) -> str:
+        result = self._flow_service().flow_tick(limit=10)
+        return (
+            f"fired {result['total']} trigger(s); "
+            f"skipped {len(result['skipped'])}"
+        )
+
+    def flow_export_text(self, reference: str) -> str:
+        import json as _json
+
+        return _json.dumps(
+            self._flow_service().export_flow(reference.strip()), indent=2, sort_keys=True
+        )
+
+    def flow_import(self, document: str) -> str:
+        import json as _json
+
+        try:
+            payload = _json.loads(document)
+        except ValueError as exc:
+            from ..errors import FlowError
+
+            raise FlowError(f"That is not valid JSON: {exc}") from exc
+        if isinstance(payload, dict) and "flow" in payload:
+            result = self._flow_service().import_flow(payload, overwrite=True)
+            return (
+                f"imported {result['flow']['name']} v{result['flow']['version']} "
+                f"with {len(result['triggers'])} trigger(s)"
+            )
+        return self.flow_save(document)
+
+    def flow_runs(self, reference: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        return self._flow_service().flow_runs(reference or None, limit=limit)["runs"]
+
+    def flow_add_trigger(
+        self, reference: str, *, kind: str, interval_seconds: int | None = None,
+        event_type: str = "",
+    ) -> str:
+        payload = self._flow_service().flow_add_trigger(
+            reference.strip(),
+            {"kind": kind, "interval_seconds": interval_seconds, "event_type": event_type},
+        )
+        return f"trigger {payload['id'][:8]} {payload['kind']} added (next {payload['next_run_at'] or '-'})"
+
+    def _flow_document(self, document: str) -> dict[str, Any]:
+        import json as _json
+
+        from ..errors import FlowError
+
+        text = (document or "").strip()
+        if not text:
+            raise FlowError("Paste a flow JSON document first.")
+        try:
+            payload = _json.loads(text)
+        except ValueError as exc:
+            raise FlowError(f"That is not valid JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise FlowError("The flow document must be a JSON object.")
+        return payload
+
+    # -- automation ledger + local vision (Transformation Phase 11) ----------
+    def _automation_recorder(self, payload: dict[str, Any]) -> None:
+        try:
+            self._automation_repository().record(**payload)
+        except Exception:  # noqa: BLE001 - the ledger must never break an action
+            return
+
+    def _automation_repository(self) -> Any:
+        from ..storage.repositories import AutomationRepository
+
+        return AutomationRepository(self.database)
+
+    def automation_capabilities(self) -> dict[str, Any]:
+        from ..browser_cdp import probe_browser
+        from ..desktop_automation import probe_desktop_automation
+        from ..tools.builtins import build_default_registry
+
+        version = probe_browser(port=self.settings.browser_port)
+        registry = build_default_registry()
+        return {
+            "browser": {
+                "enabled": bool(self.settings.allow_browser),
+                "port": self.settings.browser_port,
+                "connected": version is not None,
+                "browser": str(version.get("Browser") or "") if version else "",
+            },
+            "desktop": {
+                "enabled": bool(self.settings.allow_desktop_automation),
+                **probe_desktop_automation(),
+            },
+            "vision": {
+                "local_analysis": True,
+                "provider_vision_enabled": bool(self.settings.allow_vision),
+            },
+            "tools": [
+                tool.spec.id
+                for tool in registry.list_tools()
+                if tool.spec.id.startswith(("browser.", "desktop.", "vision."))
+            ],
+        }
+
+    def automation_capabilities_text(self) -> str:
+        caps = self.automation_capabilities()
+        summary = self._automation_repository().summary()
+        by_kind = ", ".join(
+            f"{kind}={count}" for kind, count in sorted(summary["by_kind"].items())
+        ) or "none"
+        return (
+            f"browser={'on' if caps['browser']['enabled'] else 'off'}"
+            f" ({caps['browser']['browser'] or 'no debug browser'}) | "
+            f"desktop={'on' if caps['desktop']['enabled'] else 'off'}"
+            f" | provider vision={'on' if caps['vision']['provider_vision_enabled'] else 'off'}"
+            f" | local vision=available | tools={len(caps['tools'])} | "
+            f"ledger: total={summary['total']} ({by_kind}) refused={summary['refused']}"
+        )
+
+    def automation_runs(self, limit: int = 25) -> list[dict[str, Any]]:
+        runs = self._automation_repository().list_runs(limit=limit)
+        return [
+            {
+                "id": run.id,
+                "kind": run.kind,
+                "tool_id": run.tool_id,
+                "action": run.action,
+                "target": run.target,
+                "status": run.status,
+                "allowed": run.allowed,
+                "detail": run.detail,
+                "created_at": run.created_at.isoformat(),
+            }
+            for run in runs
+        ]
+
+    def automation_screen_text(self, path: str, grid: int = 4) -> str:
+
+        arguments: dict[str, Any] = {"grid": max(1, min(int(grid), 12))}
+        if path.strip():
+            arguments["path"] = path.strip()
+        result = self._invoke_builtin("vision.screen", arguments)
+        if not result.success:
+            raise PcAgentError(result.error or "Screen analysis failed.")
+        output = result.output or {}
+        return (
+            f"{output.get('width')}x{output.get('height')} from {output.get('source')} "
+            f"(brightness {output.get('brightness')}, contrast {output.get('contrast')}, "
+            f"text_likely={output.get('text_likely')})\n{output.get('region_hint')}"
+        )
+
+    def automation_locate_text(
+        self, screen_path: str, template_path: str, threshold: float = 0.9
+    ) -> str:
+        result = self._invoke_builtin(
+            "vision.locate",
+            {
+                "screen_path": screen_path.strip(),
+                "template_path": template_path.strip(),
+                "threshold": float(threshold),
+            },
+        )
+        if not result.success:
+            raise PcAgentError(result.error or "Template search failed.")
+        output = result.output or {}
+        if not output.get("found"):
+            return (
+                f"not found (best score {output.get('score')} below "
+                f"{output.get('threshold')})"
+            )
+        match = output["matches"][0]
+        return (
+            f"found at ({match['x']}, {match['y']}) "
+            f"{match['width']}x{match['height']} score={output['score']}"
+        )
+
+    # -- voice pipeline (Transformation Phase 10) ----------------------------
+    def _voice_service(self) -> Any:
+        from ..voice import VoiceService
+
+        return VoiceService(self.settings, self.database)
+
+    def voice_status(self) -> dict[str, Any]:
+        return self._voice_service().status().to_dict()
+
+    def voice_status_text(self) -> str:
+        return self._voice_service().status().summary_line()
+
+    def voice_devices_text(self) -> str:
+        devices = self._voice_service().devices()
+        lines: list[str] = []
+        for kind in ("input", "output"):
+            block = devices[kind]
+            lines.append(f"{kind} ({block['method']}): {block['count']}")
+            if block["reason"]:
+                lines.append(f"  {block['reason']}")
+            lines.extend(
+                f"  #{device['index']} {device['name']}"
+                + (" (default)" if device["is_default"] else "")
+                for device in block["devices"]
+            )
+        return "\n".join(lines)
+
+    def voice_set_enabled(self, enabled: bool) -> str:
+        service = self._voice_service()
+        payload = service.enable() if enabled else service.disable()
+        return f"microphone {payload['indicator']} (state={payload['state']})"
+
+    def voice_set_wake_word(self, enabled: bool) -> str:
+        payload = self._voice_service().set_wake_word(enabled)
+        return (
+            "wake word " + ("enabled" if payload["wake_word_enabled"] else "disabled")
+            + f" (indicator={payload['indicator']})"
+        )
+
+    def voice_capture_start(self) -> str:
+        payload = self._voice_service().start_capture()
+        return (
+            f"recording ({payload['mode']}; backend={payload['backend']}; "
+            f"max {payload['max_seconds']:g}s)"
+        )
+
+    def voice_capture_stop(self) -> str:
+        payload = self._voice_service().stop_capture()
+        if payload["text"]:
+            return (
+                f"transcript ({payload['engine']}): {payload['text']}\n"
+                f"audio {'retained' if payload['audio_retained'] else 'discarded'}"
+            )
+        return f"no transcript: {payload['error']}"
+
+    def voice_capture_cancel(self) -> str:
+        return "capture cancelled; microphone idle"
+
+    def voice_speak(self, text: str) -> str:
+        payload = self._voice_service().speak(text)
+        if payload["ok"]:
+            return f"spoke {payload['characters']} characters via {payload['engine']}"
+        return f"speech failed: {payload['error']}"
+
+    def voice_privacy_text(self) -> str:
+        payload = self._voice_service().privacy()
+        return (
+            f"microphone {payload['indicator']}; retention={payload['retention']}; "
+            f"transcripts={'stored' if payload['store_transcripts'] else 'not stored'}; "
+            f"cloud_stt={'allowed' if payload['cloud_stt_allowed'] else 'off'}; "
+            f"wake_word={'on' if payload['wake_word_enabled'] else 'off'}; "
+            f"max={payload['max_seconds']:g}s"
+        )
+
+    def voice_purge_audio(self) -> str:
+        payload = self._voice_service().purge_audio()
+        return f"purged {payload['removed']} recording(s)"
+
+    def voice_sessions_text(self, limit: int = 10) -> str:
+        rows = self._voice_service().sessions(limit)
+        if not rows:
+            return "No voice sessions yet."
+        return "\n".join(
+            f"#{row['id']} {row['mode']} {row['audio_seconds']}s "
+            f"{'kept' if row['audio_retained'] else 'discarded'} chars={row['transcript_chars']}"
+            for row in rows
+        )
+
+    # -- knowledge base & Memory v2 (Transformation Phase 8) ------------------
+    def _knowledge_service(self) -> Any:
+        from ..knowledge import KnowledgeService
+
+        return KnowledgeService(self.settings, self.database, router=self._router)
+
+    def knowledge_documents(self) -> list[dict[str, Any]]:
+        return list(self._knowledge_service().list_documents()["documents"])
+
+    def knowledge_ingest(self, raw_path: str) -> dict[str, Any]:
+        candidate = Path(raw_path.strip()).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.settings.workspace_dir / candidate
+        target = candidate.resolve()
+        workspace = self.settings.workspace_dir.resolve()
+        if not target.is_relative_to(workspace):
+            raise PcAgentError(
+                "Knowledge ingestion from the GUI is limited to files inside "
+                "the workspace."
+            )
+        try:
+            return self._knowledge_service().ingest_file(target)
+        except KnowledgeError as exc:
+            raise PcAgentError(str(exc)) from exc
+
+    def knowledge_remove(self, document_id: int) -> dict[str, Any]:
+        try:
+            return self._knowledge_service().remove_document(int(document_id))
+        except KnowledgeError as exc:
+            raise PcAgentError(str(exc)) from exc
+
+    def knowledge_search_text(self, query: str) -> str:
+        try:
+            payload = self._knowledge_service().search(query, limit=8)
+        except KnowledgeError as exc:
+            raise PcAgentError(str(exc)) from exc
+        lines = [
+            (
+                f"Search ({payload['mode']} via {payload['embedding_model']}): "
+                f"{payload['query']}"
+            )
+        ]
+        if not payload["results"]:
+            lines.append("No matches. Ingest a document or save a note first.")
+        for index, item in enumerate(payload["results"], start=1):
+            lines.append(
+                f"[S{index}] {item['source']} · {item['title']} "
+                f"(score {item['score']})\n{item['snippet']}"
+            )
+        return "\n\n".join(lines)
+
+    def knowledge_ask_text(self, question: str) -> str:
+        self._require_license(FEATURE_PROVIDERS)
+        try:
+            payload = self._knowledge_service().ask(question)
+        except KnowledgeError as exc:
+            raise PcAgentError(str(exc)) from exc
+        if payload.get("answer") is None:
+            return str(payload.get("note") or "No sources matched.")
+        sources = ", ".join(
+            f"[S{index}] {item['title']}"
+            for index, item in enumerate(payload["sources"], start=1)
+        )
+        return (
+            f"{payload['answer']}\n\nSources: {sources}\n"
+            f"Answered by {payload.get('provider')}/{payload.get('model')} "
+            f"grounded only in the sources above."
+        )
+
+    def knowledge_stats_text(self) -> str:
+        stats = self._knowledge_service().stats()
+        memories = stats["memories"]
+        return (
+            f"documents={stats['documents']} chunks={stats['chunks']} "
+            f"embeddings={stats['active_embedding_model']} "
+            f"notes={memories.get('note', 0)} embedded={stats['embedded_notes']}"
+        )
 
     # ------------------------------------------------------------------
     # Tasks and recovery
@@ -2133,8 +3437,10 @@ class GuiController:
             vision_allowed=self.settings.allow_vision,
             vision_max_image_bytes=self.settings.vision_max_image_bytes,
             vision_router_factory=lambda: self._router,
+            knowledge_service_factory=self._knowledge_service,
             command_allowlist=self.settings.command_allowlist,
             command_timeout_seconds=self.settings.command_timeout_seconds,
+            automation_recorder=self._automation_recorder,
         )
 
     def _invoke_builtin(
@@ -2146,8 +3452,10 @@ class GuiController:
                 self._require_license(FEATURE_PROVIDERS)
         elif tool_id.startswith("desktop."):
             self._require_license(FEATURE_DESKTOP)
-        elif tool_id.startswith("web."):
+        elif tool_id.startswith(("web.", "browser.")):
             self._require_license(FEATURE_WEB)
+        elif tool_id.startswith("vision."):
+            self._require_license(FEATURE_DESKTOP)
         return self._builtin_registry.invoke(
             tool_id, dict(arguments), self._context()
         )
@@ -2488,7 +3796,8 @@ def format_auto_upgrade_status(status: AutoUpgradeStatus) -> str:
     lines.append(f"State: {status.state_path}")
     if status.scheduler is not None:
         lines.append(
-            "Windows schedule: "
+            "OS schedule: "
+            f"profile={status.scheduler.profile}; "
             f"installed={status.scheduler.installed}; "
             f"task={status.scheduler.task_name}; "
             f"state={status.scheduler.state}"
@@ -2519,7 +3828,7 @@ def format_auto_upgrade_run(report: AutoUpgradeRunReport) -> str:
 
 
 def format_auto_upgrade_schedule(result: AutoUpgradeSchedulerResult) -> str:
-    lines = [f"Windows auto-upgrade schedule: {result.summary()}"]
+    lines = [f"Auto-upgrade schedule: {result.summary()}"]
     if result.executable:
         lines.append(f"Executable: {result.executable}")
     lines.append(result.detail)

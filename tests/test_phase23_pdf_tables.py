@@ -447,9 +447,9 @@ def test_pdf_table_direct_cli_and_gui_controller(
     )
     assert gui_result.success, gui_result.error
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.60.0"
-    assert summary.builtin_tools == 62
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
+    assert summary.version == __version__ == "0.81.2"
+    assert summary.builtin_tools == 69
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
 
 def test_phase23_scope_schema_and_release_candidates() -> None:
@@ -457,9 +457,9 @@ def test_phase23_scope_schema_and_release_candidates() -> None:
     candidates = {path.as_posix() for path in release_candidate_files(project_root)}
     tool_ids = {item.spec.id for item in build_default_registry().list_tools()}
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(tool_ids) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(tool_ids) == 69
     assert "pdf.extract_tables" in tool_ids
     assert "docs/phase23.md" in candidates
     assert "src/pc_agent/documents/pdf_tables.py" in candidates

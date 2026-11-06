@@ -2,10 +2,18 @@
 
 from .db import Database
 from .repositories import (
+    AgentDefinitionRecord,
+    AgentRepository,
+    AgentRunRecord,
     ApprovalRecord,
+    AutomationRepository,
+    AutomationRunRecord,
     DynamicToolRecord,
     DynamicToolRepository,
     ExecutionRepository,
+    KnowledgeChunkRecord,
+    KnowledgeDocumentRecord,
+    KnowledgeRepository,
     MemoryItemRecord,
     MemoryRepository,
     PreferenceRepository,
@@ -17,14 +25,24 @@ from .repositories import (
     TaskRepository,
     TaskVerificationRecord,
     ToolInvocationRecord,
+    VoiceRepository,
+    VoiceSessionRecord,
 )
 
 __all__ = [
+    "AgentDefinitionRecord",
+    "AgentRepository",
+    "AgentRunRecord",
     "ApprovalRecord",
+    "AutomationRepository",
+    "AutomationRunRecord",
     "Database",
     "DynamicToolRecord",
     "DynamicToolRepository",
     "ExecutionRepository",
+    "KnowledgeChunkRecord",
+    "KnowledgeDocumentRecord",
+    "KnowledgeRepository",
     "MemoryItemRecord",
     "MemoryRepository",
     "PreferenceRepository",
@@ -36,4 +54,6 @@ __all__ = [
     "TaskRepository",
     "TaskVerificationRecord",
     "ToolInvocationRecord",
+    "VoiceRepository",
+    "VoiceSessionRecord",
 ]

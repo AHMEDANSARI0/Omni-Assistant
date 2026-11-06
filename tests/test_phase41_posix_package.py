@@ -106,7 +106,7 @@ def test_phase41_builds_deterministic_executable_posix_package(
     first_info = verify_posix_package(first)
     second_info = verify_posix_package(second)
 
-    assert first_info.version == __version__ == "0.60.0"
+    assert first_info.version == __version__ == "0.81.2"
     assert first_info.file_count == first_info.payload_file_count + 4
     assert (
         first_info.manifest_sha256,
@@ -318,8 +318,8 @@ def test_phase41_shell_install_and_uninstall_preserve_user_files(
 def test_phase41_direct_release_cli_build_verify_and_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert len(build_default_registry().list_tools()) == 62
-    assert LATEST_SCHEMA_VERSION == 6
+    assert len(build_default_registry().list_tools()) == 69
+    assert LATEST_SCHEMA_VERSION == 18
     parser = build_parser()
     settings = Settings(
         root_dir=ROOT,

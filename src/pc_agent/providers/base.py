@@ -12,7 +12,7 @@ import base64
 import enum
 import json
 import ssl
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -236,6 +236,150 @@ class UrllibJsonTransport:
         if not isinstance(parsed, Mapping):
             raise ProviderError("Provider returned a non-object JSON response.")
         return parsed
+
+
+StreamTransport = Callable[[HttpJsonRequest], Iterable[str]]
+
+
+class UrllibStreamTransport:
+    """POST JSON and yield decoded response lines (SSE/NDJSON), capped.
+
+    Gemini's Interactions streaming contract is not relied on by any
+    adapter yet; this transport serves the Chat Completions SSE, Ollama
+    NDJSON, and Anthropic Messages SSE shapes, whose line parsers live
+    below. The same URL/TLS validation and total-size cap as the JSON
+    transport apply; the timeout bounds establishing the connection and
+    each socket read.
+    """
+
+    def __call__(self, request: HttpJsonRequest) -> Iterator[str]:
+        _validate_http_url(request.url)
+        body = json.dumps(dict(request.payload)).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream, application/x-ndjson, application/json",
+            "User-Agent": "pc-agent/0.4",
+        }
+        headers.update({str(key): str(value) for key, value in request.headers.items()})
+        http_request = Request(request.url, data=body, headers=headers, method="POST")
+        try:
+            # URL scheme/host were validated by _validate_http_url above.
+            response = urlopen(
+                http_request,
+                timeout=request.timeout_seconds,
+                context=create_tls_context(),
+            )
+        except HTTPError as exc:
+            detail = _http_error_detail(exc)
+            retryable = exc.code in _RETRYABLE_HTTP_STATUSES or 500 <= exc.code <= 599
+            raise ProviderError(
+                f"Provider HTTP {exc.code}: {detail}",
+                retryable=retryable,
+                status_code=exc.code,
+            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, ssl.SSLCertVerificationError) or (
+                "certificate verify failed" in str(reason).lower()
+            ):
+                raise ProviderError(
+                    "Provider TLS certificate verification failed.",
+                    retryable=False,
+                ) from exc
+            raise ProviderError(
+                f"Provider network error: {redact_text(str(exc))}", retryable=True
+            ) from exc
+
+        total = 0
+        try:
+            with response:
+                for raw_line in response:
+                    total += len(raw_line)
+                    if total > _MAX_RESPONSE_BYTES:
+                        raise ProviderError(
+                            "Provider stream exceeded the local size limit."
+                        )
+                    yield raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        except (URLError, TimeoutError, OSError) as exc:
+            raise ProviderError(
+                f"Provider stream failed: {redact_text(str(exc))}", retryable=True
+            ) from exc
+
+
+def _stream_json_line(line: str) -> Mapping[str, Any] | None:
+    candidate = line.strip()
+    if not candidate or candidate.startswith(":"):
+        return None
+    if candidate.startswith("data:"):
+        candidate = candidate[5:].strip()
+    if candidate == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
+def parse_openai_sse_lines(lines: Iterable[str]) -> Iterator[str]:
+    """Yield text deltas from Chat Completions SSE (``data: {...}``)."""
+    for line in lines:
+        parsed = _stream_json_line(line)
+        if parsed is None:
+            continue
+        error = parsed.get("error")
+        if error:
+            detail = error.get("message") if isinstance(error, Mapping) else str(error)
+            raise ProviderError(f"Provider stream error: {detail}")
+        choices = parsed.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        first = choices[0]
+        if not isinstance(first, Mapping):
+            continue
+        delta = first.get("delta")
+        if isinstance(delta, Mapping):
+            text = extract_text_content(delta.get("content"))
+            if text:
+                yield text
+            continue
+        text = extract_text_content(first.get("text"))
+        if text:
+            yield text
+
+
+def parse_ollama_stream_lines(lines: Iterable[str]) -> Iterator[str]:
+    """Yield text deltas from Ollama NDJSON chat lines."""
+    for line in lines:
+        parsed = _stream_json_line(line)
+        if parsed is None:
+            continue
+        if parsed.get("error"):
+            raise ProviderError(f"Ollama returned an error: {parsed['error']}")
+        message = parsed.get("message")
+        if isinstance(message, Mapping):
+            text = extract_text_content(message.get("content"))
+            if text:
+                yield text
+        if parsed.get("done"):
+            break
+
+
+def parse_anthropic_sse_lines(lines: Iterable[str]) -> Iterator[str]:
+    """Yield text deltas from Anthropic Messages SSE events."""
+    for line in lines:
+        parsed = _stream_json_line(line)
+        if parsed is None:
+            continue
+        error = parsed.get("error")
+        if parsed.get("type") == "error" or error:
+            detail = error.get("message") if isinstance(error, Mapping) else str(error)
+            raise ProviderError(f"Provider anthropic returned an error: {detail}")
+        delta = parsed.get("delta")
+        if isinstance(delta, Mapping):
+            text = delta.get("text")
+            if isinstance(text, str) and text:
+                yield text
 
 
 def _validate_http_url(url: str) -> None:

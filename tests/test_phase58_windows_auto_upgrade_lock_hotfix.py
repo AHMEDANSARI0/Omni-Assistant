@@ -76,9 +76,9 @@ def test_phase58_windows_lock_reuses_existing_file_at_byte_zero(
 
 
 def test_phase58_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(build_default_registry().list_tools()) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(build_default_registry().list_tools()) == 69
 
     release_names = {path.as_posix() for path in release_candidate_files(ROOT)}
     for expected in (

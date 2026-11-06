@@ -6,7 +6,7 @@ OpenAI-compatible endpoints; provider identity and endpoint remain explicit.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from ..errors import ProviderError
@@ -15,15 +15,19 @@ from .base import (
     CompletionResponse,
     HttpJsonRequest,
     JsonTransport,
+    StreamTransport,
     UrllibJsonTransport,
+    UrllibStreamTransport,
     ensure_nonempty_content,
     extract_text_content,
+    parse_openai_sse_lines,
 )
 
 
 class OpenAICompatibleProvider:
     implemented = True
     supports_vision = True
+    supports_streaming = True
 
     def __init__(
         self,
@@ -34,6 +38,7 @@ class OpenAICompatibleProvider:
         base_url: str,
         timeout_seconds: float,
         transport: JsonTransport | None = None,
+        stream_transport: StreamTransport | None = None,
         api_key_required: bool = True,
     ) -> None:
         self.name = name
@@ -42,7 +47,33 @@ class OpenAICompatibleProvider:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._transport = transport or UrllibJsonTransport()
+        self._stream_transport = stream_transport or UrllibStreamTransport()
         self._api_key_required = api_key_required
+
+    def _headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        if self.name == "openrouter":
+            headers["X-OpenRouter-Title"] = "Self-Healing PC Agent"
+        return headers
+
+    def _payload(self, request: CompletionRequest, *, stream: bool) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [_message_payload(message) for message in request.messages],
+            "temperature": request.temperature,
+            "max_tokens": request.max_output_tokens,
+        }
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    def _require_configured(self) -> None:
+        if not self.configured:
+            raise ProviderError(
+                f"Provider {self.name} is not configured. Check its API key/model in .env."
+            )
 
     @property
     def configured(self) -> bool:
@@ -50,28 +81,12 @@ class OpenAICompatibleProvider:
         return bool(has_key and self.model and self._base_url)
 
     def complete(self, request: CompletionRequest) -> CompletionResponse:
-        if not self.configured:
-            raise ProviderError(
-                f"Provider {self.name} is not configured. Check its API key/model in .env."
-            )
-
-        headers: dict[str, str] = {}
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        if self.name == "openrouter":
-            headers["X-OpenRouter-Title"] = "Self-Healing PC Agent"
-
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [_message_payload(message) for message in request.messages],
-            "temperature": request.temperature,
-            "max_tokens": request.max_output_tokens,
-        }
+        self._require_configured()
         data = self._transport(
             HttpJsonRequest(
                 url=f"{self._base_url}/chat/completions",
-                payload=payload,
-                headers=headers,
+                payload=self._payload(request, stream=False),
+                headers=self._headers(),
                 timeout_seconds=self._timeout_seconds,
             )
         )
@@ -83,6 +98,23 @@ class OpenAICompatibleProvider:
             model=str(data.get("model") or self.model),
             usage=dict(usage),
         )
+
+    def stream_complete(self, request: CompletionRequest) -> Iterator[str]:
+        self._require_configured()
+        lines = self._stream_transport(
+            HttpJsonRequest(
+                url=f"{self._base_url}/chat/completions",
+                payload=self._payload(request, stream=True),
+                headers=self._headers(),
+                timeout_seconds=self._timeout_seconds,
+            )
+        )
+        produced = False
+        for delta in parse_openai_sse_lines(lines):
+            produced = True
+            yield delta
+        if not produced:
+            raise ProviderError(f"Provider {self.name} returned an empty stream.")
 
 
 def _message_payload(message: Any) -> dict[str, Any]:

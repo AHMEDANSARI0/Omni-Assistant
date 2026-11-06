@@ -219,7 +219,7 @@ def test_recovery_settings_are_bounded(tmp_path: Path) -> None:
         )
 
 
-def test_schema_v3_upgrades_through_v4_and_v5_to_v6_without_losing_task(
+def test_schema_v3_upgrades_through_v4_and_v5_to_latest_without_losing_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = Database(tmp_path / "data" / "test.db")
@@ -229,7 +229,7 @@ def test_schema_v3_upgrades_through_v4_and_v5_to_v6_without_losing_task(
     created = TaskRepository(database).create(Task(instruction="Keep me"))
 
     monkeypatch.setattr(db_module, "_MIGRATIONS", original)
-    assert database.initialize() == 6
+    assert database.initialize() == 18
     assert TaskRepository(database).get(created.id) is not None
     assert RecoveryRepository(database).count_attempts() == 0
 
@@ -724,7 +724,7 @@ def test_cli_run_reports_recovery_and_doctor_health(
 
     assert main([*root, "doctor"]) == 0
     doctor = capsys.readouterr().out
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in doctor
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in doctor
     assert "recorded attempts=2" in doctor
     assert "Bundled dynamic-tool example arguments: missing" in doctor
 

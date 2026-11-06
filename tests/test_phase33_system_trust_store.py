@@ -359,9 +359,9 @@ def test_system_trust_direct_cli_and_gui(
     assert "synthetic store unavailable" in (failed.error or "")
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.60.0"
-    assert summary.builtin_tools == 62
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
+    assert summary.version == __version__ == "0.81.2"
+    assert summary.builtin_tools == 69
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
 
 def test_phase33_scope_defaults_docs_and_no_registered_tool() -> None:
@@ -372,9 +372,9 @@ def test_phase33_scope_defaults_docs_and_no_registered_tool() -> None:
         ["pdf", "validate-signatures", "signed.pdf"]
     )
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(ids) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(ids) == 69
     assert args.system_trust_anchors is False
     assert args.timestamp_system_trust_anchors is False
     assert "pdf.validate_signatures" not in ids

@@ -66,3 +66,35 @@ class LicenseError(PcAgentError):
 
 class CredentialError(StorageError):
     """A provider credential could not be stored, read or deleted safely."""
+
+
+class KnowledgeError(PcAgentError):
+    """A knowledge ingestion/search problem the user can act on (Phase 8)."""
+
+
+class AgentError(PcAgentError):
+    """An agent definition/run problem the user can act on (Phase 9)."""
+
+
+class FlowError(PcAgentError):
+    """Invalid workflow definition, trigger, import or run request."""
+
+
+class ProactiveError(PcAgentError):
+    """Reminder, notification or briefing request the user can fix (Phase 14)."""
+
+
+class ConnectorError(PcAgentError):
+    """A connector is missing configuration, refused or failed (Phase 13)."""
+
+
+class PluginError(PcAgentError):
+    """Plugin install, signature, capability or sandbox refusal (Phase 15)."""
+
+
+class SyncError(PcAgentError):
+    """Device pairing, encryption, replay or coordination refusal (Phase 16)."""
+
+
+class VoiceError(PcAgentError):
+    """Raised when a voice operation is refused, gated or unavailable."""

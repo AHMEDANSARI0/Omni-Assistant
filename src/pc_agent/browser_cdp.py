@@ -400,6 +400,44 @@ class BrowserClient:
             connection.close()
             raise
 
+    def activate_tab(self, target_id: str) -> dict[str, Any]:
+        """Bring one existing tab to the front (explicit id only)."""
+        chosen = target_id.strip()
+        if not chosen:
+            raise ToolError("A target_id is required to activate a tab.")
+        if chosen not in {str(item.get("id") or "") for item in self.targets()}:
+            raise ToolError(f"No browser tab has id {chosen!r}.")
+        connection = self.connect()
+        try:
+            connection.call("Target.activateTarget", {"targetId": chosen})
+        finally:
+            connection.close()
+        return {"activated": chosen}
+
+    def close_tab(self, target_id: str) -> dict[str, Any]:
+        """Close one page tab by id (never the last remaining page)."""
+        chosen = target_id.strip()
+        if not chosen:
+            raise ToolError("A target_id is required to close a tab.")
+        pages = [
+            item
+            for item in self.targets()
+            if item.get("type") == "page"
+            and not str(item.get("url") or "").startswith("devtools://")
+        ]
+        if len(pages) <= 1:
+            raise ToolError(
+                "Refusing to close the last page tab; close the browser window instead."
+            )
+        if chosen not in {str(item.get("id") or "") for item in pages}:
+            raise ToolError(f"No page tab has id {chosen!r}.")
+        connection = self.connect()
+        try:
+            connection.call("Target.closeTarget", {"targetId": chosen})
+        finally:
+            connection.close()
+        return {"closed": chosen, "pages_remaining": len(pages) - 1}
+
     def _last_page_target_id(self) -> str:
         pages = [
             item
@@ -611,6 +649,63 @@ class PageSession:
             "target_id": self.target_id,
         }
 
+    def wait_for(
+        self,
+        *,
+        selector: str = "",
+        text: str = "",
+        url_contains: str = "",
+        timeout_seconds: float = 10.0,
+        poll_seconds: float = 0.25,
+    ) -> dict[str, Any]:
+        """Poll a page condition until it holds or the bounded timeout ends.
+
+        Exactly the conditions that were asked for are checked; nothing is
+        guessed. The result always states which condition matched and how
+        long it took, so a caller can tell "still loading" from "matched".
+        """
+        wanted = sum(1 for value in (selector, text, url_contains) if value.strip())
+        if wanted == 0:
+            raise ToolError(
+                "browser.wait needs at least one of selector, text or url_contains."
+            )
+        limit = max(0.5, min(float(timeout_seconds), 120.0))
+        poll = max(0.1, min(float(poll_seconds), 5.0))
+        deadline = time.monotonic() + limit
+        attempts = 0
+        last: dict[str, Any] = {}
+        while True:
+            attempts += 1
+            last = _parse_json_object(
+                self.evaluate(
+                    _wait_probe_js(
+                        selector=selector, text=text, url_contains=url_contains
+                    )
+                ),
+                "wait probe",
+            )
+            if last.get("matched"):
+                last.update(
+                    {
+                        "attempts": attempts,
+                        "waited_ms": int((time.monotonic() - (deadline - limit)) * 1000),
+                        "target_id": self.target_id,
+                    }
+                )
+                return last
+            if time.monotonic() >= deadline:
+                last.update(
+                    {
+                        "matched": False,
+                        "attempts": attempts,
+                        "waited_ms": int(limit * 1000),
+                        "target_id": self.target_id,
+                        "timed_out": True,
+                    }
+                )
+                return last
+            time.sleep(poll)
+
     def screenshot_png(self) -> bytes:
         result = self.call(
             "Page.captureScreenshot", {"format": "png", "fromSurface": True}
@@ -622,6 +717,41 @@ class PageSession:
             return base64.b64decode(encoded, validate=True)
         except (ValueError, TypeError) as exc:
             raise ToolError("Browser returned an invalid screenshot.") from exc
+
+
+def _wait_probe_js(*, selector: str, text: str, url_contains: str) -> str:
+    checks: list[str] = []
+    if selector.strip():
+        checks.append(
+            "selectorSeen=!!document.querySelector(" + json.dumps(selector) + ")"
+        )
+    else:
+        checks.append("selectorSeen=null")
+    if text.strip():
+        checks.append(
+            "textSeen=(document.body?document.body.innerText:'').includes("
+            + json.dumps(text)
+            + ")"
+        )
+    else:
+        checks.append("textSeen=null")
+    if url_contains.strip():
+        checks.append(
+            "urlSeen=location.href.includes(" + json.dumps(url_contains) + ")"
+        )
+    else:
+        checks.append("urlSeen=null")
+    body = ";".join(checks)
+    return (
+        "(()=>{"
+        f"{body};"
+        "const needed=[selectorSeen,textSeen,urlSeen].filter(v=>v!==null);"
+        "const matched=needed.length>0 && needed.every(Boolean);"
+        "return JSON.stringify({matched,selector_seen:selectorSeen,"
+        "text_seen:textSeen,url_seen:urlSeen,url:location.href,"
+        "title:document.title,ready:document.readyState});"
+        "})()"
+    )
 
 
 def _parse_json_object(value: Any, label: str) -> dict[str, Any]:

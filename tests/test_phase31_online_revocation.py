@@ -534,10 +534,10 @@ def test_phase31_direct_cli_gui_scope_docs_and_registry() -> None:
     )
     assert "online_revocation=online_revocation" in controller_source
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
     registry = build_default_registry()
-    assert len(registry.list_tools()) == 62
+    assert len(registry.list_tools()) == 69
     assert not any(
         "online_revocation" in tool.spec.id or "ocsp" in tool.spec.id
         for tool in registry.list_tools()

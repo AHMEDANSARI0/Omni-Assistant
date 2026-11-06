@@ -41,6 +41,8 @@ def test_default_registry_contains_expected_tools() -> None:
 
     assert ids == {
         "workspace.list_files",
+        "vision.screen",
+        "vision.locate",
         "workspace.read_text",
         "workspace.write_text",
         "pdf.inspect",
@@ -56,6 +58,7 @@ def test_default_registry_contains_expected_tools() -> None:
         "office.csv_to_xlsx",
         "web.fetch",
         "desktop.system_info",
+        "desktop.window_state",
         "desktop.open_path",
         "desktop.open_url",
         "files.copy",
@@ -85,6 +88,8 @@ def test_default_registry_contains_expected_tools() -> None:
         "git.commit",
         "commands.run",
         "browser.status",
+        "browser.wait",
+        "browser.tabs",
         "browser.open",
         "browser.snapshot",
         "browser.click",
@@ -102,6 +107,8 @@ def test_default_registry_contains_expected_tools() -> None:
         "image.transform",
         "image.compare",
         "image.analyze",
+        "knowledge.ingest",
+        "knowledge.search",
     }
 
 

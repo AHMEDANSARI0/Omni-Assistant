@@ -594,9 +594,9 @@ def test_pdf_ocr_direct_cli_json_and_gui_controller(
     assert gui_result.success, gui_result.error
     assert gui_router.calls == 1
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.60.0"
-    assert summary.builtin_tools == 62
-    assert "PHASE 58 Windows Auto-Upgrade Lock Hotfix" in summary.to_text()
+    assert summary.version == __version__ == "0.81.2"
+    assert summary.builtin_tools == 69
+    assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
 
 def test_phase22_scope_schema_dependency_and_release_candidates() -> None:
@@ -605,9 +605,9 @@ def test_phase22_scope_schema_dependency_and_release_candidates() -> None:
     tool_ids = {item.spec.id for item in build_default_registry().list_tools()}
     pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
-    assert len(tool_ids) == 62
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
+    assert len(tool_ids) == 69
     assert "pdf.ocr" in tool_ids
     assert '"pypdfium2>=5,<6"' in pyproject
     assert "docs/phase22.md" in candidates

@@ -33,15 +33,17 @@ from .anthropic_verification import (
     run_anthropic_live_verification,
     verify_anthropic_live_verification_report,
 )
+from .api_server import LocalApiServer, load_or_create_api_token
 from .auto_upgrade import (
     DEFAULT_AUTO_UPGRADE_TASK_NAME,
+    get_auto_upgrade_schedule,
     get_auto_upgrade_status,
-    get_windows_auto_upgrade_schedule,
-    install_windows_auto_upgrade_schedule,
+    install_auto_upgrade_schedule,
     run_auto_upgrade,
-    uninstall_windows_auto_upgrade_schedule,
+    uninstall_auto_upgrade_schedule,
     verify_auto_upgrade_report,
 )
+from .baseline import TRANSFORMATION_LABEL, baseline_status
 from .browser_cdp import probe_browser
 from .config import Settings
 from .credentials import (
@@ -111,18 +113,32 @@ from .online_updates import (
 from .orchestrator import ApprovalRequest, ExecutionReport, TaskOrchestrator
 from .planning import DeterministicPlanner, PlannerOptions
 from .posix_package import build_posix_package, verify_posix_package
+from .production_check import run_production_check
+from .profiles import (
+    active_profile_name,
+    delete_profile,
+    list_profiles,
+    load_profile,
+    save_profile,
+    set_active_profile,
+    snapshot_from_settings,
+)
 from .providers import CompletionRequest, build_model_router, provider_statuses
 from .recovery import RecoveryService, TaskDiagnosis
 from .release import audit_install, build_release_bundle, verify_release_bundle
 from .rpm_package import build_rpm_package, rpm_package_filename, verify_rpm_package
 from .rpm_repository import build_rpm_repository, verify_rpm_repository
+from .safety import EmergencyStop
 from .self_repair import SelfRepairService
+from .service import LocalService
 from .storage.db import Database
 from .storage.repositories import (
     DynamicToolRecord,
     DynamicToolRepository,
+    EventRepository,
     ExecutionRepository,
     MemoryRepository,
+    MissionRepository,
     PreferenceRepository,
     RecoveryRepository,
     TaskRepository,
@@ -143,6 +159,11 @@ from .updates import (
     list_updates,
     rollback_update,
     stage_update,
+)
+from .windows_acceptance import (
+    record_acceptance_report,
+    run_windows_acceptance,
+    verify_acceptance_report,
 )
 from .windows_installer import (
     build_windows_installer_source,
@@ -444,7 +465,10 @@ def _add_desktop_element_selector_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent",
-        description="Self-Healing PC Agent - personal local core + GUI + licensing (PHASE 44)",
+        description=(
+            "Self-Healing PC Agent - personal local core + GUI + licensing "
+            f"({TRANSFORMATION_LABEL})"
+        ),
     )
     parser.add_argument("--version", action="version", version=f"pc-agent {__version__}")
     parser.add_argument(
@@ -520,6 +544,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     note_set_parser.add_argument("key")
     note_set_parser.add_argument("text", nargs="+")
+    note_set_parser.add_argument(
+        "--tags", default="", help="Optional space/comma separated tags (Phase 8)"
+    )
+    memory_search_parser = memory_subparsers.add_parser(
+        "search", help="Semantic search over saved notes (Memory v2)"
+    )
+    memory_search_parser.add_argument("query", nargs="+")
+    memory_search_parser.add_argument("--limit", type=int, default=5)
+    memory_search_parser.add_argument("--json", action="store_true")
+    memory_subparsers.add_parser(
+        "reindex", help="Embed notes that lack a current-model vector (Memory v2)"
+    )
     note_show_parser = memory_subparsers.add_parser("note-show", help="Show one memory note")
     note_show_parser.add_argument("key")
     note_delete_parser = memory_subparsers.add_parser(
@@ -788,6 +824,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     providers_anthropic_report_parser.add_argument("report", type=Path)
     providers_anthropic_report_parser.add_argument("--json", action="store_true")
+    providers_capabilities_parser = providers_subparsers.add_parser(
+        "capabilities",
+        help="Show the Provider Platform v2 capability catalog (no network call)",
+    )
+    providers_capabilities_parser.add_argument("--json", action="store_true")
+    providers_route_parser = providers_subparsers.add_parser(
+        "route",
+        help="Explain the effective provider order under the routing strategy",
+    )
+    providers_route_parser.add_argument("--json", action="store_true")
+    providers_usage_parser = providers_subparsers.add_parser(
+        "usage",
+        help="Show local provider usage analytics (calls, tokens, latency, cost)",
+    )
+    providers_usage_parser.add_argument("--json", action="store_true")
+    providers_evaluate_parser = providers_subparsers.add_parser(
+        "evaluate",
+        help="Run the built-in provider evaluation cases against the configured route",
+    )
+    providers_evaluate_parser.add_argument("--json", action="store_true")
+    providers_evaluate_parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Show the latest saved evaluation instead of running new calls",
+    )
 
     credentials_parser = subparsers.add_parser(
         "credentials",
@@ -934,6 +995,123 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat warnings as a failing exit status",
     )
     release_audit_parser.add_argument("--json", action="store_true")
+    release_production_parser = release_subparsers.add_parser(
+        "production-check",
+        help=(
+            "Run the end-to-end release chain against a throw-away copy: build, "
+            "verify, tamper detection, sign, stage, apply and roll back"
+        ),
+    )
+    release_production_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Also write the JSON report to this path",
+    )
+    release_production_parser.add_argument(
+        "--keep",
+        action="store_true",
+        help="Keep the temporary work directory (reported in the output)",
+    )
+    release_production_parser.add_argument("--json", action="store_true")
+    release_signing_parser = release_subparsers.add_parser(
+        "signing",
+        help="Authenticode signing state of this host (tool, certificate, last result)",
+    )
+    release_signing_parser.add_argument("--json", action="store_true")
+    release_sign_parser = release_subparsers.add_parser(
+        "sign",
+        help=(
+            "Sign a Windows installer EXE with your own certificate and verify the "
+            "result with WinVerifyTrust (no key is generated or stored)"
+        ),
+    )
+    release_sign_parser.add_argument("artifact", type=Path)
+    release_sign_parser.add_argument(
+        "--thumbprint",
+        default="",
+        help="Certificate thumbprint in your user store (recommended: no password involved)",
+    )
+    release_sign_parser.add_argument(
+        "--pfx", type=Path, default=None, help="PFX file (fallback; see --allow-argv-password)"
+    )
+    release_sign_parser.add_argument(
+        "--pfx-password-env",
+        default="PC_AGENT_SIGN_PFX_PASSWORD",
+        help="Environment variable holding the PFX password (never a CLI argument)",
+    )
+    release_sign_parser.add_argument(
+        "--allow-argv-password",
+        action="store_true",
+        help=(
+            "Accept that signtool needs the PFX password in argv, which other "
+            "processes on this machine can read. Refused by default."
+        ),
+    )
+    release_sign_parser.add_argument(
+        "--timestamp-url", default=None, help="RFC 3161 timestamp authority"
+    )
+    release_sign_parser.add_argument("--signtool", type=Path, default=None)
+    release_sign_parser.add_argument("--timeout", type=float, default=600.0)
+    release_sign_parser.add_argument("--json", action="store_true")
+    release_signature_parser = release_subparsers.add_parser(
+        "signature",
+        help="Verify an Authenticode signature on this machine (WinVerifyTrust, read-only)",
+    )
+    release_signature_parser.add_argument("artifact", type=Path)
+    release_signature_parser.add_argument("--signtool", type=Path, default=None)
+    release_signature_parser.add_argument("--json", action="store_true")
+
+    release_evidence_parser = release_subparsers.add_parser(
+        "evidence",
+        help=(
+            "Windows acceptance evidence: run the gates on this machine, verify a "
+            "recorded report offline, or record a verified passed Windows run"
+        ),
+    )
+    release_evidence_parser.add_argument(
+        "evidence_command",
+        nargs="?",
+        choices=("status", "verify", "record"),
+        default=None,
+        help="status: show what is recorded and run nothing; verify: check a report "
+        "file; record: copy a verified passed Windows report into this install. "
+        "Omitted: run the gates on Windows, report the recorded state elsewhere",
+    )
+    release_evidence_parser.add_argument(
+        "report",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="Report file for verify/record (defaults to workspace/windows-acceptance.json)",
+    )
+    release_evidence_parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Where a freshly produced report is written",
+    )
+    release_evidence_parser.add_argument(
+        "--no-suite",
+        action="store_true",
+        help="Skip the test-suite gate (the report then says so and cannot pass)",
+    )
+    release_evidence_parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "Exercise the harness on this host even if it is not Windows; the report "
+            "is marked self-test and can never be recorded as Windows evidence"
+        ),
+    )
+    release_evidence_parser.add_argument(
+        "--suite-timeout",
+        type=float,
+        default=3600.0,
+        help="Seconds allowed for the test-suite gate (default 3600)",
+    )
+    release_evidence_parser.add_argument("--json", action="store_true")
+
     release_build_parser = release_subparsers.add_parser(
         "build",
         help="Build a reproducible portable ZIP (excludes .env, data and workspace contents)",
@@ -1267,7 +1445,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_hosting_verify_parser.add_argument("--json", action="store_true")
     update_auto_status_parser = update_subparsers.add_parser(
         "auto-status",
-        help="Show signed background auto-upgrade state and Windows schedule",
+        help="Show signed background auto-upgrade state and OS schedule",
     )
     update_auto_status_parser.add_argument(
         "--task-name", default=DEFAULT_AUTO_UPGRADE_TASK_NAME
@@ -1290,7 +1468,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_auto_verify_parser.add_argument("--json", action="store_true")
     update_auto_install_parser = update_subparsers.add_parser(
         "auto-install-schedule",
-        help="Install the Windows Scheduled Task auto-upgrade worker",
+        help="Install the Windows task or Linux systemd user timer auto-upgrade worker",
     )
     update_auto_install_parser.add_argument(
         "--task-name", default=DEFAULT_AUTO_UPGRADE_TASK_NAME
@@ -1302,7 +1480,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_auto_install_parser.add_argument("--json", action="store_true")
     update_auto_uninstall_parser = update_subparsers.add_parser(
         "auto-uninstall-schedule",
-        help="Remove the Windows Scheduled Task auto-upgrade worker",
+        help="Remove the Windows task or Linux systemd user timer auto-upgrade worker",
     )
     update_auto_uninstall_parser.add_argument(
         "--task-name", default=DEFAULT_AUTO_UPGRADE_TASK_NAME
@@ -1311,7 +1489,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_auto_uninstall_parser.add_argument("--json", action="store_true")
     update_auto_schedule_status_parser = update_subparsers.add_parser(
         "auto-schedule-status",
-        help="Show the Windows Scheduled Task auto-upgrade worker state",
+        help="Show the Windows task or Linux systemd user timer auto-upgrade worker state",
     )
     update_auto_schedule_status_parser.add_argument(
         "--task-name", default=DEFAULT_AUTO_UPGRADE_TASK_NAME
@@ -1365,6 +1543,11 @@ def build_parser() -> argparse.ArgumentParser:
         "backup", help="Create and verify a consistent database backup"
     )
     maintenance_backup_parser.add_argument("--label", default="manual")
+    maintenance_backup_parser.add_argument(
+        "--encrypt",
+        action="store_true",
+        help="Encrypt the backup with a passphrase (prompted, never stored)",
+    )
     maintenance_backup_parser.add_argument("--json", action="store_true")
     maintenance_list_parser = maintenance_subparsers.add_parser(
         "list", help="List database backups"
@@ -1402,6 +1585,961 @@ def build_parser() -> argparse.ArgumentParser:
     )
     diagnostics_export_parser.add_argument("--json", action="store_true")
 
+    safety_parser = subparsers.add_parser(
+        "safety",
+        help="Safety Kernel status and the emergency stop (Transformation Phase 2)",
+    )
+    safety_subparsers = safety_parser.add_subparsers(dest="safety_command")
+    safety_status_parser = safety_subparsers.add_parser(
+        "status", help="Show Safety Kernel settings, emergency stop and pending approvals"
+    )
+    safety_status_parser.add_argument("--json", action="store_true")
+    safety_stop_parser = safety_subparsers.add_parser(
+        "stop", help="Engage the emergency stop: block all orchestrated tool execution"
+    )
+    safety_stop_parser.add_argument("--reason", default="", help="Short reason (no secrets)")
+    safety_stop_parser.add_argument("--json", action="store_true")
+    safety_resume_parser = safety_subparsers.add_parser(
+        "resume", help="Clear the emergency stop after explicit confirmation"
+    )
+    safety_resume_parser.add_argument("--yes", action="store_true")
+    safety_resume_parser.add_argument("--json", action="store_true")
+
+    approvals_parser = subparsers.add_parser(
+        "approvals",
+        help="Approval Center: decide pending exact-scope approval requests",
+    )
+    approvals_subparsers = approvals_parser.add_subparsers(dest="approvals_command")
+    approvals_list_parser = approvals_subparsers.add_parser(
+        "list", help="List Approval Center requests"
+    )
+    approvals_list_parser.add_argument(
+        "--status",
+        choices=("pending", "approved", "denied", "expired", "consumed"),
+        default=None,
+    )
+    approvals_list_parser.add_argument("--task", default=None, help="Only this task ID")
+    approvals_list_parser.add_argument("--limit", type=int, default=50)
+    approvals_list_parser.add_argument("--json", action="store_true")
+    approvals_show_parser = approvals_subparsers.add_parser(
+        "show", help="Show one Approval Center request"
+    )
+    approvals_show_parser.add_argument("request_key", help="Request key such as apr-1a2b3c4d5e6f")
+    approvals_show_parser.add_argument("--json", action="store_true")
+    for _decision in ("approve", "deny"):
+        _decision_parser = approvals_subparsers.add_parser(
+            _decision,
+            help=f"{_decision.capitalize()} one pending request for its exact scope",
+        )
+        _decision_parser.add_argument(
+            "request_key", help="Request key such as apr-1a2b3c4d5e6f"
+        )
+        _decision_parser.add_argument("--yes", action="store_true")
+        _decision_parser.add_argument("--json", action="store_true")
+
+    api_parser = subparsers.add_parser(
+        "api",
+        help="Local Service API: loopback-only HTTP front-end (Transformation Phase 3)",
+    )
+    api_subparsers = api_parser.add_subparsers(dest="api_command")
+    api_serve_parser = api_subparsers.add_parser(
+        "serve", help="Serve the local API until interrupted (Ctrl+C)"
+    )
+    api_serve_parser.add_argument(
+        "--show-token",
+        action="store_true",
+        help="Print the bearer token once at startup (keep it private)",
+    )
+    api_status_parser = api_subparsers.add_parser(
+        "status", help="Show local API settings and service health (in-process)"
+    )
+    api_status_parser.add_argument("--json", action="store_true")
+
+    events_parser = subparsers.add_parser(
+        "events",
+        help="Global application events (task lifecycle, approvals, safety, backups)",
+    )
+    events_subparsers = events_parser.add_subparsers(dest="events_command")
+    events_list_parser = events_subparsers.add_parser("list", help="List application events")
+    events_list_parser.add_argument("--since-id", type=int, default=0)
+    events_list_parser.add_argument("--type", default=None, help="Only this event type")
+    events_list_parser.add_argument("--task", default=None, help="Only this task ID")
+    events_list_parser.add_argument("--limit", type=int, default=50)
+    events_list_parser.add_argument(
+        "--recent",
+        action="store_true",
+        help="Newest first (default is oldest-first cursor order)",
+    )
+    events_list_parser.add_argument("--json", action="store_true")
+
+    profiles_parser = subparsers.add_parser(
+        "profiles",
+        help="File-based settings profiles (non-secret, non-gate settings only)",
+    )
+    profiles_subparsers = profiles_parser.add_subparsers(dest="profiles_command")
+    profiles_list_parser = profiles_subparsers.add_parser("list", help="List profiles")
+    profiles_list_parser.add_argument("--json", action="store_true")
+    profiles_show_parser = profiles_subparsers.add_parser("show", help="Show one profile")
+    profiles_show_parser.add_argument("name")
+    profiles_show_parser.add_argument("--json", action="store_true")
+    profiles_save_parser = profiles_subparsers.add_parser(
+        "save-current", help="Save the effective settings (whitelisted fields) as a profile"
+    )
+    profiles_save_parser.add_argument("name")
+    profiles_save_parser.add_argument("--json", action="store_true")
+    profiles_activate_parser = profiles_subparsers.add_parser(
+        "activate", help="Mark a profile active for future runs (environment still wins)"
+    )
+    profiles_activate_parser.add_argument("name")
+    profiles_activate_parser.add_argument("--json", action="store_true")
+    profiles_deactivate_parser = profiles_subparsers.add_parser(
+        "deactivate", help="Clear the active profile marker"
+    )
+    profiles_deactivate_parser.add_argument("--json", action="store_true")
+    profiles_delete_parser = profiles_subparsers.add_parser(
+        "delete", help="Delete a profile file"
+    )
+    profiles_delete_parser.add_argument("name")
+    profiles_delete_parser.add_argument("--yes", action="store_true")
+    profiles_delete_parser.add_argument("--json", action="store_true")
+
+    missions_parser = subparsers.add_parser(
+        "missions",
+        help="Mission Center: task dependency graphs with parallel execution (Phase 4)",
+    )
+    missions_subparsers = missions_parser.add_subparsers(dest="missions_command")
+    missions_create_parser = missions_subparsers.add_parser("create", help="Create a mission")
+    missions_create_parser.add_argument("name")
+    missions_create_parser.add_argument("--description", default="")
+    missions_create_parser.add_argument(
+        "--task",
+        action="append",
+        default=None,
+        help="Instruction for a new task (repeatable; independent tasks)",
+    )
+    missions_create_parser.add_argument("--json", action="store_true")
+    missions_list_parser = missions_subparsers.add_parser("list", help="List missions")
+    missions_list_parser.add_argument("--limit", type=int, default=50)
+    missions_list_parser.add_argument("--json", action="store_true")
+    missions_show_parser = missions_subparsers.add_parser(
+        "show", help="Show a mission, its tasks and execution graph"
+    )
+    missions_show_parser.add_argument("mission_id", help="Mission ID, prefix, or latest")
+    missions_show_parser.add_argument("--json", action="store_true")
+    missions_add_parser = missions_subparsers.add_parser(
+        "add-task", help="Add a new or existing task to a mission"
+    )
+    missions_add_parser.add_argument("mission_id")
+    missions_add_parser.add_argument(
+        "instruction", nargs="?", default=None, help="Instruction for a new task"
+    )
+    missions_add_parser.add_argument(
+        "--task", default=None, help="Existing task ID/prefix instead of a new instruction"
+    )
+    missions_add_parser.add_argument(
+        "--after",
+        action="append",
+        default=None,
+        help="Task ID/prefix this task depends on (repeatable)",
+    )
+    missions_add_parser.add_argument("--json", action="store_true")
+    missions_link_parser = missions_subparsers.add_parser(
+        "link", help="Make one mission task depend on another"
+    )
+    missions_link_parser.add_argument("mission_id")
+    missions_link_parser.add_argument("task_id")
+    missions_link_parser.add_argument("depends_on")
+    missions_link_parser.add_argument("--json", action="store_true")
+    missions_run_parser = missions_subparsers.add_parser(
+        "run", help="Run a mission graph (waits for completion)"
+    )
+    missions_run_parser.add_argument("mission_id")
+    missions_run_parser.add_argument("--use-ai", action="store_true")
+    missions_run_parser.add_argument("--json", action="store_true")
+    missions_cancel_parser = missions_subparsers.add_parser("cancel", help="Cancel a mission")
+    missions_cancel_parser.add_argument("mission_id")
+    missions_cancel_parser.add_argument("--reason", default="Cancelled from the CLI.")
+    missions_cancel_parser.add_argument("--json", action="store_true")
+    missions_delete_parser = missions_subparsers.add_parser(
+        "delete", help="Delete a mission record (its tasks are kept)"
+    )
+    missions_delete_parser.add_argument("mission_id")
+    missions_delete_parser.add_argument("--yes", action="store_true")
+    missions_delete_parser.add_argument("--json", action="store_true")
+
+    schedules_parser = subparsers.add_parser(
+        "schedules",
+        help="Recurring/one-off task schedules (run by the API scheduler loop or tick)",
+    )
+    schedules_subparsers = schedules_parser.add_subparsers(dest="schedules_command")
+    schedules_add_parser = schedules_subparsers.add_parser("add", help="Create a schedule")
+    schedules_add_parser.add_argument("name")
+    schedules_add_parser.add_argument("instruction")
+    schedules_add_parser.add_argument(
+        "--in-minutes",
+        type=int,
+        default=None,
+        help="One-off: run this many minutes from now",
+    )
+    schedules_add_parser.add_argument(
+        "--every-minutes",
+        type=int,
+        default=None,
+        help="Interval: run every this many minutes (minimum 1)",
+    )
+    schedules_add_parser.add_argument("--use-ai", action="store_true")
+    schedules_add_parser.add_argument("--json", action="store_true")
+    schedules_list_parser = schedules_subparsers.add_parser("list", help="List schedules")
+    schedules_list_parser.add_argument("--json", action="store_true")
+    schedules_toggle_parser = schedules_subparsers.add_parser(
+        "toggle", help="Enable or disable a schedule"
+    )
+    schedules_toggle_parser.add_argument("schedule_id")
+    schedules_toggle_parser.add_argument(
+        "--enabled", choices=("true", "false"), required=True
+    )
+    schedules_toggle_parser.add_argument("--json", action="store_true")
+    schedules_delete_parser = schedules_subparsers.add_parser(
+        "delete", help="Delete a schedule"
+    )
+    schedules_delete_parser.add_argument("schedule_id")
+    schedules_delete_parser.add_argument("--yes", action="store_true")
+    schedules_delete_parser.add_argument("--json", action="store_true")
+    schedules_tick_parser = schedules_subparsers.add_parser(
+        "tick", help="Run every schedule that is due right now (and wait for those tasks)"
+    )
+    schedules_tick_parser.add_argument("--json", action="store_true")
+
+    system_parser = subparsers.add_parser(
+        "system",
+        help="Live system monitoring: CPU, memory, disk, network, GPU, processes (Phase 6)",
+    )
+    system_subparsers = system_parser.add_subparsers(dest="system_command")
+    system_status_parser = system_subparsers.add_parser(
+        "status", help="One real system snapshot (two samples for rates)"
+    )
+    system_status_parser.add_argument("--json", action="store_true")
+    system_sample_parser = system_subparsers.add_parser(
+        "sample", help="Take several samples to measure CPU/network rates"
+    )
+    system_sample_parser.add_argument("--count", type=int, default=3)
+    system_sample_parser.add_argument(
+        "--interval", type=float, default=1.0, help="Seconds between samples"
+    )
+    system_sample_parser.add_argument("--json", action="store_true")
+
+    knowledge_parser = subparsers.add_parser(
+        "knowledge",
+        help="Local knowledge base: ingest documents, semantic search, grounded answers (Phase 8)",
+    )
+    knowledge_subparsers = knowledge_parser.add_subparsers(dest="knowledge_command")
+    knowledge_ingest_parser = knowledge_subparsers.add_parser(
+        "ingest", help="Ingest one text/PDF/Office file into the knowledge base"
+    )
+    knowledge_ingest_parser.add_argument("path", type=Path)
+    knowledge_ingest_parser.add_argument("--json", action="store_true")
+    knowledge_list_parser = knowledge_subparsers.add_parser(
+        "list", help="List ingested knowledge documents"
+    )
+    knowledge_list_parser.add_argument("--json", action="store_true")
+    knowledge_search_parser = knowledge_subparsers.add_parser(
+        "search", help="Semantic/hybrid search over documents and memory notes"
+    )
+    knowledge_search_parser.add_argument("query", nargs="+")
+    knowledge_search_parser.add_argument("--limit", type=int, default=5)
+    knowledge_search_parser.add_argument("--json", action="store_true")
+    knowledge_ask_parser = knowledge_subparsers.add_parser(
+        "ask", help="Ask a question answered only from retrieved local sources (RAG)"
+    )
+    knowledge_ask_parser.add_argument("question", nargs="+")
+    knowledge_ask_parser.add_argument("--json", action="store_true")
+    knowledge_remove_parser = knowledge_subparsers.add_parser(
+        "remove", help="Remove one ingested document by id"
+    )
+    knowledge_remove_parser.add_argument("document_id", type=int)
+    knowledge_stats_parser = knowledge_subparsers.add_parser(
+        "stats", help="Knowledge base and embedding statistics"
+    )
+    knowledge_stats_parser.add_argument("--json", action="store_true")
+
+    agents_parser = subparsers.add_parser(
+        "agents",
+        help="Agent Studio: specialized agents with least-privilege tools + team runs (Phase 9)",
+    )
+    agents_subparsers = agents_parser.add_subparsers(dest="agents_command")
+    agents_list_parser = agents_subparsers.add_parser("list", help="List agent definitions")
+    agents_list_parser.add_argument("--json", action="store_true")
+    agents_show_parser = agents_subparsers.add_parser("show", help="Show one agent definition")
+    agents_show_parser.add_argument("name")
+    agents_show_parser.add_argument("--json", action="store_true")
+    agents_create_parser = agents_subparsers.add_parser(
+        "create", help="Create or update a custom agent (upsert by name)"
+    )
+    agents_create_parser.add_argument("name")
+    agents_create_parser.add_argument("--role", default="")
+    agents_create_parser.add_argument("--description", default="")
+    agents_create_parser.add_argument("--prompt", default="", help="Specialist system prompt")
+    agents_create_parser.add_argument(
+        "--tools", default="", help="Comma-separated builtin tool ids, or * for all"
+    )
+    agents_create_parser.add_argument("--provider", default="")
+    agents_create_parser.add_argument("--max-steps", type=int, default=5)
+    agents_create_parser.add_argument("--token-budget", type=int, default=None)
+    agents_create_parser.add_argument("--json", action="store_true")
+    agents_delete_parser = agents_subparsers.add_parser(
+        "delete", help="Delete a custom agent (builtins can only be disabled)"
+    )
+    agents_delete_parser.add_argument("name")
+    for verb in ("enable", "disable"):
+        toggle_parser = agents_subparsers.add_parser(verb, help=f"{verb.capitalize()} an agent")
+        toggle_parser.add_argument("name")
+    agents_run_parser = agents_subparsers.add_parser(
+        "run", help="Run one task as a specialist agent (filtered tool registry)"
+    )
+    agents_run_parser.add_argument("name")
+    agents_run_parser.add_argument("instruction", nargs="+")
+    agents_run_parser.add_argument("--ai", action="store_true", help="Use AI planning with the agent persona")
+    agents_run_parser.add_argument("--yes", action="store_true", help="Pre-approve exact tool actions")
+    agents_run_parser.add_argument("--json", action="store_true")
+    agents_team_parser = agents_subparsers.add_parser(
+        "team", help="Run a goal as a team of specialists (dependency graph)"
+    )
+    agents_team_parser.add_argument("goal", nargs="+")
+    agents_team_parser.add_argument(
+        "--assignments", type=Path, default=None,
+        help="JSON file with explicit assignments; without it the coordinator proposes them (uses a provider)",
+    )
+    agents_team_parser.add_argument("--ai", action="store_true", help="Use AI planning for each assignment")
+    agents_team_parser.add_argument("--yes", action="store_true", help="Pre-approve exact tool actions")
+    agents_team_parser.add_argument("--json", action="store_true")
+    agents_runs_parser = agents_subparsers.add_parser("runs", help="Recent agent/team runs")
+    agents_runs_parser.add_argument("--agent", default="")
+    agents_runs_parser.add_argument("--team", default="", help="Team run id filter")
+    agents_runs_parser.add_argument("--limit", type=int, default=20)
+    agents_runs_parser.add_argument("--json", action="store_true")
+    agents_stats_parser = agents_subparsers.add_parser("stats", help="Agent Studio statistics")
+    agents_stats_parser.add_argument("--json", action="store_true")
+
+    voice_parser = subparsers.add_parser(
+        "voice",
+        help="Voice pipeline: push-to-talk capture, speech-to-text, text-to-speech, privacy (Phase 10)",
+    )
+    voice_subparsers = voice_parser.add_subparsers(dest="voice_command")
+    voice_status_parser = voice_subparsers.add_parser(
+        "status", help="Live microphone/speech-engine state (honest capabilities)"
+    )
+    voice_status_parser.add_argument("--json", action="store_true")
+    voice_devices_parser = voice_subparsers.add_parser("devices", help="Audio devices on this machine")
+    voice_devices_parser.add_argument("--json", action="store_true")
+    for verb in ("enable", "disable"):
+        toggle = voice_subparsers.add_parser(verb, help=f"{verb.capitalize()} the microphone")
+        toggle.add_argument("--json", action="store_true")
+    voice_wake = voice_subparsers.add_parser(
+        "wake-word", help="Turn optional wake-word listening on or off (second opt-in)"
+    )
+    voice_wake.add_argument("state", choices=("on", "off"))
+    voice_wake.add_argument("--json", action="store_true")
+    voice_ptt_parser = voice_subparsers.add_parser(
+        "ptt", help="Push-to-talk: record for N seconds, transcribe, then release the audio"
+    )
+    voice_ptt_parser.add_argument(
+        "--seconds", type=float, default=None, help="Recording length (bounded by PC_AGENT_VOICE_MAX_SECONDS)"
+    )
+    voice_ptt_parser.add_argument(
+        "--run", action="store_true", help="Execute the transcript as a task after transcribing"
+    )
+    voice_ptt_parser.add_argument(
+        "--cloud-consent",
+        action="store_true",
+        help="Allow this single utterance to use cloud speech-to-text",
+    )
+    voice_ptt_parser.add_argument("--json", action="store_true")
+    voice_transcribe_parser = voice_subparsers.add_parser(
+        "transcribe", help="Transcribe an existing WAV file"
+    )
+    voice_transcribe_parser.add_argument("path", type=Path)
+    voice_transcribe_parser.add_argument("--cloud-consent", action="store_true")
+    voice_transcribe_parser.add_argument("--json", action="store_true")
+    voice_say_parser = voice_subparsers.add_parser("say", help="Speak text through the local synthesizer")
+    voice_say_parser.add_argument("text", nargs="+")
+    voice_say_parser.add_argument("--out", type=Path, default=None, help="Write a WAV instead of playing it")
+    voice_say_parser.add_argument("--json", action="store_true")
+    voice_sessions_parser = voice_subparsers.add_parser("sessions", help="Voice session ledger")
+    voice_sessions_parser.add_argument("--limit", type=int, default=20)
+    voice_sessions_parser.add_argument("--json", action="store_true")
+    voice_privacy_parser = voice_subparsers.add_parser(
+        "privacy", help="Microphone privacy state, retention policy and purge controls"
+    )
+    voice_privacy_parser.add_argument(
+        "--purge-audio", action="store_true", help="Delete every retained recording"
+    )
+    voice_privacy_parser.add_argument(
+        "--clear-history", action="store_true", help="Delete the whole voice ledger (audio first)"
+    )
+    voice_privacy_parser.add_argument("--json", action="store_true")
+    voice_intent_parser = voice_subparsers.add_parser(
+        "intent",
+        help=(
+            "Parse a spoken sentence into a deterministic intent, and optionally "
+            "execute it through the real services"
+        ),
+    )
+    voice_intent_parser.add_argument("text", nargs="+")
+    voice_intent_parser.add_argument(
+        "--execute", action="store_true", help="Perform the intent (tasks still need approval)"
+    )
+    voice_intent_parser.add_argument("--wake-word", default=None, help="Wake phrase to strip")
+    voice_intent_parser.add_argument("--json", action="store_true")
+    voice_loop_parser = voice_subparsers.add_parser(
+        "loop",
+        help=(
+            "Hands-free session: bounded listen -> transcribe -> act -> speak cycles "
+            "with a visible state and an immediate stop"
+        ),
+    )
+    voice_loop_parser.add_argument("--max-cycles", type=int, default=5)
+    voice_loop_parser.add_argument(
+        "--cycle-seconds", type=float, default=4.0, help="Length of each capture"
+    )
+    voice_loop_parser.add_argument("--max-seconds", type=float, default=300.0)
+    voice_loop_parser.add_argument(
+        "--no-wake-word",
+        action="store_true",
+        help="Push-to-talk style session: do not require the wake phrase",
+    )
+    voice_loop_parser.add_argument(
+        "--no-speak", action="store_true", help="Do not speak the replies"
+    )
+    voice_loop_parser.add_argument("--json", action="store_true")
+    voice_acceptance_parser = voice_subparsers.add_parser(
+        "acceptance",
+        help="Run the real voice gates on this machine and write a sealed acceptance report",
+    )
+    voice_acceptance_parser.add_argument("--out", type=Path, default=None)
+    voice_acceptance_parser.add_argument("--json", action="store_true")
+    voice_acceptance_verify_parser = voice_subparsers.add_parser(
+        "acceptance-verify", help="Verify a stored voice acceptance report offline"
+    )
+    voice_acceptance_verify_parser.add_argument("path", type=Path)
+    voice_acceptance_verify_parser.add_argument("--json", action="store_true")
+
+    automation_parser = subparsers.add_parser(
+        "automation",
+        help="Browser/desktop/vision automation audit, capabilities and local screen analysis (Phase 11)",
+    )
+    automation_subparsers = automation_parser.add_subparsers(dest="automation_command")
+    automation_runs_parser = automation_subparsers.add_parser(
+        "runs", help="Recent gated automation actions (including refusals)"
+    )
+    automation_runs_parser.add_argument("--kind", default="", help="browser, desktop or vision")
+    automation_runs_parser.add_argument("--status", default="")
+    automation_runs_parser.add_argument("--limit", type=int, default=20)
+    automation_runs_parser.add_argument("--json", action="store_true")
+    automation_stats_parser = automation_subparsers.add_parser("stats", help="Automation ledger summary")
+    automation_stats_parser.add_argument("--json", action="store_true")
+    automation_caps_parser = automation_subparsers.add_parser(
+        "capabilities", help="What browser/desktop/vision can actually do on this machine"
+    )
+    automation_caps_parser.add_argument("--json", action="store_true")
+    automation_screen_parser = automation_subparsers.add_parser(
+        "screen", help="Analyse an image locally (or the live screen when desktop automation is on)"
+    )
+    automation_screen_parser.add_argument("--path", default="", help="Workspace image path; omit for live screen")
+    automation_screen_parser.add_argument("--grid", type=int, default=4)
+    automation_screen_parser.add_argument("--json", action="store_true")
+    automation_locate_parser = automation_subparsers.add_parser(
+        "locate", help="Find a template image inside a screenshot (bounded local search)"
+    )
+    automation_locate_parser.add_argument("screen_path")
+    automation_locate_parser.add_argument("template_path")
+    automation_locate_parser.add_argument("--threshold", type=float, default=0.9)
+    automation_locate_parser.add_argument("--json", action="store_true")
+
+    flows_parser = subparsers.add_parser(
+        "flows",
+        help="Visual Workflow Builder: versioned flow graphs, triggers, import/export, runs (Phase 12)",
+    )
+    flows_subparsers = flows_parser.add_subparsers(dest="flows_command")
+    flows_list_parser = flows_subparsers.add_parser("list", help="List stored flows")
+    flows_list_parser.add_argument("--limit", type=int, default=100)
+    flows_list_parser.add_argument("--json", action="store_true")
+    flows_show_parser = flows_subparsers.add_parser(
+        "show", help="Show one flow with its graph, versions, triggers and runs"
+    )
+    flows_show_parser.add_argument("reference", help="Flow id, id prefix or exact name")
+    flows_show_parser.add_argument("--json", action="store_true")
+    flows_create_parser = flows_subparsers.add_parser(
+        "create", help="Create a flow from a JSON document"
+    )
+    flows_create_parser.add_argument("--file", type=Path, required=True)
+    flows_create_parser.add_argument("--json", action="store_true")
+    flows_update_parser = flows_subparsers.add_parser(
+        "update", help="Replace a flow definition (bumps the version)"
+    )
+    flows_update_parser.add_argument("reference")
+    flows_update_parser.add_argument("--file", type=Path, required=True)
+    flows_update_parser.add_argument("--json", action="store_true")
+    flows_validate_parser = flows_subparsers.add_parser(
+        "validate", help="Validate a flow document without saving it"
+    )
+    flows_validate_parser.add_argument("--file", type=Path, required=True)
+    flows_validate_parser.add_argument("--json", action="store_true")
+    flows_delete_parser = flows_subparsers.add_parser("delete", help="Delete a flow and its triggers")
+    flows_delete_parser.add_argument("reference")
+    flows_delete_parser.add_argument("--json", action="store_true")
+    for verb in ("enable", "disable"):
+        flows_toggle_parser = flows_subparsers.add_parser(verb, help=f"{verb.capitalize()} a flow")
+        flows_toggle_parser.add_argument("reference")
+        flows_toggle_parser.add_argument("--json", action="store_true")
+    flows_run_parser = flows_subparsers.add_parser(
+        "run", help="Run a flow now as a Mission Center mission"
+    )
+    flows_run_parser.add_argument("reference")
+    flows_run_parser.add_argument("--json", action="store_true")
+    flows_runs_parser = flows_subparsers.add_parser("runs", help="Flow run ledger")
+    flows_runs_parser.add_argument("reference", nargs="?", default=None)
+    flows_runs_parser.add_argument("--limit", type=int, default=20)
+    flows_runs_parser.add_argument("--json", action="store_true")
+    flows_export_parser = flows_subparsers.add_parser(
+        "export", help="Export a flow (flow + triggers + checksum) to JSON"
+    )
+    flows_export_parser.add_argument("reference")
+    flows_export_parser.add_argument("--out", type=Path, default=None)
+    flows_export_parser.add_argument("--json", action="store_true")
+    flows_import_parser = flows_subparsers.add_parser(
+        "import", help="Import an exported flow document (checksum verified)"
+    )
+    flows_import_parser.add_argument("--file", type=Path, required=True)
+    flows_import_parser.add_argument("--overwrite", action="store_true")
+    flows_import_parser.add_argument("--json", action="store_true")
+    flows_trigger_parser = flows_subparsers.add_parser(
+        "trigger", help="Add, list, enable, disable or delete flow triggers"
+    )
+    flows_trigger_subparsers = flows_trigger_parser.add_subparsers(dest="trigger_command")
+    trigger_add_parser = flows_trigger_subparsers.add_parser("add", help="Add a trigger")
+    trigger_add_parser.add_argument("reference")
+    trigger_add_parser.add_argument("--kind", default="schedule", choices=["schedule", "event"])
+    trigger_add_parser.add_argument("--interval-seconds", type=int, default=None)
+    trigger_add_parser.add_argument("--run-at", default=None, help="ISO timestamp for a one-shot run")
+    trigger_add_parser.add_argument("--event-type", default="")
+    trigger_add_parser.add_argument("--json", action="store_true")
+    trigger_list_parser = flows_trigger_subparsers.add_parser("list", help="List triggers")
+    trigger_list_parser.add_argument("reference", nargs="?", default=None)
+    trigger_list_parser.add_argument("--json", action="store_true")
+    for verb in ("enable", "disable", "delete"):
+        trigger_toggle_parser = flows_trigger_subparsers.add_parser(
+            verb, help=f"{verb.capitalize()} one trigger by id"
+        )
+        trigger_toggle_parser.add_argument("trigger_id")
+        trigger_toggle_parser.add_argument("--json", action="store_true")
+    flows_tick_parser = flows_subparsers.add_parser(
+        "tick", help="Fire due schedule/event triggers once (bounded)"
+    )
+    flows_tick_parser.add_argument("--limit", type=int, default=10)
+    flows_tick_parser.add_argument("--json", action="store_true")
+    flows_stats_parser = flows_subparsers.add_parser("stats", help="Flow counts and run summary")
+    flows_stats_parser.add_argument("--json", action="store_true")
+
+    connectors_parser = subparsers.add_parser(
+        "connectors",
+        help="Calendar, drive, mail, chat and webhook connectors (Phase 13)",
+    )
+    connectors_subparsers = connectors_parser.add_subparsers(dest="connectors_command")
+    connectors_status_parser = connectors_subparsers.add_parser(
+        "status", help="Gate state, configuration and ledger counts"
+    )
+    connectors_status_parser.add_argument(
+        "--probe", action="store_true", help="Also probe local calendar/drive targets"
+    )
+    connectors_status_parser.add_argument("--json", action="store_true")
+    connectors_events_parser = connectors_subparsers.add_parser(
+        "events", help="Inbound connector ledger"
+    )
+    connectors_events_parser.add_argument("--connector", default=None)
+    connectors_events_parser.add_argument("--limit", type=int, default=25)
+    connectors_events_parser.add_argument("--json", action="store_true")
+    connectors_deliveries_parser = connectors_subparsers.add_parser(
+        "deliveries", help="Outbound delivery ledger"
+    )
+    connectors_deliveries_parser.add_argument("--connector", default=None)
+    connectors_deliveries_parser.add_argument("--limit", type=int, default=20)
+    connectors_deliveries_parser.add_argument("--json", action="store_true")
+
+    connectors_calendar_parser = connectors_subparsers.add_parser(
+        "calendar", help="Read or add events in the local .ics calendar"
+    )
+    connectors_calendar_subparsers = connectors_calendar_parser.add_subparsers(
+        dest="connectors_action"
+    )
+    calendar_list_parser = connectors_calendar_subparsers.add_parser(
+        "list", help="Upcoming events"
+    )
+    calendar_list_parser.add_argument("--days", type=int, default=7)
+    calendar_list_parser.add_argument("--limit", type=int, default=None)
+    calendar_list_parser.add_argument("--json", action="store_true")
+    calendar_add_parser = connectors_calendar_subparsers.add_parser(
+        "add", help="Add one event"
+    )
+    calendar_add_parser.add_argument("--summary", required=True)
+    calendar_add_parser.add_argument("--start", required=True, help="ISO-8601 instant")
+    calendar_add_parser.add_argument("--minutes", type=int, default=30)
+    calendar_add_parser.add_argument("--location", default="")
+    calendar_add_parser.add_argument("--description", default="")
+    calendar_add_parser.add_argument("--json", action="store_true")
+
+    connectors_drive_parser = connectors_subparsers.add_parser(
+        "drive", help="Index the configured folder"
+    )
+    connectors_drive_subparsers = connectors_drive_parser.add_subparsers(
+        dest="connectors_action"
+    )
+    drive_sync_parser = connectors_drive_subparsers.add_parser(
+        "sync", help="Scan the folder and record the changes"
+    )
+    drive_sync_parser.add_argument("--json", action="store_true")
+
+    connectors_mail_parser = connectors_subparsers.add_parser(
+        "mail", help="Read headers or send one approved message"
+    )
+    connectors_mail_subparsers = connectors_mail_parser.add_subparsers(
+        dest="connectors_action"
+    )
+    mail_inbox_parser = connectors_mail_subparsers.add_parser(
+        "inbox", help="Newest message headers (no bodies are downloaded)"
+    )
+    mail_inbox_parser.add_argument("--limit", type=int, default=10)
+    mail_inbox_parser.add_argument("--json", action="store_true")
+    mail_send_parser = connectors_mail_subparsers.add_parser(
+        "send", help="Send one message (requires --confirm SEND)"
+    )
+    mail_send_parser.add_argument("--to", required=True, action="append")
+    mail_send_parser.add_argument("--subject", required=True)
+    mail_send_parser.add_argument("--body", required=True)
+    mail_send_parser.add_argument(
+        "--confirm", default="", help="Type SEND to confirm the outbound message"
+    )
+    mail_send_parser.add_argument("--json", action="store_true")
+
+    connectors_chat_parser = connectors_subparsers.add_parser(
+        "chat", help="Send a signed chat notification"
+    )
+    connectors_chat_subparsers = connectors_chat_parser.add_subparsers(
+        dest="connectors_action"
+    )
+    chat_send_parser = connectors_chat_subparsers.add_parser("send", help="Send a message")
+    chat_send_parser.add_argument("--text", required=True)
+    chat_send_parser.add_argument("--target", default="")
+    chat_send_parser.add_argument("--json", action="store_true")
+
+    connectors_webhook_parser = connectors_subparsers.add_parser(
+        "webhook", help="Verify and record one inbound webhook"
+    )
+    connectors_webhook_subparsers = connectors_webhook_parser.add_subparsers(
+        dest="connectors_action"
+    )
+    webhook_receive_parser = connectors_webhook_subparsers.add_parser(
+        "receive", help="Verify an HMAC-signed body and record it"
+    )
+    webhook_receive_parser.add_argument("--body-file", type=Path, required=True)
+    webhook_receive_parser.add_argument("--timestamp", required=True)
+    webhook_receive_parser.add_argument("--signature", required=True)
+    webhook_receive_parser.add_argument("--json", action="store_true")
+
+
+    i18n_parser = subparsers.add_parser(
+        "i18n", help="Interface languages, coverage and text direction (Phase 17)"
+    )
+    i18n_subparsers = i18n_parser.add_subparsers(dest="i18n_command")
+    i18n_status_parser = i18n_subparsers.add_parser(
+        "status", help="Current language, direction and real translation coverage"
+    )
+    i18n_status_parser.add_argument("--json", action="store_true")
+    i18n_list_parser = i18n_subparsers.add_parser("list", help="Supported languages")
+    i18n_list_parser.add_argument("--json", action="store_true")
+    i18n_strings_parser = i18n_subparsers.add_parser(
+        "strings", help="Every translated interface key for a language"
+    )
+    i18n_strings_parser.add_argument("locale", nargs="?", default=None)
+    i18n_strings_parser.add_argument("--json", action="store_true")
+    i18n_set_parser = i18n_subparsers.add_parser(
+        "set", help="Persist a language / text size / contrast / motion choice"
+    )
+    i18n_set_parser.add_argument("--locale", default=None)
+    i18n_set_parser.add_argument("--scale", type=float, default=None)
+    contrast_group = i18n_set_parser.add_mutually_exclusive_group()
+    contrast_group.add_argument("--high-contrast", dest="high_contrast", action="store_true")
+    contrast_group.add_argument(
+        "--no-high-contrast", dest="high_contrast", action="store_false"
+    )
+    i18n_set_parser.set_defaults(high_contrast=None)
+    motion_group = i18n_set_parser.add_mutually_exclusive_group()
+    motion_group.add_argument("--reduce-motion", dest="reduce_motion", action="store_true")
+    motion_group.add_argument(
+        "--no-reduce-motion", dest="reduce_motion", action="store_false"
+    )
+    i18n_set_parser.set_defaults(reduce_motion=None)
+    i18n_set_parser.add_argument(
+        "--cli-color", choices=["auto", "always", "never"], default=None
+    )
+    i18n_set_parser.add_argument("--json", action="store_true")
+
+    a11y_parser = subparsers.add_parser(
+        "a11y", help="Accessibility status and measured contrast (Phase 17)"
+    )
+    a11y_subparsers = a11y_parser.add_subparsers(dest="a11y_command")
+    a11y_status_parser = a11y_subparsers.add_parser(
+        "status", help="Language, direction, text size, contrast and shortcuts"
+    )
+    a11y_status_parser.add_argument("--json", action="store_true")
+    a11y_check_parser = a11y_subparsers.add_parser(
+        "check", help="Assert the accessibility claims and print the limits"
+    )
+    a11y_check_parser.add_argument("--json", action="store_true")
+    a11y_contrast_parser = a11y_subparsers.add_parser(
+        "contrast", help="Measured WCAG 2.1 contrast ratios for the active palette"
+    )
+    a11y_contrast_parser.add_argument("--palette", choices=["jarvis", "high-contrast"], default=None)
+    a11y_contrast_parser.add_argument("--json", action="store_true")
+
+    perf_parser = subparsers.add_parser(
+        "perf", help="Measured local performance (Phase 17)"
+    )
+    perf_subparsers = perf_parser.add_subparsers(dest="perf_command")
+    perf_bench_parser = perf_subparsers.add_parser(
+        "bench", help="Time health, events, a11y and system status locally"
+    )
+    perf_bench_parser.add_argument("--iterations", type=int, default=5)
+    perf_bench_parser.add_argument("--json", action="store_true")
+
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="Optional encrypted device sync and coordination (Phase 16)",
+    )
+    sync_subparsers = sync_parser.add_subparsers(dest="sync_command")
+    sync_status_parser = sync_subparsers.add_parser(
+        "status", help="Gate, device identity, peers, limits and the sync folder state"
+    )
+    sync_status_parser.add_argument("--json", action="store_true")
+    sync_identity_parser = sync_subparsers.add_parser(
+        "identity", help="This device's public id, fingerprint and public keys"
+    )
+    sync_identity_parser.add_argument("--json", action="store_true")
+    sync_peers_parser = sync_subparsers.add_parser("peers", help="Paired devices")
+    sync_peers_parser.add_argument("--json", action="store_true")
+    sync_pair_parser = sync_subparsers.add_parser(
+        "pair", help="Trust another device's public keys (needs --confirm PAIR)"
+    )
+    sync_pair_parser.add_argument("--name", required=True)
+    sync_pair_parser.add_argument("--sign", required=True, help="Peer Ed25519 public key (base64)")
+    sync_pair_parser.add_argument(
+        "--encrypt", required=True, help="Peer X25519 public key (base64)"
+    )
+    sync_pair_parser.add_argument("--confirm", default=None)
+    sync_pair_parser.add_argument("--json", action="store_true")
+    sync_unpair_parser = sync_subparsers.add_parser("unpair", help="Forget a paired device")
+    sync_unpair_parser.add_argument("device")
+    sync_unpair_parser.add_argument("--json", action="store_true")
+    sync_pause_parser = sync_subparsers.add_parser(
+        "pause", help="Pause a peer (its bundles are refused until resumed)"
+    )
+    sync_pause_parser.add_argument("device")
+    sync_pause_parser.add_argument("--json", action="store_true")
+    sync_resume_parser = sync_subparsers.add_parser("resume", help="Resume a paused peer")
+    sync_resume_parser.add_argument("device")
+    sync_resume_parser.add_argument("--json", action="store_true")
+    sync_export_parser = sync_subparsers.add_parser(
+        "export", help="Write an encrypted bundle for every paired device"
+    )
+    sync_export_parser.add_argument("--path", type=Path, default=None)
+    sync_export_parser.add_argument("--json", action="store_true")
+    sync_import_parser = sync_subparsers.add_parser(
+        "import", help="Verify, decrypt and apply a bundle from a paired device"
+    )
+    sync_import_parser.add_argument("path", type=Path)
+    sync_import_parser.add_argument("--json", action="store_true")
+    sync_tick_parser = sync_subparsers.add_parser(
+        "tick", help="Export a fresh bundle and import everything new in the sync folder"
+    )
+    sync_tick_parser.add_argument("--json", action="store_true")
+    sync_bundles_parser = sync_subparsers.add_parser("bundles", help="Bundle ledger")
+    sync_bundles_parser.add_argument("--direction", choices=["in", "out"], default=None)
+    sync_bundles_parser.add_argument("--limit", type=int, default=25)
+    sync_bundles_parser.add_argument("--json", action="store_true")
+    sync_requests_parser = sync_subparsers.add_parser(
+        "requests", help="Coordination requests from paired devices"
+    )
+    sync_requests_parser.add_argument("--status", default=None)
+    sync_requests_parser.add_argument("--limit", type=int, default=25)
+    sync_requests_parser.add_argument("--json", action="store_true")
+    sync_request_parser = sync_subparsers.add_parser(
+        "request", help="Ask a paired device to remind or notify you"
+    )
+    sync_request_parser.add_argument("kind", choices=["remind", "notify", "ping"])
+    sync_request_parser.add_argument("--title", required=True)
+    sync_request_parser.add_argument("--body", default="")
+    sync_request_parser.add_argument("--due", default="")
+    sync_request_parser.add_argument("--severity", default="normal")
+    sync_request_parser.add_argument("--json", action="store_true")
+    sync_decide_parser = sync_subparsers.add_parser(
+        "decide", help="Accept or deny a peer's coordination request locally"
+    )
+    sync_decide_parser.add_argument("request")
+    group = sync_decide_parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--accept", action="store_true")
+    group.add_argument("--deny", action="store_true")
+    sync_decide_parser.add_argument("--note", default="")
+    sync_decide_parser.add_argument("--json", action="store_true")
+
+    plugins_parser = subparsers.add_parser(
+        "plugins",
+        help="Signed plugin and skill ecosystem (Phase 15)",
+    )
+    plugins_subparsers = plugins_parser.add_subparsers(dest="plugins_command")
+    plugins_status_parser = plugins_subparsers.add_parser(
+        "status", help="Gate, signature policy, sandbox and installed plugins"
+    )
+    plugins_status_parser.add_argument("--json", action="store_true")
+    plugins_list_parser = plugins_subparsers.add_parser("list", help="List installed plugins")
+    plugins_list_parser.add_argument("--json", action="store_true")
+    plugins_show_parser = plugins_subparsers.add_parser(
+        "show", help="Full plugin detail including version history"
+    )
+    plugins_show_parser.add_argument("plugin")
+    plugins_show_parser.add_argument("--json", action="store_true")
+    plugins_verify_parser = plugins_subparsers.add_parser(
+        "verify", help="Validate a bundle without installing it"
+    )
+    plugins_verify_parser.add_argument("bundle", type=Path)
+    plugins_verify_parser.add_argument("--json", action="store_true")
+    plugins_install_parser = plugins_subparsers.add_parser(
+        "install", help="Verify and install a signed .zip bundle"
+    )
+    plugins_install_parser.add_argument("bundle", type=Path)
+    plugins_install_parser.add_argument("--json", action="store_true")
+    plugins_enable_parser = plugins_subparsers.add_parser("enable", help="Enable a plugin")
+    plugins_enable_parser.add_argument("plugin")
+    plugins_enable_parser.add_argument("--json", action="store_true")
+    plugins_disable_parser = plugins_subparsers.add_parser("disable", help="Disable a plugin")
+    plugins_disable_parser.add_argument("plugin")
+    plugins_disable_parser.add_argument("--json", action="store_true")
+    plugins_rollback_parser = plugins_subparsers.add_parser(
+        "rollback", help="Switch a plugin back to an earlier installed version"
+    )
+    plugins_rollback_parser.add_argument("plugin")
+    plugins_rollback_parser.add_argument("--version", default=None)
+    plugins_rollback_parser.add_argument("--json", action="store_true")
+    plugins_remove_parser = plugins_subparsers.add_parser(
+        "remove", help="Uninstall a plugin and delete its files"
+    )
+    plugins_remove_parser.add_argument("plugin")
+    plugins_remove_parser.add_argument("--json", action="store_true")
+    plugins_run_parser = plugins_subparsers.add_parser(
+        "run", help="Run one declared tool in the OS sandbox (needs --confirm)"
+    )
+    plugins_run_parser.add_argument("plugin")
+    plugins_run_parser.add_argument("tool")
+    plugins_run_parser.add_argument(
+        "--arg",
+        action="append",
+        default=[],
+        metavar="NAME=JSON",
+        help="Tool argument as NAME=JSON (repeatable)",
+    )
+    plugins_run_parser.add_argument(
+        "--confirm",
+        default=None,
+        help="Pass the plugin id to accept running third-party code",
+    )
+    plugins_run_parser.add_argument("--json", action="store_true")
+    plugins_skills_parser = plugins_subparsers.add_parser(
+        "skills", help="Read the plugin's Markdown skills (never executed)"
+    )
+    plugins_skills_parser.add_argument("plugin")
+    plugins_skills_parser.add_argument("--json", action="store_true")
+    plugins_runs_parser = plugins_subparsers.add_parser("runs", help="Sandbox run ledger")
+    plugins_runs_parser.add_argument("--plugin", default=None)
+    plugins_runs_parser.add_argument("--limit", type=int, default=25)
+    plugins_runs_parser.add_argument("--json", action="store_true")
+
+    proactive_parser = subparsers.add_parser(
+        "proactive",
+        help="Reminders, notifications and daily briefings (Phase 14)",
+    )
+    proactive_subparsers = proactive_parser.add_subparsers(dest="proactive_command")
+    proactive_status_parser = proactive_subparsers.add_parser(
+        "status", help="Policy, quiet hours, counters and the next due reminder"
+    )
+    proactive_status_parser.add_argument("--json", action="store_true")
+    proactive_tick_parser = proactive_subparsers.add_parser(
+        "tick", help="Deliver whatever is due right now (same path the scheduler uses)"
+    )
+    proactive_tick_parser.add_argument("--limit", type=int, default=None)
+    proactive_tick_parser.add_argument("--json", action="store_true")
+
+    reminders_parser = proactive_subparsers.add_parser("reminders", help="Manage reminders")
+    reminders_subparsers = reminders_parser.add_subparsers(dest="reminders_command")
+    reminder_list_parser = reminders_subparsers.add_parser("list", help="List reminders")
+    reminder_list_parser.add_argument(
+        "--status", choices=["open", "done", "dismissed"], default=None
+    )
+    reminder_list_parser.add_argument("--limit", type=int, default=50)
+    reminder_list_parser.add_argument("--json", action="store_true")
+    reminder_add_parser = reminders_subparsers.add_parser("add", help="Add a reminder")
+    reminder_add_parser.add_argument("--title", required=True)
+    reminder_add_parser.add_argument(
+        "--due", required=True, help="ISO-8601, HH:MM local time, or +15m / +2h / +1d"
+    )
+    reminder_add_parser.add_argument("--note", default="")
+    reminder_add_parser.add_argument("--repeat-seconds", type=int, default=None)
+    reminder_add_parser.add_argument(
+        "--severity", choices=["low", "normal", "high", "critical"], default="normal"
+    )
+    reminder_add_parser.add_argument("--json", action="store_true")
+    for verb, extra in (
+        ("done", None),
+        ("dismiss", None),
+        ("delete", None),
+        ("snooze", "--for"),
+    ):
+        parser_obj = reminders_subparsers.add_parser(verb, help=f"{verb.capitalize()} a reminder")
+        parser_obj.add_argument("reference", help="Reminder id or unique id prefix")
+        if extra:
+            parser_obj.add_argument(extra, dest="for_spec", default="+15m")
+        parser_obj.add_argument("--json", action="store_true")
+
+    notifications_parser = proactive_subparsers.add_parser(
+        "notifications", help="Notification ledger"
+    )
+    notifications_subparsers = notifications_parser.add_subparsers(dest="notifications_command")
+    notifications_list_parser = notifications_subparsers.add_parser("list")
+    notifications_list_parser.add_argument("--kind", default=None)
+    notifications_list_parser.add_argument("--limit", type=int, default=25)
+    notifications_list_parser.add_argument("--json", action="store_true")
+    notifications_clear_parser = notifications_subparsers.add_parser("clear")
+    notifications_clear_parser.add_argument("--json", action="store_true")
+
+    briefing_parser = proactive_subparsers.add_parser("briefing", help="Daily briefing")
+    briefing_subparsers = briefing_parser.add_subparsers(dest="briefing_command")
+    briefing_show_parser = briefing_subparsers.add_parser("show", help="Latest briefing")
+    briefing_show_parser.add_argument("--limit", type=int, default=3)
+    briefing_show_parser.add_argument("--json", action="store_true")
+    briefing_run_parser = briefing_subparsers.add_parser(
+        "run", help="Compose the briefing now (honours the schedule unless --force)"
+    )
+    briefing_run_parser.add_argument("--force", action="store_true")
+    briefing_run_parser.add_argument("--json", action="store_true")
+
+    notify_parser = proactive_subparsers.add_parser(
+        "notify", help="Send one notification through the full policy"
+    )
+    notify_parser.add_argument("--title", required=True)
+    notify_parser.add_argument("--body", default="")
+    notify_parser.add_argument("--kind", default="general")
+    notify_parser.add_argument(
+        "--severity", choices=["low", "normal", "high", "critical"], default="normal"
+    )
+    notify_parser.add_argument("--json", action="store_true")
+
     ask_parser = subparsers.add_parser(
         "ask", help="Ask the configured provider route (uses the network unless only mock is available)"
     )
@@ -1413,6 +2551,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-fallback",
         action="store_true",
         help="Use only the first provider in the configured route",
+    )
+    ask_parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream the reply token-by-token (first streaming-capable provider)",
     )
 
     tools_parser = subparsers.add_parser(
@@ -2276,9 +3419,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_NEGATIVE_VALUE_FLAGS = ("--due", "--for")
+
+
+def _fold_negative_values(argv: Sequence[str]) -> list[str]:
+    """Let ``--due -1m`` work: argparse would otherwise read ``-1m`` as a flag.
+
+    Only the two reminders flags that legitimately accept a negative-looking
+    relative time are folded, so no other option changes behaviour.
+    """
+
+    folded: list[str] = []
+    index = 0
+    items = list(argv)
+    while index < len(items):
+        token = items[index]
+        if (
+            token in _NEGATIVE_VALUE_FLAGS
+            and index + 1 < len(items)
+            and items[index + 1].startswith("-")
+            and not items[index + 1].startswith("--")
+        ):
+            folded.append(f"{token}={items[index + 1]}")
+            index += 2
+            continue
+        folded.append(token)
+        index += 1
+    return folded
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(_fold_negative_values(raw_argv))
 
     if args.command is None:
         parser.print_help()
@@ -2289,7 +3462,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except PcAgentError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
-    configure_logging(settings.log_level)
+    configure_logging(
+        settings.log_level,
+        log_format=settings.log_format,
+        log_file=(
+            settings.data_dir / "logs" / "pc-agent.jsonl"
+            if settings.log_format == "json"
+            else None
+        ),
+    )
 
     try:
         if args.command == "doctor":
@@ -2326,6 +3507,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_maintenance_command(settings, args)
         if args.command == "diagnostics":
             return _run_diagnostics_command(settings, args)
+        if args.command == "safety":
+            return _run_safety_command(settings, args)
+        if args.command == "approvals":
+            return _run_approvals_command(settings, args)
+        if args.command == "api":
+            return _run_api_command(settings, args)
+        if args.command == "events":
+            return _run_events_command(settings, args)
+        if args.command == "profiles":
+            return _run_profiles_command(settings, args)
+        if args.command == "missions":
+            return _run_missions_command(settings, args)
+        if args.command == "schedules":
+            return _run_schedules_command(settings, args)
+        if args.command == "system":
+            return _run_system_command(settings, args)
+        if args.command == "knowledge":
+            return _run_knowledge_command(settings, args)
+        if args.command == "agents":
+            return _run_agents_command(settings, args)
+        if args.command == "flows":
+            return _run_flows_command(settings, args)
+        if args.command == "i18n":
+            return _run_i18n_command(settings, args)
+        if args.command == "a11y":
+            return _run_a11y_command(settings, args)
+        if args.command == "perf":
+            return _run_perf_command(settings, args)
+        if args.command == "sync":
+            return _run_sync_command(settings, args)
+        if args.command == "plugins":
+            return _run_plugins_command(settings, args)
+        if args.command == "connectors":
+            return _run_connectors_command(settings, args)
+        if args.command == "proactive":
+            return _run_proactive_command(settings, args)
+        if args.command == "voice":
+            return _run_voice_command(settings, args)
+        if args.command == "automation":
+            return _run_automation_command(settings, args)
         if args.command == "ask":
             return _run_ask_command(settings, args)
         if args.command == "tools":
@@ -2484,7 +3705,7 @@ def _run_memory_command(settings: Settings, args: argparse.Namespace) -> int:
     if args.memory_command is None:
         print(
             "Usage: pc-agent memory stats|prefs|pref-set|pref-get|pref-delete|"
-            "notes|note-set|note-show|note-delete|workflows|clear ...",
+            "notes|note-set|note-show|note-delete|search|reindex|workflows|clear ...",
             file=sys.stderr,
         )
         return 2
@@ -2507,6 +3728,16 @@ def _run_memory_command(settings: Settings, args: argparse.Namespace) -> int:
         print(f"Preferences: {len(preferences.all())}")
         print(f"Memory notes: {counts['note']}")
         print(f"Workflow memory records: {counts['workflow']}")
+        try:
+            knowledge_stats = _knowledge_service(settings).stats()
+            print(
+                f"Knowledge documents: {knowledge_stats['documents']} "
+                f"(chunks={knowledge_stats['chunks']}, "
+                f"embeddings={knowledge_stats['active_embedding_model']}, "
+                f"embedded notes={knowledge_stats['embedded_notes']})"
+            )
+        except PcAgentError as exc:
+            print(f"Knowledge: unavailable ({exc})")
         print(f"Database: {settings.database_path}")
         return 0
     if command == "prefs":
@@ -2558,8 +3789,11 @@ def _run_memory_command(settings: Settings, args: argparse.Namespace) -> int:
             key=args.key.strip(),
             title=text[:80] or args.key.strip(),
             content={"text": text},
+            tags=str(getattr(args, "tags", "") or ""),
         )
-        print(f"Note saved: {record.key}")
+        embedded = _knowledge_service(settings).embed_memory("note", record.key)
+        suffix = " (embedded for semantic search)" if embedded else ""
+        print(f"Note saved: {record.key}{suffix}")
         return 0
     if command == "note-show":
         record = memory.get("note", args.key.strip())
@@ -2576,6 +3810,38 @@ def _run_memory_command(settings: Settings, args: argparse.Namespace) -> int:
             return 0
         print(f"Note not found: {args.key}", file=sys.stderr)
         return 1
+    if command == "search":
+        from .knowledge import KnowledgeError as _KErr
+
+        service = _knowledge_service(settings)
+        try:
+            payload = service.search_memories(" ".join(args.query), limit=args.limit)
+        except _KErr as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2))
+            return 0
+        print(
+            f"Memory search ({payload['mode']} via {payload['embedding_model']}): "
+            f"{payload['query']}"
+        )
+        if not payload["results"]:
+            print("No matching notes.")
+            return 0
+        for item in payload["results"]:
+            print(f"{item['key']}  {item['title']} (score {item['score']})")
+            print("  " + item["snippet"].replace("\n", "\n  ")[:300])
+        return 0
+    if command == "reindex":
+        service = _knowledge_service(settings)
+        updated = service.backfill_memory_embeddings(limit=1000)
+        stats = service.stats()
+        print(
+            f"Embedded {updated} note(s); total embedded="
+            f"{stats['embedded_notes']} via {stats['active_embedding_model']}"
+        )
+        return 0
     if command == "clear":
         if not args.yes:
             print(
@@ -2591,6 +3857,113 @@ def _run_memory_command(settings: Settings, args: argparse.Namespace) -> int:
             "Task history was kept."
         )
         return 0
+    return 2
+
+
+def _print_search_results(payload: dict) -> None:
+    print(
+        f"Search ({payload['mode']} via {payload['embedding_model']}): "
+        f"{payload['query']}"
+    )
+    if not payload["results"]:
+        print("No matches. Ingest a document (knowledge ingest) or save a note first.")
+        return
+    for index, item in enumerate(payload["results"], start=1):
+        print(f"[S{index}] {item['source']} · {item['title']} (score {item['score']})")
+        print("  " + item["snippet"].replace("\n", "\n  ")[:400])
+
+
+def _run_knowledge_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .knowledge import KnowledgeError
+
+    command = getattr(args, "knowledge_command", None)
+    if command is None:
+        print(
+            "Usage: pc-agent knowledge ingest|list|search|ask|remove|stats ...",
+            file=sys.stderr,
+        )
+        return 2
+    as_json = bool(getattr(args, "json", False))
+    service = _knowledge_service(settings)
+    try:
+        if command == "ingest":
+            target = _resolve_cli_path(settings, args.path, existing=True)
+            document = service.ingest_file(target)
+            if as_json:
+                print(json.dumps(document, indent=2))
+            else:
+                state = (
+                    "already ingested as" if document["already_ingested"] else "ingested as"
+                )
+                print(
+                    f"Document {state} #{document['id']}: {document['title']} "
+                    f"[{document['kind']}] chunks={document['chunk_count']} "
+                    f"embeddings={document['embedding_model']}"
+                )
+            return 0
+        if command == "list":
+            payload = service.list_documents()
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["documents"]:
+                print("No knowledge documents ingested yet.")
+                return 0
+            for document in payload["documents"]:
+                print(
+                    f"#{document['id']} {document['title']} [{document['kind']}] "
+                    f"chunks={document['chunk_count']} chars={document['characters']} "
+                    f"({document['source_name']})"
+                )
+            return 0
+        if command == "search":
+            payload = service.search(" ".join(args.query), limit=args.limit)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                _print_search_results(payload)
+            return 0
+        if command == "ask":
+            _require_license(settings, FEATURE_PROVIDERS)
+            payload = service.ask(" ".join(args.question))
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if payload.get("answer") is None:
+                print(str(payload.get("note") or "No sources matched."))
+                return 0
+            print(payload["answer"])
+            print("\nSources:")
+            for index, item in enumerate(payload["sources"], start=1):
+                print(f"[S{index}] {item['source']} · {item['title']}")
+            print(
+                f"(answered by {payload.get('provider')}/{payload.get('model')} "
+                "grounded only in these sources)"
+            )
+            return 0
+        if command == "remove":
+            removed = service.remove_document(args.document_id)
+            print(f"Removed knowledge document #{removed['removed']}: {removed['title']}")
+            return 0
+        if command == "stats":
+            stats = service.stats()
+            if as_json:
+                print(json.dumps({"knowledge": stats}, indent=2))
+                return 0
+            print(
+                f"Knowledge: documents={stats['documents']} chunks={stats['chunks']} "
+                f"embeddings={stats['active_embedding_model']} "
+                f"({'offline' if stats['embedding_local'] else 'provider'})"
+            )
+            print(
+                f"Memory notes: {stats['memories'].get('note', 0)} "
+                f"(embedded={stats['embedded_notes']}); "
+                f"supported: {', '.join(stats['supported_suffixes'])}"
+            )
+            return 0
+    except (KnowledgeError, PcAgentError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 2
 
 
@@ -2626,10 +3999,80 @@ def _run_doctor(settings: Settings, *, as_json: bool = False) -> int:
         / "dynamic-tools"
         / "word_count_arguments.json"
     )
+    print(f"Self-Healing PC Agent {__version__} ({TRANSFORMATION_LABEL})")
+    print(f"Transformation baseline: {baseline_status(settings.root_dir).summary()}")
     print(
-        f"Self-Healing PC Agent {__version__} "
-        "(PHASE 58 Windows Auto-Upgrade Lock Hotfix)"
+        "Safety kernel: "
+        f"hard_timeouts={'on' if settings.safety_hard_timeouts else 'OFF'}; "
+        f"worker_isolation={'on' if settings.safety_worker_isolation else 'off'}; "
+        f"max_tool_seconds={settings.safety_max_tool_seconds:g}; "
+        f"{EmergencyStop(settings.data_dir).status().summary()}; "
+        "pending_approvals="
+        f"{ExecutionRepository(database).pending_approval_center_count()}"
     )
+    print(
+        "Local service: "
+        f"api={'on' if settings.api_enabled else 'off'} "
+        f"http://{settings.api_host}:{settings.api_port} (loopback); "
+        f"log_format={settings.log_format}; "
+        f"profile={settings.active_profile or 'none'}; "
+        f"events={EventRepository(database).count()}"
+    )
+    _mission_counts = MissionRepository(database)
+    print(
+        "Mission center: "
+        f"missions={_mission_counts.count_missions()}; "
+        f"max_parallel={settings.mission_max_parallel}; "
+        f"schedules={_mission_counts.count_schedules()} "
+        f"(enabled={_mission_counts.count_schedules(enabled_only=True)}); "
+        f"scheduler_interval={settings.scheduler_interval_seconds}s"
+    )
+    from .system_monitor import SystemMonitor as _DoctorMonitor
+    from .system_monitor import system_summary_line as _system_summary_line
+
+    _doctor_monitor = _DoctorMonitor(
+        root_dir=settings.root_dir, workspace_dir=settings.workspace_dir
+    )
+    _doctor_monitor.snapshot()
+    time.sleep(0.15)
+    print(f"System: {_system_summary_line(_doctor_monitor.snapshot())}")
+    from .provider_platform import provider_platform_line as _provider_platform_line
+
+    print(f"Provider platform: {_provider_platform_line(settings, build_model_router(settings))}")
+    from .knowledge import knowledge_summary_line as _knowledge_summary_line
+
+    print(f"Knowledge: {_knowledge_summary_line(settings, database)}")
+    from .agents import agents_summary_line as _agents_summary_line
+
+    print(f"Agents: {_agents_summary_line(settings, database)}")
+    from .voice import VoiceService as _VoiceService
+
+    _voice_status = _VoiceService(settings, database).status()
+    from .diagnostics import connectors_summary_line as _connectors_summary_line
+
+    print(f"Connectors: {_connectors_summary_line(settings, database)}")
+    from .diagnostics import proactive_summary_line as _proactive_summary_line
+
+    print(f"Proactive: {_proactive_summary_line(settings, database)}")
+    from .diagnostics import plugins_summary_line as _plugins_summary_line
+
+    print(f"Plugins: {_plugins_summary_line(settings, database)}")
+    from .diagnostics import sync_summary_line as _sync_summary_line
+
+    print(f"Sync: {_sync_summary_line(settings, database)}")
+    from .a11y import a11y_summary_line as _a11y_summary_line
+
+    print(f"Accessibility: {_a11y_summary_line(settings)}")
+    from .diagnostics import production_summary_line as _production_summary_line
+
+    print(f"Hardening: {_production_summary_line(settings)}")
+    print(f"Voice: {_voice_status.summary_line()}")
+    from .diagnostics import automation_summary_line as _automation_summary_line
+
+    print(f"Automation: {_automation_summary_line(settings, database)}")
+    from .diagnostics import flows_summary_line as _flows_summary_line
+
+    print(f"Flows: {_flows_summary_line(settings, database)}")
     print(f"Python: {platform.python_version()}")
     print(f"Environment: {summary['environment']}")
     print(f"Root: {summary['root']}")
@@ -3231,7 +4674,1841 @@ def _tool_context(
         vision_allowed=settings.allow_vision,
         vision_max_image_bytes=settings.vision_max_image_bytes,
         vision_router_factory=lambda: build_model_router(settings),
+        knowledge_service_factory=lambda: _knowledge_service(settings),
+        automation_recorder=_automation_recorder(settings),
     )
+
+
+def _automation_repository(settings: Settings) -> Any:
+    from .storage.repositories import AutomationRepository
+
+    return AutomationRepository(_open_database(settings))
+
+
+def _automation_recorder(settings: Settings) -> Any:
+    """Best-effort audit hook: a refused write must never break the action."""
+
+    def record(payload: dict[str, Any]) -> None:
+        try:
+            _automation_repository(settings).record(**payload)
+        except Exception:  # noqa: BLE001 - auditing is not allowed to gate actions
+            return
+
+    return record
+
+
+def _knowledge_service(settings: Settings) -> Any:
+    from .knowledge import KnowledgeService
+
+    return KnowledgeService(settings, _open_database(settings))
+
+
+def _agent_studio(settings: Settings) -> Any:
+    from .agents import AgentStudio
+
+    return AgentStudio(settings, _open_database(settings))
+
+
+def _voice_service(settings: Settings) -> Any:
+    from .voice import VoiceService
+
+    return VoiceService(settings, _open_database(settings))
+
+
+def _automation_capabilities(settings: Settings) -> dict[str, Any]:
+    from .browser_cdp import BrowserClient, probe_browser
+    from .desktop_automation import probe_desktop_automation
+
+    version = probe_browser(port=settings.browser_port)
+    browser = {
+        "status": "connected" if version else "no debug browser is listening",
+        "version": (
+            f"{version.get('Browser', 'unknown')} at "
+            f"{BrowserClient(port=settings.browser_port).endpoint}"
+            if version
+            else ""
+        ),
+    }
+    desktop = probe_desktop_automation()
+    registry = build_default_registry()
+    tools = sorted(
+        tool.spec.id
+        for tool in registry.list_tools()
+        if tool.spec.id.startswith(("browser.", "desktop.", "vision."))
+    )
+    return {
+        "browser": {
+            "enabled": bool(settings.allow_browser),
+            "port": settings.browser_port,
+            **browser,
+        },
+        "desktop": {
+            "enabled": bool(settings.allow_desktop_automation),
+            **desktop,
+        },
+        "vision": {
+            "local_analysis": True,
+            "provider_vision_enabled": bool(settings.allow_vision),
+            "max_image_bytes": settings.vision_max_image_bytes,
+        },
+        "tools": tools,
+        "tool_count": len(tools),
+    }
+
+
+def _run_automation_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = args.automation_command or "stats"
+    repository = _automation_repository(settings)
+    as_json = bool(getattr(args, "json", False))
+    if command == "capabilities":
+        payload = _automation_capabilities(settings)
+        if as_json:
+            print(json.dumps(payload, indent=2))
+            return 0
+        print(
+            f"browser: {'enabled' if payload['browser']['enabled'] else 'off'} "
+            f"(port {payload['browser']['port']}; {payload['browser'].get('status', 'unknown')})"
+        )
+        print(
+            f"desktop automation: {'enabled' if payload['desktop']['enabled'] else 'off'}"
+            f"{'; ' + str(payload['desktop'].get('reason', '')) if not payload['desktop'].get('available', True) else ''}"
+        )
+        print(
+            "vision: local analysis available; provider vision "
+            + ("enabled" if payload["vision"]["provider_vision_enabled"] else "off")
+        )
+        print(f"automation tools ({payload['tool_count']}): {', '.join(payload['tools'])}")
+        return 0
+    if command == "runs":
+        runs = repository.list_runs(
+            kind=args.kind, status=args.status, limit=args.limit
+        )
+        if as_json:
+            print(
+                json.dumps(
+                    [
+                        {
+                            "id": run.id,
+                            "kind": run.kind,
+                            "tool_id": run.tool_id,
+                            "action": run.action,
+                            "target": run.target,
+                            "status": run.status,
+                            "detail": run.detail,
+                            "allowed": run.allowed,
+                            "created_at": run.created_at.isoformat(),
+                        }
+                        for run in runs
+                    ],
+                    indent=2,
+                )
+            )
+            return 0
+        if not runs:
+            print("No automation runs recorded yet.")
+            return 0
+        for run in runs:
+            print(
+                f"#{run.id} {run.kind}/{run.tool_id} {run.action} "
+                f"[{run.status}{'' if run.allowed else ', REFUSED'}] "
+                f"{run.target[:60]}"
+                + (f" - {run.detail[:80]}" if run.detail else "")
+            )
+        return 0
+    if command == "stats":
+        payload = repository.summary()
+        if as_json:
+            print(json.dumps(payload, indent=2))
+            return 0
+        by_kind = ", ".join(
+            f"{kind}={count}" for kind, count in sorted(payload["by_kind"].items())
+        ) or "none"
+        print(
+            f"automation runs: total={payload['total']} ({by_kind}); "
+            f"refused={payload['refused']}; last={payload['last_at'] or 'never'}"
+        )
+        return 0
+    if command in {"screen", "locate"}:
+        from .errors import ToolError
+        from .tools.builtins import build_default_registry as _registry
+
+        context = _tool_context(settings)
+        registry = _registry()
+        if command == "screen":
+            arguments: dict[str, Any] = {"grid": max(1, min(int(args.grid), 12))}
+            if args.path:
+                arguments["path"] = args.path
+        else:
+            arguments = {
+                "screen_path": args.screen_path,
+                "template_path": args.template_path,
+                "threshold": args.threshold,
+            }
+        tool_id = "vision.screen" if command == "screen" else "vision.locate"
+        try:
+            result = registry.invoke(tool_id, arguments, context)
+        except ToolError as exc:
+            print(f"Automation error: {exc}", file=sys.stderr)
+            return 1
+        payload = result.output or {}
+        if as_json:
+            print(json.dumps(payload, indent=2))
+        elif command == "screen":
+            print(
+                f"{payload.get('width')}x{payload.get('height')} from {payload.get('source')}; "
+                f"brightness={payload.get('brightness')} contrast={payload.get('contrast')}; "
+                f"text_likely={payload.get('text_likely')}"
+            )
+            print(str(payload.get("region_hint") or ""))
+        else:
+            if payload.get("found"):
+                match = payload["matches"][0]
+                print(
+                    f"found at ({match['x']}, {match['y']}) {match['width']}x{match['height']} "
+                    f"score={payload['score']} steps={payload['search_steps']}"
+                )
+            else:
+                print(
+                    f"not found (best score {payload.get('score')} below "
+                    f"{payload.get('threshold')}; steps={payload.get('search_steps')})"
+                )
+        return 0
+    print("Usage: pc-agent automation [capabilities|runs|stats|screen|locate]")
+    return 0
+
+
+def _run_proactive_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .errors import ProactiveError
+
+    command = args.proactive_command or "status"
+    sub = getattr(args, "reminders_command", None) or getattr(
+        args, "notifications_command", None
+    ) or getattr(args, "briefing_command", None)
+    service = _local_service(settings)
+    as_json = bool(getattr(args, "json", False))
+    try:
+        if command == "status":
+            payload = service.proactive_status()
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            print(
+                f"proactive={'on' if payload['enabled'] else 'off'} "
+                f"outbound={'on' if payload['outbound_enabled'] else 'off'} "
+                f"quiet={payload['quiet_hours']} (now={'yes' if payload['quiet_now'] else 'no'}) "
+                f"briefing={payload['briefing_time'] if payload['briefing_enabled'] else 'off'}"
+            )
+            print(
+                f"reminders open={payload['reminders_open']} next={payload['next_due_at'] or '-'} | "
+                f"notifications={payload['notifications']} "
+                f"(last hour {payload['notifications_last_hour']}/{payload['notification_max_per_hour']}) "
+                f"briefings={payload['briefings']} last={payload['last_briefing_at'] or 'never'}"
+            )
+            return 0
+        if command == "tick":
+            payload = service.proactive_tick(limit=args.limit, source="cli")
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            print(
+                f"delivered={payload['total']} deferred={len(payload['deferred'])} "
+                f"at={payload['at'][:19]}"
+            )
+            for item in payload["fired"]:
+                reminder = item["reminder"]
+                print(f"  fired: {reminder['title']} (due {reminder['due_at'][:19]})")
+            for item in payload["deferred"]:
+                print(f"  deferred: {item['title']} - {item['reason']}")
+            briefing = payload.get("briefing")
+            if isinstance(briefing, dict):
+                if "briefing" in briefing:
+                    print(f"  briefing: {briefing['briefing']['item_count']} item(s)")
+                elif briefing.get("skipped"):
+                    print(f"  briefing skipped: {briefing['skipped']}")
+            return 0
+        if command == "reminders":
+            action = sub or "list"
+            if action == "add":
+                payload = service.add_reminder(
+                    title=args.title,
+                    due=args.due,
+                    note=args.note,
+                    repeat_seconds=args.repeat_seconds,
+                    severity=args.severity,
+                    source="cli",
+                )
+                if as_json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    repeat = (
+                        f" every {payload['repeat_seconds']}s" if payload["repeat_seconds"] else ""
+                    )
+                    print(
+                        f"reminder {payload['id'][:8]} '{payload['title']}' due "
+                        f"{payload['due_at'][:19]}{repeat} ({payload['severity']})"
+                    )
+                return 0
+            if action == "list":
+                payload = service.reminders(status=args.status, limit=args.limit)
+                if as_json:
+                    print(json.dumps(payload, indent=2))
+                    return 0
+                if not payload["reminders"]:
+                    print("No reminders stored yet.")
+                    return 0
+                for item in payload["reminders"]:
+                    print(
+                        f"{item['id'][:8]} {item['status']:<9} {item['due_at'][:19]} "
+                        f"{item['severity']:<8} {item['title'][:50]}"
+                        + (f" (fired {item['fired_count']}x)" if item["fired_count"] else "")
+                    )
+                print(f"total={payload['total']}")
+                return 0
+            if action == "done":
+                payload = service.resolve_reminder(args.reference, source="cli")
+            elif action == "dismiss":
+                payload = service.dismiss_reminder(args.reference)
+            elif action == "delete":
+                payload = service.delete_reminder(args.reference)
+                print(f"deleted reminder {payload['reminder_id'][:8]}")
+                return 0
+            elif action == "snooze":
+                payload = service.snooze_reminder(args.reference, for_spec=args.for_spec)
+            else:  # pragma: no cover - argparse keeps this unreachable
+                print("usage: pc-agent proactive reminders {list|add|done|dismiss|delete|snooze}")
+                return 2
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"{payload['id'][:8]} {payload['status']} due {payload['due_at'][:19]}")
+            return 0
+        if command == "notifications":
+            if sub == "clear":
+                payload = service.clear_notifications()
+                print(f"cleared {payload['removed']} notification(s)")
+                return 0
+            payload = service.notifications(
+                limit=getattr(args, "limit", 25), kind=getattr(args, "kind", None)
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["notifications"]:
+                print("No notifications recorded yet.")
+                return 0
+            for item in payload["notifications"]:
+                print(
+                    f"{item['created_at'][:19]} {item['kind']:<9} {item['status']:<9} "
+                    f"{item['severity']:<8} {item['title'][:48]} [{item['channels']}]"
+                    + (f" - {item['detail']}" if item["detail"] else "")
+                )
+            print(f"total={payload['total']}")
+            return 0
+        if command == "briefing":
+            if sub == "run":
+                payload = service.run_briefing(force=args.force, source="cli")
+                if as_json:
+                    print(json.dumps(payload, indent=2))
+                    return 0
+                briefing = payload["briefing"]
+                print(f"briefing {briefing['local_date']} ({briefing['item_count']} item(s))")
+                for name, section in payload["sections"].items():
+                    print(f"  {name:<10} {section.get('summary', '')}")
+                return 0
+            payload = service.briefings(limit=getattr(args, "limit", 3))
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["briefings"]:
+                print("No briefings generated yet.")
+                return 0
+            for item in payload["briefings"]:
+                print(
+                    f"{item['generated_at'][:19]} {item['local_date']} "
+                    f"items={item['item_count']} via {item['delivered']}"
+                )
+                print(f"  {item['summary'][:200]}")
+            return 0
+        if command == "notify":
+            payload = service.notify_user(
+                title=args.title,
+                body=args.body,
+                kind=args.kind,
+                severity=args.severity,
+                source="cli",
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"{payload['status']} [{payload['channels']}] {payload['title']}"
+                    + (f" - {payload['detail']}" if payload["detail"] else "")
+                )
+            return 0 if payload["status"] == "delivered" else 1
+    except ProactiveError as exc:
+        print(f"proactive error: {exc}")
+        return 1
+    print("usage: pc-agent proactive {status|tick|reminders|notifications|briefing|notify}")
+    return 2
+
+
+def _run_i18n_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .errors import ConfigError
+    from .i18n import locale_rows
+
+    command = args.i18n_command or "status"
+    service = _local_service(settings)
+
+    def dump(payload: Any) -> None:
+        print(json.dumps(payload, indent=2, default=str))
+
+    try:
+        if command == "status":
+            payload = service.i18n_status()
+            if args.json:
+                dump(payload)
+                return 0
+            print(
+                f"language={payload['locale']} ({payload['name']}) "
+                f"direction={payload['direction']} "
+                f"coverage={payload['coverage']['percent']}% "
+                f"({payload['coverage']['translated_keys']}/"
+                f"{payload['coverage']['total_keys']} keys)"
+            )
+            if payload["notice"]:
+                print(payload["notice"])
+            print("available: " + ", ".join(row["locale"] for row in payload["locales"]))
+            print(f"preferences file: {settings.data_dir / 'ui.json'}")
+            return 0
+        if command == "list":
+            rows = locale_rows()
+            if args.json:
+                dump(rows)
+                return 0
+            for row in rows:
+                marker = "*" if row["is_default"] else " "
+                print(
+                    f"{marker} {row['locale']:<3} {row['name']:<10} "
+                    f"direction={row['direction']:<3} "
+                    f"{row['translated_keys']}/{row['total_keys']} keys "
+                    f"({row['percent']}%)"
+                )
+            return 0
+        if command == "strings":
+            payload = service.i18n_messages(args.locale)
+            if args.json:
+                dump(payload)
+                return 0
+            print(f"{payload['locale']} ({payload['direction']}):")
+            for key in sorted(payload["messages"]):
+                print(f"  {key:<26} {payload['messages'][key]}")
+            return 0
+        if command == "set":
+            payload = service.i18n_set(
+                locale=args.locale,
+                scale=args.scale,
+                high_contrast=args.high_contrast,
+                reduce_motion=args.reduce_motion,
+                cli_color=args.cli_color,
+            )
+            if args.json:
+                dump(payload)
+                return 0
+            changed = ", ".join(f"{k}={v}" for k, v in sorted(payload["saved"].items()))
+            print(f"saved {changed} to {payload['path']}")
+            print(f"{payload['applies']} (an environment variable still wins)")
+            if payload["env_overrides"]:
+                print("warning: an environment variable overrides: "
+                      + ", ".join(payload["env_overrides"]))
+            return 0
+    except ConfigError as exc:
+        print(f"i18n error: {exc}", file=sys.stderr)
+        return 1
+    print("Unknown i18n command.", file=sys.stderr)
+    return 2
+
+
+def _run_a11y_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .a11y import PALETTES, a11y_status, contrast_ratio
+
+    command = args.a11y_command or "status"
+
+    def dump(payload: Any) -> None:
+        print(json.dumps(payload, indent=2, default=str))
+
+    if command == "status":
+        payload = _local_service(settings).a11y_status()
+        if args.json:
+            dump(payload)
+            return 0
+        print(
+            f"language={payload['locale']} ({payload['language_name']}) "
+            f"direction={payload['direction']} text={int(payload['scale'] * 100)}% "
+            f"theme={payload['theme']} motion="
+            f"{'reduced' if payload['reduce_motion'] else 'full'}"
+        )
+        contrast = payload["contrast"]
+        print(
+            f"contrast: {contrast['passing']}/{contrast['total']} pairs meet "
+            f"WCAG 2.1 {contrast['wcag_level']} on the {contrast['palette']} palette"
+        )
+        print("shortcuts: " + "; ".join(f"{s['keys']} = {s['action']}" for s in payload["shortcuts"]))
+        return 0
+    if command == "check":
+        payload = a11y_status(settings)
+        contrast = payload["contrast"]
+        checks = [
+            ("language_supported", payload["locale"] in payload["supported_locales"]),
+            ("coverage_complete", payload["coverage"]["percent"] >= 100.0),
+            (
+                "contrast_aa",
+                contrast["passing"] == contrast["total"],
+            ),
+            ("text_scale_in_range", 0.8 <= payload["scale"] <= 2.0),
+            ("direction_declared", payload["direction"] in {"ltr", "rtl"}),
+            ("keyboard_shortcuts_documented", len(payload["shortcuts"]) >= 4),
+            ("limits_disclosed", len(payload["limitations"]) >= 3),
+        ]
+        if args.json:
+            dump(
+                {
+                    "checks": [{"id": name, "passes": ok} for name, ok in checks],
+                    "failures": [name for name, ok in checks if not ok],
+                    "status": payload,
+                }
+            )
+            return 0 if all(ok for _name, ok in checks) else 1
+        for name, ok in checks:
+            print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+        print(f"limits: {len(payload['limitations'])} disclosed")
+        for limitation in payload["limitations"]:
+            print(f"  - {limitation}")
+        return 0 if all(ok for _name, ok in checks) else 1
+    if command == "contrast":
+        palette_name = args.palette or a11y_status(settings)["theme"]
+        palette = PALETTES[palette_name]
+        rows = [
+            ("text on background", palette["text"], palette["background"]),
+            ("text on panel", palette["text"], palette["panel"]),
+            ("muted on panel", palette["muted"], palette["panel"]),
+            ("accent on background", palette["accent"], palette["background"]),
+            ("ok on panel", palette["ok"], palette["panel"]),
+            ("warn on panel", palette["warn"], palette["panel"]),
+            ("bad on panel", palette["bad"], palette["panel"]),
+        ]
+        payload = [
+            {"pair": name, "ratio": contrast_ratio(fg, bg), "foreground": fg, "background": bg}
+            for name, fg, bg in rows
+        ]
+        if args.json:
+            dump({"palette": palette_name, "pairs": payload})
+            return 0
+        print(f"palette={palette_name} (WCAG 2.1: body text needs 4.5, UI parts 3.0)")
+        for row in payload:
+            verdict = "AA" if row["ratio"] >= 4.5 else ("AA-large" if row["ratio"] >= 3.0 else "FAIL")
+            print(f"  {row['pair']:<22} {row['ratio']:>6} : 1   {verdict}")
+        return 0
+    print("Unknown a11y command.", file=sys.stderr)
+    return 2
+
+
+def _run_perf_command(settings: Settings, args: argparse.Namespace) -> int:
+    if (args.perf_command or "bench") != "bench":
+        print("Unknown perf command.", file=sys.stderr)
+        return 2
+    payload = _local_service(settings).perf_bench(iterations=args.iterations)
+    if args.json:
+        print(json.dumps(payload, indent=2, default=str))
+        return 0
+    print(f"python={payload['python']} platform={payload['platform']} schema=v{payload['schema']}")
+    for name, value in payload["measurements_ms"].items():
+        print(f"  {name:<20} {value:>8.3f} ms")
+    print(payload["notes"])
+    return 0
+
+
+def _run_sync_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .errors import SyncError
+
+    command = args.sync_command or "status"
+    service = _local_service(settings)
+    as_json = bool(getattr(args, "json", False))
+
+    def dump(payload: Any) -> None:
+        print(json.dumps(payload, indent=2, default=str))
+
+    try:
+        if command == "status":
+            payload = service.sync_status()
+            if as_json:
+                dump(payload)
+                return 0
+            print(
+                f"sync={'on' if payload['enabled'] else 'off'} "
+                f"device={payload['device']['device_id'][:12]} "
+                f"name={payload['device_name']} peers={payload['counts']['peers']} "
+                f"bundles={payload['counts']['bundles']} "
+                f"pending_requests={payload['counts']['pending_requests']}"
+            )
+            print(
+                f"transport={payload['transport']} dir={payload['sync_dir'] or 'none'} "
+                f"({payload['sync_dir_state']}) policy={payload['conflict_policy']}"
+            )
+            print(
+                f"limits: bundle<={payload['limits']['max_bundle_bytes']}B "
+                f"records<={payload['limits']['max_records']} "
+                f"skew={payload['limits']['clock_skew_seconds']}s "
+                f"retention={payload['limits']['retention_days']}d"
+            )
+            for peer in payload["peers"]:
+                print(
+                    f"  {peer['device_id'][:12]} {peer['name']:<18} {peer['status']:<7} "
+                    f"fp={peer['fingerprint'][:19]} bundles={peer['bundle_count']}"
+                )
+            if not payload["enabled"]:
+                print(f"  {payload['detail']}")
+            return 0
+        if command == "identity":
+            payload = service.sync_identity()
+            if as_json:
+                dump(payload)
+                return 0
+            print(f"device id: {payload['device_id']}")
+            print(f"fingerprint: {payload['fingerprint']}")
+            print(f"sign public key (Ed25519): {payload['sign_public']}")
+            print(f"encrypt public key (X25519): {payload['encrypt_public']}")
+            print("share these PUBLIC values with your other device only.")
+            return 0
+        if command == "peers":
+            payload = service.sync_peers()
+            if as_json:
+                dump(payload)
+                return 0
+            if not payload["peers"]:
+                print("No paired devices yet.")
+                return 0
+            for peer in payload["peers"]:
+                print(
+                    f"{peer['device_id'][:12]} {peer['name']} [{peer['status']}] "
+                    f"fp={peer['fingerprint']} paired={peer['paired_at']}"
+                )
+            return 0
+        if command == "pair":
+            payload = service.sync_pair(
+                name=args.name,
+                sign_public=args.sign,
+                encrypt_public=args.encrypt,
+                confirm=args.confirm,
+            )
+            if as_json:
+                dump(payload)
+                return 0
+            print(
+                f"paired {payload['name']} ({payload['device_id'][:12]}) "
+                f"fp={payload['fingerprint']}"
+            )
+            return 0
+        if command == "unpair":
+            payload = service.sync_unpair(args.device)
+            if as_json:
+                dump(payload)
+                return 0
+            print(f"unpaired {payload['name']} ({payload['unpaired'][:12]})")
+            return 0
+        if command in {"pause", "resume"}:
+            payload = service.sync_set_peer_enabled(args.device, enabled=command == "resume")
+            if as_json:
+                dump(payload)
+                return 0
+            print(f"{payload['name']} is now {payload['status']}")
+            return 0
+        if command == "export":
+            payload = service.sync_export(path=str(args.path) if args.path else None)
+            if as_json:
+                dump(payload)
+                return 0
+            print(
+                f"exported {payload['size_bytes']} bytes, {payload['records']} record(s) "
+                f"for {len(payload['recipients'])} device(s) as {Path(payload['path']).name}"
+            )
+            print(f"collections: {payload['collections']}")
+            return 0
+        if command == "import":
+            payload = service.sync_import(str(args.path))
+            if as_json:
+                dump(payload)
+                return 0
+            print(
+                f"imported from {payload['from'][:12]} (seq {payload['seq']}): "
+                f"applied={payload['applied']} skipped={payload['skipped']} "
+                f"conflicts={len(payload['conflicts'])} requests={payload['requests']}"
+            )
+            for conflict in payload["conflicts"]:
+                print(f"  conflict {conflict['collection']}/{conflict['name']}: {conflict['reason']}")
+            return 0
+        if command == "tick":
+            payload = service.sync_tick()
+            if as_json:
+                dump(payload)
+                return 0
+            print(
+                f"exported {Path(payload['exported']['path']).name}; "
+                f"imported={len(payload['imported'])} refused={len(payload['refused'])}"
+            )
+            for item in payload["refused"]:
+                print(f"  refused {item['path']}: {item['reason']}")
+            return 0
+        if command == "bundles":
+            payload = service.sync_bundles(direction=args.direction, limit=args.limit)
+            if as_json:
+                dump(payload)
+                return 0
+            if not payload["bundles"]:
+                print("No sync bundles yet.")
+                return 0
+            for entry in payload["bundles"]:
+                print(
+                    f"{entry['created_at']} {entry['direction']:<3} {entry['status']:<9} "
+                    f"seq={entry['seq']} records={entry['record_count']} "
+                    f"bytes={entry['size_bytes']} peer={entry['peer'][:20]}"
+                )
+            return 0
+        if command == "requests":
+            payload = service.sync_requests(status=args.status, limit=args.limit)
+            if as_json:
+                dump(payload)
+                return 0
+            if not payload["requests"]:
+                print("No coordination requests.")
+                return 0
+            for entry in payload["requests"]:
+                body = entry.get("payload") or {}
+                print(
+                    f"{entry['id'][:12]} {entry['kind']:<6} {entry['status']:<9} "
+                    f"from={entry['device'][:10]} {body.get('title', '')[:40]}"
+                    + (f" detail={entry['detail']}" if entry.get("detail") else "")
+                )
+            return 0
+        if command == "request":
+            payload = service.sync_request(
+                args.kind,
+                title=args.title,
+                body=args.body,
+                due=args.due,
+                severity=args.severity,
+            )
+            if as_json:
+                dump(payload)
+                return 0
+            print(
+                f"sent {payload['request']['kind']} request "
+                f"{payload['request']['id'][:12]} in "
+                f"{Path(payload['bundle']['path']).name}"
+            )
+            return 0
+        if command == "decide":
+            payload = service.sync_decide(
+                args.request, accept=bool(args.accept), note=args.note
+            )
+            if as_json:
+                dump(payload)
+                return 0
+            print(f"{payload['request']['id'][:12]} {payload['status']}: {payload['detail']}")
+            return 0
+    except SyncError as exc:
+        print(f"sync error: {exc}", file=sys.stderr)
+        return 1
+    print("Unknown sync command.", file=sys.stderr)
+    return 2
+
+
+def _plugin_arguments(raw: list[str]) -> dict[str, Any]:
+    """Parse repeated ``--arg name=json`` into a typed mapping."""
+
+    from .errors import PluginError
+
+    values: dict[str, Any] = {}
+    for item in raw:
+        if "=" not in item:
+            raise PluginError(f"--arg '{item}' must look like NAME=JSON.")
+        name, _, blob = item.partition("=")
+        key = name.strip()
+        if not key:
+            raise PluginError("--arg needs a name before '='.")
+        if key in values:
+            raise PluginError(f"--arg '{key}' was given twice.")
+        try:
+            values[key] = json.loads(blob)
+        except ValueError:
+            values[key] = blob
+    return values
+
+
+def _run_plugins_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .errors import PluginError
+
+    command = args.plugins_command or "status"
+    service = _local_service(settings)
+    as_json = bool(getattr(args, "json", False))
+
+    def dump(payload: Any) -> None:
+        print(json.dumps(payload, indent=2, default=str))
+
+    try:
+        if command == "status":
+            payload = service.plugin_status()
+            if as_json:
+                dump(payload)
+                return 0
+            sandbox = payload["sandbox"]
+            print(
+                f"plugins={'on' if payload['enabled'] else 'off'} "
+                f"signatures={'required' if payload['signature_required'] else 'optional'} "
+                f"keys={len(payload['trusted_keys'])} "
+                f"installed={payload['counts']['plugins']} "
+                f"enabled={payload['counts']['enabled']} runs={payload['counts']['runs']}"
+            )
+            print(
+                f"sandbox: {sandbox['mechanism']} limits={sandbox['os_limits']} "
+                f"timeout={payload['limits']['timeout_seconds']}s "
+                f"memory={payload['limits']['memory_limit_mb']}MB"
+            )
+            print(f"not grantable: {', '.join(payload['denied_capabilities'])}")
+            if not payload["enabled"]:
+                print(f"  {payload['detail']}")
+            for entry in payload["plugins"]:
+                print(
+                    f"  {entry['id']:<28} {entry['version']:<9} {entry['status']:<9} "
+                    f"tools={len(entry['tools'])} skills={len(entry['skills'])} "
+                    f"key={entry['signature_key'] or 'unsigned'}"
+                )
+            return 0
+        if command == "list":
+            payload = service.plugins()
+            if as_json:
+                dump(payload)
+                return 0
+            if not payload["plugins"]:
+                print("No plugins installed.")
+                return 0
+            for entry in payload["plugins"]:
+                print(
+                    f"{entry['id']} {entry['version']} {entry['status']} "
+                    f"publisher={entry['publisher']} tools={len(entry['tools'])}"
+                )
+            return 0
+        if command == "show":
+            payload = service.plugin_show(args.plugin)
+            if as_json:
+                dump(payload)
+                return 0
+            print(f"{payload['name']} ({payload['id']}) {payload['version']} [{payload['status']}]")
+            print(f"publisher: {payload['publisher']}  license={payload.get('license', '-')}")
+            print(f"description: {payload['description']}")
+            print(f"capabilities: {', '.join(payload['capabilities']) or 'none'}")
+            print(f"signature: {payload['signature_status']} (key={payload['signature_key'] or '-'})")
+            print(f"checksum: {payload['checksum']}")
+            for tool in payload["tools"]:
+                args_text = ", ".join(f"{k}:{v}" for k, v in (tool.get("arguments") or {}).items())
+                print(f"  tool {tool['name']}({args_text}) - {tool['description']}")
+            for skill in payload["skills"]:
+                print(f"  skill {skill}")
+            for version in payload.get("versions", []):
+                print(f"  version {version['version']} installed {version['installed_at']}")
+            return 0
+        if command == "verify":
+            payload = service.plugin_verify(str(args.bundle))
+            if as_json:
+                dump(payload)
+                return 0
+            manifest = payload["manifest"]
+            print(
+                f"{manifest['name']} {manifest['version']} files={payload['file_count']} "
+                f"signature={payload['signature_status']} key={payload['signature_key'] or '-'}"
+            )
+            print(f"capabilities: {', '.join(manifest['capabilities']) or 'none'}")
+            print(f"checksum: {payload['checksum']}")
+            return 0
+        if command == "install":
+            payload = service.plugin_install(str(args.bundle))
+            if as_json:
+                dump(payload)
+                return 0
+            print(
+                f"installed {payload['name']} {payload['version']} "
+                f"(signature={payload['signature_status']}); enable it with "
+                f"'pc-agent plugins enable {payload['id']}'"
+            )
+            return 0
+        if command in {"enable", "disable"}:
+            payload = service.plugin_set_enabled(args.plugin, enabled=command == "enable")
+            if as_json:
+                dump(payload)
+                return 0
+            print(f"{payload['id']} is now {payload['status']}")
+            return 0
+        if command == "rollback":
+            payload = service.plugin_rollback(args.plugin, version=args.version)
+            if as_json:
+                dump(payload)
+                return 0
+            print(f"{payload['id']} rolled back to {payload['version']}")
+            return 0
+        if command == "remove":
+            payload = service.plugin_uninstall(args.plugin)
+            if as_json:
+                dump(payload)
+                return 0
+            print(f"removed {payload['name']} ({payload['deleted']}); {payload['total']} remain")
+            return 0
+        if command == "run":
+            values = _plugin_arguments(list(args.arg or []))
+            payload = service.plugin_run_tool(
+                args.plugin, args.tool, values=values, confirm=args.confirm
+            )
+            if as_json:
+                dump(payload)
+                return 0
+            print(
+                f"{payload['status']} in {payload['duration_ms']}ms "
+                f"({payload['sandbox']['mechanism']})"
+            )
+            if payload["detail"]:
+                print(f"  detail: {payload['detail']}")
+            if payload["result"] is not None:
+                print(f"  result: {json.dumps(payload['result'], default=str)[:2000]}")
+            return 0 if payload["status"] == "ok" else 1
+        if command == "skills":
+            payload = service.plugin_skills(args.plugin)
+            if as_json:
+                dump(payload)
+                return 0
+            if not payload["skills"]:
+                print("This plugin ships no skills.")
+                return 0
+            for skill in payload["skills"]:
+                print(f"--- {skill['path']} ({skill['chars']} chars) ---")
+                print(skill["text"])
+            return 0
+        if command == "runs":
+            payload = service.plugin_runs(plugin_id=args.plugin, limit=args.limit)
+            if as_json:
+                dump(payload)
+                return 0
+            if not payload["runs"]:
+                print("No plugin runs recorded yet.")
+                return 0
+            for run in payload["runs"]:
+                print(
+                    f"{run['created_at']} {run['plugin_id']} {run['tool']} "
+                    f"{run['status']} {run['duration_ms']}ms"
+                    + (f" detail={run['detail']}" if run["detail"] else "")
+                )
+            return 0
+    except PluginError as exc:
+        print(f"plugin error: {exc}", file=sys.stderr)
+        return 1
+    print("Unknown plugins command.", file=sys.stderr)
+    return 2
+
+
+def _run_connectors_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .errors import ConnectorError
+
+    command = args.connectors_command or "status"
+    action = getattr(args, "connectors_action", None)
+    service = _local_service(settings)
+    as_json = bool(getattr(args, "json", False))
+    try:
+        if command == "status":
+            payload = service.connector_status(probe=bool(getattr(args, "probe", False)))
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            print(
+                f"connectors={'on' if payload['allow_connectors'] else 'off'} "
+                f"email_gate={'on' if payload['allow_email_connector'] else 'off'} "
+                f"max_items={payload['max_items']} timeout={payload['timeout_seconds']}s"
+            )
+            for entry in payload["connectors"]:
+                state = "ready" if entry["enabled"] else "off"
+                print(
+                    f"  {entry['connector']:<9} {state:<6} configured={entry['configured']}"
+                    f" target={entry.get('target', '-')}"
+                    + (f" reason={entry['reason']}" if entry["reason"] else "")
+                )
+            ledger = payload["ledger"]
+            print(
+                f"ledger: events={ledger['events']} deliveries={ledger['deliveries']} "
+                f"failed={ledger['deliveries_failed']} state_keys={ledger['state_keys']} "
+                f"last_event={ledger['last_event_at'] or 'never'}"
+            )
+            return 0
+        if command == "events":
+            payload = service.connector_events(
+                connector=args.connector, limit=args.limit
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["events"]:
+                print("No connector events recorded yet.")
+                return 0
+            for event in payload["events"]:
+                print(
+                    f"{event['received_at']} {event['connector']:<9} {event['kind']:<12} "
+                    f"{event['summary'][:70]}"
+                )
+            print(f"total={payload['total']}")
+            return 0
+        if command == "deliveries":
+            payload = service.connector_deliveries(
+                connector=args.connector, limit=args.limit
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["deliveries"]:
+                print("No connector deliveries recorded yet.")
+                return 0
+            for item in payload["deliveries"]:
+                print(
+                    f"{item['created_at']} {item['connector']:<9} {item['status']:<7} "
+                    f"{item['payload_bytes']}B {item['duration_ms']}ms {item['target'][:40]}"
+                )
+            print(f"total={payload['total']}")
+            return 0
+        if command == "calendar" and action == "add":
+            payload = service.connector_calendar_add(
+                summary=args.summary,
+                start=args.start,
+                duration_minutes=args.minutes,
+                location=args.location,
+                description=args.description,
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                event = payload["event"]
+                print(
+                    f"added '{event['summary']}' at {event['start']} (uid {event['uid']})"
+                )
+            return 0
+        if command == "calendar":
+            payload = service.connector_calendar_events(
+                days_ahead=args.days, limit=getattr(args, "limit", None)
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["events"]:
+                print(f"No events in the next {payload['days_ahead']} day(s).")
+                return 0
+            for event in payload["events"]:
+                print(
+                    f"{event['start']} -> {event['end']} {event['summary'][:60]}"
+                    + (f" @ {event['location'][:30]}" if event["location"] else "")
+                )
+            print(f"total={payload['total']} digest={payload['digest'][:12] or 'none'}")
+            return 0
+        if command == "drive":
+            payload = service.connector_drive_sync()
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            print(
+                f"{payload['files']} file(s) indexed, {payload['total_bytes']} bytes; "
+                f"added={payload['added']} modified={payload['modified']} "
+                f"removed={payload['removed']} unchanged={payload['unchanged']} "
+                f"skipped={payload['skipped']}"
+                + (" (truncated)" if payload["truncated"] else "")
+            )
+            return 0
+        if command == "mail" and action == "send":
+            payload = service.connector_mail_send(
+                to=list(args.to),
+                subject=args.subject,
+                body=args.body,
+                confirm=args.confirm,
+            )
+            delivery = payload["delivery"]
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"sent to {delivery['recipient_count']} recipient(s), "
+                    f"{delivery['payload_bytes']} bytes, ledger {delivery['id'][:8]}"
+                )
+            return 0
+        if command == "mail":
+            payload = service.connector_mail_inbox(limit=args.limit)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["messages"]:
+                print("The mailbox returned no message headers.")
+                return 0
+            for message in payload["messages"]:
+                print(
+                    f"{message['date'][:31]:<31} {message['from'][:34]:<34} {message['subject'][:50]}"
+                )
+            print(f"total={payload['total']} (headers only)")
+            return 0
+        if command == "chat":
+            payload = service.connector_chat_send(args.text, target=args.target)
+            result = payload["result"]
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"{'delivered' if result['ok'] else 'failed'} "
+                    f"HTTP {result['status_code']} {result['payload_bytes']}B "
+                    f"{result['duration_ms']}ms -> {result['target']}"
+                )
+            return 0 if result["ok"] else 1
+        if command == "webhook":
+            body = args.body_file.read_bytes()
+            payload = service.connector_webhook_receive(
+                body, timestamp=args.timestamp, signature=args.signature
+            )
+            receipt = payload["receipt"]
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            elif receipt["accepted"]:
+                print(
+                    f"accepted {receipt['kind']} event {receipt['external_id'] or '(no id)'}: "
+                    f"{receipt['summary'][:60]}"
+                )
+            else:
+                print(f"refused: {receipt['reason']}")
+            return 0 if receipt["accepted"] else 1
+    except ConnectorError as exc:
+        print(f"connector error: {exc}")
+        return 1
+    print("usage: pc-agent connectors {status|events|deliveries|calendar|drive|mail|chat|webhook}")
+    return 2
+
+
+def _run_voice_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .errors import VoiceError
+
+    service = _voice_service(settings)
+    command = args.voice_command or "status"
+    as_json = bool(getattr(args, "json", False))
+    try:
+        if command == "status":
+            status = service.status()
+            if as_json:
+                print(json.dumps(status.to_dict(), indent=2))
+            else:
+                print(status.summary_line())
+                microphone = status.microphone
+                print(
+                    f"microphone: {microphone['indicator']} "
+                    f"(state={microphone['state']}, backend={microphone['backend']})"
+                )
+                if microphone["backend_reason"]:
+                    print(f"  backend note: {microphone['backend_reason']}")
+                print(
+                    f"retention: {microphone['retention']}; "
+                    f"store_transcripts={'yes' if microphone['store_transcripts'] else 'no'}; "
+                    f"cloud_stt={'allowed' if microphone['cloud_stt_allowed'] else 'not allowed'}"
+                )
+                print(
+                    f"wake word: {'on' if microphone['wake_word_enabled'] else 'off'} "
+                    f"(optional second opt-in)"
+                )
+                for kind in ("stt", "tts"):
+                    block = status.stt if kind == "stt" else status.tts
+                    state = block["engine"] or "unavailable"
+                    print(f"{kind.upper()}: {state}")
+                    if not block["available"] and block["reason"]:
+                        print(f"  {block['reason']}")
+                print(
+                    f"devices: input={status.input_devices['count']}"
+                    f" ({status.input_devices['method']}); "
+                    f"output={status.output_devices['count']}"
+                )
+                sessions = status.sessions
+                print(
+                    f"sessions: total={sessions['total']} "
+                    f"audio={sessions['audio_seconds']}s "
+                    f"retained={sessions['retained']}"
+                )
+                if status.emergency_stop:
+                    print("emergency stop: ENGAGED - voice is blocked")
+            return 0
+        if command == "devices":
+            devices = service.devices()
+            if as_json:
+                print(json.dumps(devices, indent=2))
+            else:
+                for kind in ("input", "output"):
+                    block = devices[kind]
+                    print(f"{kind} devices ({block['method']}): {block['count']}")
+                    if block["reason"]:
+                        print(f"  {block['reason']}")
+                    for device in block["devices"]:
+                        marker = " (default)" if device["is_default"] else ""
+                        print(f"  - #{device['index']} {device['name']}{marker}")
+            return 0
+        if command in {"enable", "disable"}:
+            payload = (
+                service.enable() if command == "enable" else service.disable()
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"microphone {command}d; indicator={payload['indicator']}")
+            return 0
+        if command == "wake-word":
+            payload = service.set_wake_word(args.state == "on")
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"wake word {'enabled' if payload['wake_word_enabled'] else 'disabled'}; "
+                    f"indicator={payload['indicator']}"
+                )
+            return 0
+        if command == "ptt":
+            seconds = args.seconds
+            maximum = float(settings.voice_max_seconds)
+            if seconds is None:
+                seconds = min(5.0, maximum)
+            if seconds <= 0 or seconds > maximum:
+                print(
+                    f"--seconds must be between 0 and PC_AGENT_VOICE_MAX_SECONDS ({maximum}).",
+                    file=sys.stderr,
+                )
+                return 2
+            if not service.status().microphone["enabled"]:
+                print(
+                    "The microphone is off. Run 'pc-agent voice enable' first "
+                    "(push-to-talk never records before you turn it on).",
+                    file=sys.stderr,
+                )
+                return 1
+            service.start_capture()
+            if not as_json:
+                print(f"recording {seconds:g}s ...")
+            time.sleep(seconds)
+            result = service.stop_capture(cloud_consent=bool(args.cloud_consent))
+            if as_json:
+                print(json.dumps(result, indent=2))
+            else:
+                if result["text"]:
+                    print(f"transcript ({result['engine']}): {result['text']}")
+                else:
+                    print(f"no transcript: {result['error'] or 'silence'}")
+                print(
+                    f"session #{result['session_id']}; audio "
+                    f"{'retained at ' + str(result['audio_path']) if result['audio_retained'] else 'discarded'}"
+                )
+            if args.run and result["text"]:
+                from .service import LocalService
+
+                local = LocalService(settings)
+                try:
+                    submitted = local.submit_task(result["text"])
+                finally:
+                    local.close()
+                print(f"task {submitted['id']} submitted: {submitted['status']}")
+            return 0 if result["text"] else 1
+        if command == "transcribe":
+            payload = service.transcribe_file(args.path, cloud_consent=bool(args.cloud_consent))
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(payload["text"] or "(no speech recognised)")
+            return 0 if payload["text"] else 1
+        if command == "say":
+            payload = service.speak(" ".join(args.text), output_path=args.out)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                if payload["ok"]:
+                    target = payload["output_path"] or "default audio device"
+                    print(f"spoke {payload['characters']} characters via {payload['engine']} -> {target}")
+                else:
+                    print(f"speech failed: {payload['error']}", file=sys.stderr)
+            return 0 if payload["ok"] else 1
+        if command == "sessions":
+            payload = service.sessions(args.limit)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                if not payload:
+                    print("no voice sessions yet")
+                for row in payload:
+                    kept = "audio kept" if row["audio_retained"] else "audio discarded"
+                    print(
+                        f"#{row['id']} {row['mode']} {row['started_at']} "
+                        f"{row['audio_seconds']}s {kept} "
+                        f"chars={row['transcript_chars']} status={row['status']}"
+                        + (f" error={row['error']}" if row["error"] else "")
+                    )
+            return 0
+        if command == "intent":
+            from .voice.intents import VoiceIntentExecutor, parse_intent
+
+            wake_word = args.wake_word
+            if wake_word is None:
+                wake_word = str(settings.voice_wake_word or "")
+            intent = parse_intent(" ".join(args.text), wake_word=wake_word)
+            payload: dict[str, Any] = {"intent": intent.to_dict()}
+            if args.execute:
+                executor = VoiceIntentExecutor(settings, service.database)
+                outcome = executor.execute(intent)
+                payload["outcome"] = outcome.to_dict()
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"intent: {intent.name}"
+                    + (f" (addressed={intent.addressed})" if wake_word else "")
+                )
+                if intent.text:
+                    print(f"  text: {intent.text}")
+                if intent.due:
+                    print(f"  due: {intent.due}")
+                outcome_block = payload.get("outcome")
+                if outcome_block:
+                    print(f"  executed: {outcome_block['executed']} ok={outcome_block['ok']}")
+                    print(f"  reply: {outcome_block['reply']}")
+                    if outcome_block["task_id"]:
+                        print(f"  task: {outcome_block['task_id']}")
+                    if outcome_block["detail"]:
+                        print(f"  detail: {outcome_block['detail'][:300]}")
+            return 0
+        if command == "loop":
+            from .voice.intents import VoiceIntentExecutor
+            from .voice.listener import VoiceLoop
+
+            loop = VoiceLoop(
+                service,
+                VoiceIntentExecutor(settings, service.database),
+                wake_word=str(settings.voice_wake_word or "jarvis"),
+                speak_replies=not args.no_speak,
+            )
+            report = loop.run(
+                max_cycles=args.max_cycles,
+                cycle_seconds=args.cycle_seconds,
+                max_seconds=args.max_seconds,
+                require_wake_phrase=not args.no_wake_word,
+            )
+            if as_json:
+                print(json.dumps(report.to_dict(), indent=2))
+            else:
+                print(report.summary_line())
+                if report.blocked_reason:
+                    print(f"  blocked: {report.blocked_reason}")
+                for cycle in report.cycles:
+                    heard = cycle.get("heard") or f"(nothing: {cycle.get('reason') or cycle.get('error') or 'silence'})"
+                    intent_name = (cycle.get("intent") or {}).get("intent", "-")
+                    print(f"  cycle {cycle['index'] + 1}: {intent_name} <- {heard[:120]}")
+                    if cycle.get("reply"):
+                        print(f"    reply: {cycle['reply']}")
+                    if cycle.get("error"):
+                        print(f"    error: {cycle['error']}")
+            return 0 if report.ok else 1
+        if command == "acceptance":
+            from .voice.acceptance import run_voice_acceptance
+
+            report = run_voice_acceptance(service, version=__version__)
+            target = (
+                _resolve_cli_path(settings, args.out)
+                if args.out is not None
+                else settings.workspace_dir / "voice-acceptance.json"
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(report.to_dict(), indent=1, sort_keys=True), encoding="utf-8"
+            )
+            if as_json:
+                print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+            else:
+                print(f"Voice acceptance: {report.summary()}")
+                for gate in report.gates:
+                    marker = {"pass": "ok", "fail": "FAIL", "not-run": "skip"}.get(
+                        gate.status, gate.status
+                    )
+                    print(f"  [{marker}] {gate.name} ({gate.duration_ms} ms): {gate.detail}")
+                if report.not_run:
+                    print(
+                        "  Gates marked skip could not run on this machine; they are "
+                        "reported, never passed by default."
+                    )
+                print(f"  Report written: {target}")
+            return 0 if report.failures == 0 else 1
+        if command == "acceptance-verify":
+            from .voice.acceptance import verify_voice_acceptance_report
+
+            result = verify_voice_acceptance_report(args.path)
+            if as_json:
+                print(json.dumps(result, indent=2, sort_keys=True))
+            else:
+                print(
+                    ("VERIFIED; status=" + str(result.get("status")))
+                    if result["ok"]
+                    else "REJECTED; " + "; ".join(result["problems"][:3])
+                )
+            return 0 if result["ok"] else 1
+        if command == "privacy":
+            payload = service.privacy()
+            if args.purge_audio:
+                payload["purged"] = service.purge_audio()
+            if args.clear_history:
+                payload["cleared"] = service.clear_history()
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"microphone: {payload['indicator']} (state={payload['state']})")
+                print(f"retention policy: {payload['retention']}")
+                print(
+                    "transcripts stored: "
+                    + ("yes" if payload["store_transcripts"] else "no")
+                )
+                print(
+                    "wake word: "
+                    + ("enabled" if payload["wake_word_enabled"] else "disabled")
+                )
+                print(f"max capture: {payload['max_seconds']:g}s")
+                if "purged" in payload:
+                    print(f"purged recordings: {payload['purged']['removed']}")
+                if "cleared" in payload:
+                    print(f"cleared sessions: {payload['cleared']['removed']}")
+            return 0
+    except VoiceError as exc:
+        print(f"Voice error: {exc}", file=sys.stderr)
+        return 1
+    print("Usage: pc-agent voice [status|devices|enable|disable|wake-word|ptt|transcribe|say|sessions|privacy]")
+    return 0
+
+
+def _local_service(settings: Settings) -> Any:
+    from .service import LocalService
+
+    return LocalService(settings)
+
+
+def _load_json_document(path: Path) -> dict[str, Any]:
+    from .errors import FlowError
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FlowError(f"The document could not be read: {exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise FlowError(f"The document is not valid JSON: {exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise FlowError("The document must be a JSON object.")
+    return payload
+
+
+def _run_flows_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .errors import FlowError
+
+    command = args.flows_command or "list"
+    service = _local_service(settings)
+    as_json = bool(getattr(args, "json", False))
+    try:
+        if command == "list":
+            payload = service.list_flows(limit=args.limit)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["flows"]:
+                print("No flows stored yet.")
+                return 0
+            for flow in payload["flows"]:
+                print(
+                    f"{flow['id'][:8]} v{flow['version']} "
+                    f"{'enabled' if flow['enabled'] else 'DISABLED'} "
+                    f"{flow['node_count']} node(s) "
+                    f"levels={len(flow['levels'])} {flow['name']}"
+                )
+            summary = payload["summary"]
+            print(
+                f"total={payload['total']} triggers_enabled={summary['triggers_enabled']} "
+                f"runs={summary['runs']} last={summary['last_run_at'] or 'never'}"
+            )
+            return 0
+        if command == "show":
+            payload = service.get_flow(args.reference)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            print(f"{payload['name']} (id {payload['id']}, v{payload['version']})")
+            print(f"description: {payload['description'] or '-'}")
+            print(f"levels: {payload['levels']}")
+            for node in payload["flow"]["nodes"]:
+                deps = [a for a, b in
+                        ((edge['from'], edge['to']) for edge in payload["flow"]["edges"])
+                        if b == node["id"]]
+                print(
+                    f"  {node['id']}: {node['title'] or '(no title)'} "
+                    f"after={deps or 'none'} -> {node['instruction'][:70]}"
+                )
+            for trigger in payload["triggers"]:
+                print(
+                    f"  trigger {trigger['id'][:8]} {trigger['kind']} "
+                    f"enabled={trigger['enabled']} next={trigger['next_run_at'] or '-'} "
+                    f"runs={trigger['run_count']}"
+                )
+            for run in payload["runs"]:
+                print(
+                    f"  run {run['id'][:8]} {run['status']} via {run['trigger_kind']} "
+                    f"mission={run['mission_id'] or '-'}"
+                )
+            return 0
+        if command == "validate":
+            payload = service.validate_flow(_load_json_document(args.file))
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"valid: {payload['name']} with {len(payload['nodes'])} node(s); "
+                    f"levels={payload['levels']}"
+                )
+            return 0
+        if command == "create":
+            payload = service.create_flow(_load_json_document(args.file))
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"created {payload['name']} v{payload['version']} ({payload['id']})")
+            return 0
+        if command == "update":
+            payload = service.update_flow(
+                args.reference, _load_json_document(args.file)
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"updated {payload['name']} to v{payload['version']}")
+            return 0
+        if command in {"enable", "disable"}:
+            payload = service.set_flow_enabled(args.reference, enabled=command == "enable")
+            print(f"{payload['name']} {'enabled' if payload['enabled'] else 'disabled'}")
+            return 0
+        if command == "delete":
+            payload = service.delete_flow(args.reference)
+            print(f"deleted flow {payload['flow_id'][:8]}")
+            return 0
+        if command == "run":
+            payload = service.run_flow(args.reference)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"flow '{payload['flow']['name']}' v{payload['flow']['version']} started: "
+                    f"mission {payload['mission_id']} levels={payload['levels']}"
+                )
+                print(f"run ledger entry: {payload['run']['id']} ({payload['run']['status']})")
+            return 0
+        if command == "runs":
+            payload = service.flow_runs(args.reference, limit=args.limit)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["runs"]:
+                print("No flow runs recorded yet.")
+                return 0
+            for run in payload["runs"]:
+                print(
+                    f"{run['id'][:8]} {run['created_at'][:19]} {run['status']:<9} "
+                    f"via {run['trigger_kind']:<8} {run['flow_name']} v{run['flow_version']} "
+                    f"mission={run['mission_id'] or '-'}"
+                    + (f" error={run['error'][:60]}" if run["error"] else "")
+                )
+            return 0
+        if command == "export":
+            payload = service.export_flow(args.reference)
+            text = json.dumps(payload, indent=2, sort_keys=True)
+            if args.out:
+                args.out.parent.mkdir(parents=True, exist_ok=True)
+                args.out.write_text(text + "\n", encoding="utf-8")
+                if as_json:
+                    print(
+                        json.dumps(
+                            {
+                                "exported": True,
+                                "path": str(args.out),
+                                "name": payload["flow"]["name"],
+                                "checksum": payload["checksum"],
+                            },
+                            indent=2,
+                        )
+                    )
+                else:
+                    print(f"exported {payload['flow']['name']} to {args.out}")
+                    print(f"checksum {payload['checksum']}")
+            else:
+                print(text)
+            return 0
+        if command == "import":
+            payload = service.import_flow(
+                _load_json_document(args.file), overwrite=args.overwrite
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"imported {payload['flow']['name']} v{payload['flow']['version']} "
+                    f"with {len(payload['triggers'])} trigger(s)"
+                )
+            return 0
+        if command == "trigger":
+            return _run_flow_trigger_command(service, args)
+        if command == "tick":
+            payload = service.flow_tick(limit=args.limit)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+                return 0
+            print(f"fired={payload['total']} skipped={len(payload['skipped'])}")
+            for item in payload["fired"]:
+                print(
+                    f"  started run {item['run_id'][:8]} for flow {item['flow_id'][:8]} "
+                    f"(mission {item['mission_id']})"
+                )
+            for item in payload["skipped"]:
+                print(f"  skipped trigger {item['trigger_id'][:8]}: {item['reason']}")
+            return 0
+        if command == "stats":
+            payload = service.flow_stats()
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                block = payload["flows"]
+                by_status = ", ".join(
+                    f"{key}={value}" for key, value in sorted(block["by_status"].items())
+                ) or "none"
+                print(
+                    f"flows={block['flows']} triggers_enabled={block['triggers_enabled']} "
+                    f"runs={block['runs']} ({by_status}) last={block['last_run_at'] or 'never'}"
+                )
+            return 0
+        print(
+            "Usage: pc-agent flows "
+            "[list|show|create|update|validate|enable|disable|delete|run|runs|export|import|trigger|tick|stats]"
+        )
+        return 0
+    except FlowError as exc:
+        print(f"Flow error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        service.close()
+
+
+def _run_flow_trigger_command(service: Any, args: argparse.Namespace) -> int:
+    from .errors import FlowError
+
+    command = args.trigger_command or "list"
+    try:
+        as_json = bool(getattr(args, "json", False))
+        if command == "add":
+            payload = service.flow_add_trigger(
+                args.reference,
+                {
+                    "kind": args.kind,
+                    "interval_seconds": args.interval_seconds,
+                    "run_at": args.run_at,
+                    "event_type": args.event_type,
+                },
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"trigger {payload['id'][:8]} {payload['kind']} added "
+                    f"(next {payload['next_run_at'] or '-'})"
+                )
+            return 0
+        if command == "list":
+            payload = service.flow_triggers(args.reference)
+            if getattr(args, "json", False):
+                print(json.dumps(payload, indent=2))
+                return 0
+            if not payload["triggers"]:
+                print("No triggers stored yet.")
+                return 0
+            for trigger in payload["triggers"]:
+                print(
+                    f"{trigger['id'][:8]} {trigger['kind']:<8} "
+                    f"{'enabled' if trigger['enabled'] else 'DISABLED':<8} "
+                    f"interval={trigger['interval_seconds'] or '-'} "
+                    f"event={trigger['event_type'] or '-'} "
+                    f"next={trigger['next_run_at'] or '-'} runs={trigger['run_count']}"
+                )
+            return 0
+        if command in {"enable", "disable"}:
+            payload = service.flow_set_trigger_enabled(
+                args.trigger_id, enabled=command == "enable"
+            )
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"trigger {payload['id'][:8]} "
+                    f"{'enabled' if payload['enabled'] else 'disabled'}"
+                )
+            return 0
+        if command == "delete":
+            payload = service.flow_delete_trigger(args.trigger_id)
+            if as_json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"deleted trigger {payload['trigger_id'][:8]}")
+            return 0
+    except FlowError as exc:
+        print(f"Flow error: {exc}", file=sys.stderr)
+        return 1
+    print("Usage: pc-agent flows trigger [add|list|enable|disable|delete]")
+    return 0
+
+
+def _run_agents_command(settings: Settings, args: argparse.Namespace) -> int:
+    from .errors import AgentError
+
+    studio = _agent_studio(settings)
+    command = args.agents_command or "list"
+    try:
+        if command == "list":
+            payload = studio.list_agents()
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                for agent in payload["agents"]:
+                    state = "enabled" if agent["enabled"] else "DISABLED"
+                    tools = (
+                        agent["allowed_tools"] if agent["allowed_tools"] else ["(none)"]
+                    )
+                    print(
+                        f"{agent['name']} [{agent['role']}; {state}"
+                        f"{'; builtin' if agent['builtin'] else ''}] "
+                        f"tools({len(agent['allowed_tools'])}): {', '.join(tools)}"
+                    )
+            return 0
+        if command == "show":
+            payload = studio.get_agent(args.name)
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                for key in (
+                    "name", "role", "description", "provider", "max_steps",
+                    "token_budget", "builtin", "enabled",
+                ):
+                    print(f"{key}: {payload[key]}")
+                print(f"allowed_tools: {', '.join(payload['allowed_tools']) or '(none)'}")
+                print(f"system_prompt: {payload['system_prompt']}")
+            return 0
+        if command == "create":
+            payload = studio.save_agent(
+                {
+                    "name": args.name,
+                    "role": args.role,
+                    "description": args.description,
+                    "system_prompt": args.prompt,
+                    "allowed_tools": args.tools,
+                    "provider": args.provider,
+                    "max_steps": args.max_steps,
+                    "token_budget": args.token_budget,
+                }
+            )
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"Agent saved: {payload['name']} "
+                    f"(tools={len(payload['allowed_tools'])}, max_steps={payload['max_steps']})"
+                )
+            return 0
+        if command == "delete":
+            print(f"Agent deleted: {studio.delete_agent(args.name)['deleted']}")
+            return 0
+        if command in ("enable", "disable"):
+            payload = studio.set_agent_enabled(args.name, command == "enable")
+            print(f"Agent {payload['name']}: enabled={payload['enabled']}")
+            return 0
+        if command == "run":
+            if args.ai:
+                _require_license(settings, FEATURE_PROVIDERS)
+            result = studio.run_agent(
+                args.name,
+                " ".join(args.instruction),
+                use_ai=bool(args.ai),
+                approval_callback=_approval_callback(preapproved=bool(args.yes)),
+            )
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(
+                    f"Agent {result['agent']} run #{result['run_id']}: "
+                    f"{result['status']} (task {result['task_id']})"
+                )
+                print(result["summary"])
+            return 0 if result["status"] == "succeeded" else 1
+        if command == "team":
+            assignments = None
+            if args.assignments is not None:
+                assignments = json.loads(
+                    args.assignments.read_text(encoding="utf-8")
+                )
+                if isinstance(assignments, dict):
+                    assignments = assignments.get("assignments")
+            else:
+                # Coordinator decomposition makes a provider call.
+                _require_license(settings, FEATURE_PROVIDERS)
+            if args.ai:
+                _require_license(settings, FEATURE_PROVIDERS)
+            result = studio.run_team(
+                " ".join(args.goal),
+                assignments,
+                use_ai=bool(args.ai),
+                approval_callback=_approval_callback(preapproved=bool(args.yes)),
+            )
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(
+                    f"Team {result['team_run_id']}: "
+                    f"{result['succeeded']}/{result['total']} succeeded"
+                )
+                for item in result["results"]:
+                    print(f"  {item['agent']}: {item['status']} - {item['summary'][:120]}")
+            return 0 if result["succeeded"] == result["total"] else 1
+        if command == "runs":
+            payload = studio.list_runs(
+                agent_name=args.agent or None,
+                team_run_id=args.team or None,
+                limit=args.limit,
+            )
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                for run in payload["runs"]:
+                    print(
+                        f"#{run['id']} {run['agent']} [{run['status']}] "
+                        f"{run['instruction'][:60]}"
+                    )
+            return 0
+        if command == "stats":
+            stats = studio.stats()
+            if args.json:
+                print(json.dumps({"agents": stats}, indent=2))
+            else:
+                print(
+                    f"Agents: {stats['agents']} (enabled={stats['agents_enabled']}, "
+                    f"builtin={stats['builtin_agents']}); runs={stats['agent_runs']}"
+                )
+            return 0
+    except AgentError as exc:
+        print(f"Agent error: {exc}", file=sys.stderr)
+        return 1
+    return 1
 
 
 def _tool_builder_service(
@@ -6848,11 +10125,255 @@ def _print_release_bundle(
             print(f"  - {record.path} ({record.size} bytes)")
 
 
+def _print_production_report(report: Any, *, as_json: bool, out: Path | None) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=1, sort_keys=True))
+        return
+    print(f"Release chain check: {report.summary()}")
+    print(f"Version: {report.version}")
+    print(f"Generated: {report.generated_at}")
+    print(f"Signing: {report.environment.get('signing_key', 'unknown')}")
+    for step in report.steps:
+        marker = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP"}.get(
+            step.status, step.status.upper()
+        )
+        print(f"  [{marker}] {step.name} ({step.duration_ms} ms): {step.detail}")
+    if report.kept:
+        print(f"Work directory kept: {report.workdir}")
+    if out is not None:
+        print(f"Report written: {out}")
+
+
+def _run_release_signing(settings: Settings, args: argparse.Namespace) -> int:
+    from .release import WINDOWS_SIGNING_REPORT
+    from .windows_signing import signtool_status
+
+    status = signtool_status(getattr(args, "signtool", None))
+    report_path = settings.data_dir / WINDOWS_SIGNING_REPORT
+    recorded: dict[str, Any] = {}
+    if report_path.is_file():
+        try:
+            loaded = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = {"status": "unreadable"}
+        else:
+            recorded = loaded if isinstance(loaded, dict) else {"status": "invalid"}
+    payload = {"host": status, "last_result": recorded, "report_path": str(report_path)}
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    print(f"Authenticode: {status['platform']}")
+    print(f"  signtool: {status['signtool'] or 'not found'}")
+    print(f"  certificate configured: {'yes' if status['certificate_configured'] else 'no'}")
+    print(f"    thumbprint: {'set' if status['thumbprint_configured'] else 'unset'}")
+    print(f"    pfx file: {'set' if status['pfx_configured'] else 'unset'}")
+    print(f"  timestamp authority: {status['timestamp_url']}")
+    print(f"  verification: {status['verification']}")
+    if recorded:
+        print(
+            f"  last result: {recorded.get('status', 'unknown')} "
+            f"({str(recorded.get('detail', ''))[:160]})"
+        )
+    else:
+        print("  last result: no signing has been recorded on this install")
+        print(
+            "  note: the update bundle signature (Ed25519) is separate and already "
+            "enforced; Authenticode applies to the installer EXE"
+        )
+    return 0
+
+
+def _run_release_sign(settings: Settings, args: argparse.Namespace) -> int:
+    from .release import WINDOWS_SIGNING_REPORT
+    from .windows_signing import DEFAULT_TIMESTAMP_URL, sign_installer
+
+    artifact = _resolve_cli_path(settings, args.artifact, existing=True)
+    if not artifact.is_file():
+        # Never record a "result" for a file that is not there: an absent artefact
+        # is not a signing outcome.
+        print(f"Artifact not found: {artifact}", file=sys.stderr)
+        return 2
+    thumbprint = args.thumbprint or os.environ.get("PC_AGENT_SIGN_THUMBPRINT", "")
+    password = os.environ.get(args.pfx_password_env, "") if args.pfx is not None else ""
+    if args.pfx is not None and not password:
+        print(
+            f"The PFX password must be in the {args.pfx_password_env} environment "
+            "variable; it is never accepted as a command-line argument.",
+            file=sys.stderr,
+        )
+        return 2
+    report = sign_installer(
+        artifact,
+        thumbprint=thumbprint,
+        pfx=args.pfx,
+        password=password or None,
+        timestamp_url=args.timestamp_url or DEFAULT_TIMESTAMP_URL,
+        allow_argv_password=bool(args.allow_argv_password),
+        signtool_path=args.signtool,
+        timeout=float(args.timeout),
+    )
+    settings.ensure_directories()
+    target = settings.data_dir / WINDOWS_SIGNING_REPORT
+    target.write_text(
+        json.dumps(report.to_dict(), indent=1, sort_keys=True), encoding="utf-8"
+    )
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(f"Signing: {report.status.upper()}; ok={report.ok}")
+        print(f"  {report.detail}")
+        if report.command:
+            print("  command: " + " ".join(report.command))
+        print(f"  report: {target}")
+    return 0 if report.ok else 1
+
+
+def _run_release_signature(settings: Settings, args: argparse.Namespace) -> int:
+    from .windows_signing import verify_authenticode
+
+    artifact = _resolve_cli_path(settings, args.artifact, existing=True)
+    report = verify_authenticode(artifact, signtool_path=args.signtool)
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(f"Signature: {report.status.upper()}")
+        print(f"  {report.detail}")
+        print(f"  file: {report.path}")
+    return 0 if report.ok else 1
+
+
+def _print_acceptance_report(report: Any, *, as_json: bool, out: Path | None) -> None:
+    if as_json:
+        print(json.dumps(report.to_dict(), indent=1, sort_keys=True))
+        return
+    print(f"Windows acceptance: {report.summary()}")
+    print(f"  generated: {report.generated_at}  version: {report.version}")
+    for gate in report.gates:
+        marker = {"pass": "ok", "fail": "FAIL", "not-run": "skip"}.get(
+            gate.status, gate.status
+        )
+        print(f"  [{marker}] {gate.name} ({gate.duration_ms} ms): {gate.detail}")
+    if report.status == "skipped":
+        print(
+            "  This host is not Windows, so nothing was claimed. Run the same "
+            "command on your Windows install."
+        )
+    elif report.status == "self-test":
+        print(
+            "  Self-test report: the harness works, but this is not Windows "
+            "evidence and will never be recorded as such."
+        )
+    if out is not None:
+        print(f"  Report written: {out}")
+
+
+def _print_recorded_evidence(recorded: dict[str, Any]) -> None:
+    print(f"Windows acceptance evidence: {recorded['status']}")
+    print(f"  {recorded['detail']}")
+    if recorded["recorded"]:
+        print(f"  file: {recorded['path']}")
+        print(f"  gates: {recorded['gates']}  generated: {recorded['generated_at']}")
+    else:
+        print(
+            "  Next: on the Windows machine run `pc-agent release evidence`, then "
+            "`pc-agent release evidence record`"
+        )
+
+
+def _run_release_evidence(settings: Settings, args: argparse.Namespace) -> int:
+    """``status`` never runs anything; ``verify``/``record`` act on a file.
+
+    With no verb the command *runs the gates* on Windows (that is the documented
+    one-command acceptance) and only reports the recorded state elsewhere. ``--json``
+    always prints exactly one JSON document: mixing a report and a status line into
+    stdout made the output unparseable, which is what the 0.81.0 Windows run found.
+    """
+
+    from .baseline import windows_acceptance_evidence
+
+    verb = getattr(args, "evidence_command", None)
+    as_json = bool(args.json)
+    if verb == "verify":
+        target = (
+            _resolve_cli_path(settings, args.report, existing=True)
+            if args.report is not None
+            else settings.workspace_dir / "windows-acceptance.json"
+        )
+        verification = verify_acceptance_report(target)
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "ok": verification.ok,
+                        "status": verification.status,
+                        "problems": list(verification.problems),
+                    },
+                    indent=1,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"Report: {target}")
+            print(f"Result: {verification.summary()}")
+            for problem in verification.problems:
+                print(f"  - {problem}")
+        return 0 if verification.ok else 1
+    if verb == "record":
+        target = (
+            _resolve_cli_path(settings, args.report, existing=True)
+            if args.report is not None
+            else settings.workspace_dir / "windows-acceptance.json"
+        )
+        result = record_acceptance_report(settings, target)
+        if as_json:
+            print(json.dumps(result, indent=1, sort_keys=True))
+        else:
+            print(f"Recorded Windows acceptance evidence: {result['path']}")
+            print(f"  status: {result['status']}  gates: {result['gates']}")
+            print(f"  {result['detail']}")
+        return 0
+
+    recorded = windows_acceptance_evidence(Path(settings.root_dir))
+    wants_run = verb is None or bool(args.self_test or args.no_suite or args.out)
+    if verb == "status":
+        wants_run = False
+    if wants_run and (sys.platform.startswith("win") or args.self_test or args.no_suite):
+        settings.ensure_directories()
+        out = _resolve_cli_path(settings, args.out) if args.out is not None else None
+        report = run_windows_acceptance(
+            settings,
+            run_suite=not args.no_suite,
+            suite_timeout_seconds=float(args.suite_timeout),
+            allow_non_windows=bool(args.self_test),
+            out_path=out,
+        )
+        if as_json:
+            print(
+                json.dumps(
+                    {"report": report.to_dict(), "recorded": recorded},
+                    indent=1,
+                    sort_keys=True,
+                )
+            )
+        else:
+            _print_acceptance_report(report, as_json=False, out=out)
+            print(f"Recorded evidence: {recorded['status']}")
+        return 0 if report.ok else 1
+
+    if as_json:
+        print(json.dumps({"recorded": recorded}, indent=1, sort_keys=True))
+    else:
+        _print_recorded_evidence(recorded)
+    return 0
+
+
 def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
     command = getattr(args, "release_command", None)
     if command is None:
         print(
-            "Usage: pc-agent release audit|build|verify|info|installer-source|"
+            "Usage: pc-agent release audit|production-check|evidence|signing|sign|signature|"
+            "build|verify|info|"
+            "installer-source|"
             "installer-verify|installer-acceptance|installer-acceptance-verify|"
             "posix-source|posix-verify|debian-package|debian-verify|"
             "debian-repository|debian-repository-verify|"
@@ -6867,6 +10388,25 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
         if audit.failures or (args.strict and audit.warnings):
             return 1
         return 0
+    if command == "production-check":
+        settings.ensure_directories()
+        report = run_production_check(settings, keep=bool(getattr(args, "keep", False)))
+        if args.out is not None:
+            target = _resolve_cli_path(settings, args.out)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                json.dumps(report.to_dict(), indent=1, sort_keys=True), encoding="utf-8"
+            )
+        _print_production_report(report, as_json=bool(args.json), out=args.out)
+        return 0 if report.ok else 1
+    if command == "signing":
+        return _run_release_signing(settings, args)
+    if command == "sign":
+        return _run_release_sign(settings, args)
+    if command == "signature":
+        return _run_release_signature(settings, args)
+    if command == "evidence":
+        return _run_release_evidence(settings, args)
     if command == "build":
         settings.ensure_directories()
         output = (
@@ -7441,9 +10981,9 @@ def _print_auto_upgrade_status(status: Any, *, as_json: bool) -> None:
     if status.scheduler is not None:
         scheduler = status.scheduler
         print(
-            "Windows schedule: "
-            f"installed={scheduler.installed}; task={scheduler.task_name}; "
-            f"state={scheduler.state}"
+            "OS schedule: "
+            f"profile={scheduler.profile}; installed={scheduler.installed}; "
+            f"task={scheduler.task_name}; state={scheduler.state}"
         )
     if status.state.get("latest_report"):
         print(f"Latest report: {status.state['latest_report']}")
@@ -7454,7 +10994,7 @@ def _print_auto_upgrade_scheduler(result: Any, *, as_json: bool) -> None:
     if as_json:
         print(json.dumps(result.to_dict(), indent=2))
         return
-    print(f"Windows auto-upgrade schedule: {result.summary()}")
+    print(f"Auto-upgrade schedule: {result.summary()}")
     if result.executable:
         print(f"Executable: {result.executable}")
     print(result.detail)
@@ -7612,21 +11152,21 @@ def _run_update_command(settings: Settings, args: argparse.Namespace) -> int:
         return 0
     if command == "auto-install-schedule":
         summary = (
-            f"install Windows background auto-upgrade task {args.task_name} "
-            f"for root {settings.root_dir}"
+            "install the operating-system background auto-upgrade schedule "
+            f"{args.task_name} for root {settings.root_dir}"
         )
         confirmed = bool(args.yes) if args.json else _confirm_update_action(
             summary, assume_yes=bool(args.yes)
         )
         if not confirmed:
-            print("Windows auto-upgrade schedule install cancelled.")
+            print("Auto-upgrade schedule install cancelled.")
             return 3
         executable = (
             _resolve_cli_path(settings, args.executable, existing=True)
             if args.executable is not None
             else None
         )
-        schedule = install_windows_auto_upgrade_schedule(
+        schedule = install_auto_upgrade_schedule(
             settings,
             task_name=args.task_name,
             executable=executable,
@@ -7635,22 +11175,20 @@ def _run_update_command(settings: Settings, args: argparse.Namespace) -> int:
         return 0
     if command == "auto-uninstall-schedule":
         summary = (
-            f"remove Windows background auto-upgrade task {args.task_name} "
-            f"for root {settings.root_dir}"
+            "remove the operating-system background auto-upgrade schedule "
+            f"{args.task_name} for root {settings.root_dir}"
         )
         confirmed = bool(args.yes) if args.json else _confirm_update_action(
             summary, assume_yes=bool(args.yes)
         )
         if not confirmed:
-            print("Windows auto-upgrade schedule removal cancelled.")
+            print("Auto-upgrade schedule removal cancelled.")
             return 3
-        schedule = uninstall_windows_auto_upgrade_schedule(
-            task_name=args.task_name
-        )
+        schedule = uninstall_auto_upgrade_schedule(task_name=args.task_name)
         _print_auto_upgrade_scheduler(schedule, as_json=bool(args.json))
         return 0
     if command == "auto-schedule-status":
-        schedule = get_windows_auto_upgrade_schedule(task_name=args.task_name)
+        schedule = get_auto_upgrade_schedule(task_name=args.task_name)
         _print_auto_upgrade_scheduler(schedule, as_json=bool(args.json))
         return 0
     if command == "apply":
@@ -7730,12 +11268,24 @@ def _run_maintenance_command(settings: Settings, args: argparse.Namespace) -> in
     service = DatabaseMaintenanceService(settings.database_path, settings.data_dir)
     if command == "backup":
         _open_database(settings)
-        info = service.create_backup(args.label)
+        passphrase = _read_backup_passphrase(confirm=True) if args.encrypt else None
+        info = service.create_backup(args.label, passphrase=passphrase)
+        EventRepository(_open_database(settings)).record(
+            "maintenance.backup_created",
+            source="cli",
+            summary=f"Database backup created: {info.summary()}",
+            payload={"backup_id": info.backup_id, "encrypted": bool(info.encrypted)},
+        )
         if args.json:
             print(json.dumps(info.to_dict(), indent=2))
         else:
             print(f"Database backup created and verified: {info.summary()}")
             print(f"Backup file: {info.path}")
+            if info.encrypted:
+                print(
+                    "Keep the passphrase safe: it is never stored, and the "
+                    "backup cannot be restored without it."
+                )
         return 0
     if command == "list":
         backups = service.list_backups()
@@ -7748,14 +11298,22 @@ def _run_maintenance_command(settings: Settings, args: argparse.Namespace) -> in
                 print(f"- {backup.summary()} label={backup.label} created={backup.created_at}")
         return 0
     if command == "verify":
-        info = service.verify_backup(args.backup)
+        resolved = service.resolve_backup(args.backup)
+        passphrase = (
+            _read_backup_passphrase(confirm=False) if resolved.encrypted else None
+        )
+        info = service.verify_backup(args.backup, passphrase=passphrase)
         if args.json:
             print(json.dumps(info.to_dict(), indent=2))
         else:
             print(f"Database backup verified: {info.summary()}")
         return 0
     if command == "restore":
-        info = service.verify_backup(args.backup)
+        resolved = service.resolve_backup(args.backup)
+        passphrase = (
+            _read_backup_passphrase(confirm=False) if resolved.encrypted else None
+        )
+        info = service.verify_backup(args.backup, passphrase=passphrase)
         confirmed = bool(args.yes) if args.json else _confirm_direct_write(
             "restore database backup "
             f"{info.backup_id} (schema v{info.schema_version}); "
@@ -7766,8 +11324,14 @@ def _run_maintenance_command(settings: Settings, args: argparse.Namespace) -> in
         if not confirmed:
             print("Database restore cancelled; the live database is unchanged.")
             return 3
-        result = service.restore_backup(info.backup_id)
+        result = service.restore_backup(info.backup_id, passphrase=passphrase)
         database = _open_database(settings)
+        EventRepository(database).record(
+            "maintenance.backup_restored",
+            source="cli",
+            summary=f"Database restored from backup {info.backup_id}.",
+            payload={"pre_restore_backup_id": result.pre_restore_backup_id},
+        )
         payload = result.to_dict()
         payload["live_schema_version"] = database.schema_version()
         if args.json:
@@ -7778,6 +11342,689 @@ def _run_maintenance_command(settings: Settings, args: argparse.Namespace) -> in
             print(f"Live database schema: v{database.schema_version()}")
         return 0
     raise PcAgentError(f"Unknown maintenance command: {command}")
+
+
+def _read_backup_passphrase(*, confirm: bool) -> str:
+    """Read a backup passphrase without echoing or storing it.
+
+    ``PC_AGENT_BACKUP_PASSPHRASE`` exists only for unattended automation;
+    interactive use should prefer the hidden prompt.
+    """
+
+    env_value = os.environ.get("PC_AGENT_BACKUP_PASSPHRASE")
+    if env_value:
+        return env_value
+    first = getpass.getpass("Backup passphrase: ")
+    if confirm:
+        second = getpass.getpass("Confirm backup passphrase: ")
+        if first != second:
+            raise PcAgentError("The passphrases did not match; nothing was written.")
+    return first
+
+
+def _run_api_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "api_command", None)
+    if command is None:
+        print("Usage: pc-agent api serve|status ...", file=sys.stderr)
+        return 2
+    if command == "status":
+        with LocalService(settings) as service:
+            payload = {
+                "api_enabled": settings.api_enabled,
+                "api_host": settings.api_host,
+                "api_port": settings.api_port,
+                "api_token_configured": True,
+                "api_token_source": "environment" if settings.api_token else "file (auto)",
+                "health": service.health(),
+                "overview": service.overview(),
+            }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            health = payload["health"]
+            overview = payload["overview"]
+            print("Local Service:")
+            print(
+                f"  API: {'enabled' if settings.api_enabled else 'disabled'} on "
+                f"http://{settings.api_host}:{settings.api_port} (loopback only)"
+            )
+            print(f"  Token source: {payload['api_token_source']}")
+            print(
+                f"  Version: {health['version']} | Database schema: "
+                f"v{health['schema_version']} (latest v{health['schema_latest']})"
+            )
+            print(
+                f"  Tasks: {overview['tasks']['total']} | Events: "
+                f"{overview['events_total']} | Pending approvals: "
+                f"{overview['pending_approvals']} | Tools: {overview['tools']}"
+            )
+            print(
+                f"  Emergency stop: {'ENGAGED' if health['emergency_stop_engaged'] else 'clear'}"
+                f" | Active profile: {settings.active_profile or 'none'}"
+            )
+        return 0
+    if command == "serve":
+        if not settings.api_enabled:
+            print(
+                "The local API is disabled. Set PC_AGENT_API_ENABLED=true to enable it.",
+                file=sys.stderr,
+            )
+            return 2
+        server = LocalApiServer(settings)
+        host, port = server.address
+        print(f"Omni-Assistant local API listening on http://{host}:{port} (loopback only).")
+        print(f"Command Center (web UI): http://{host}:{port}/")
+        if args.show_token:
+            print("Bearer token (keep private): " + load_or_create_api_token(settings))
+        else:
+            print(
+                "Bearer token required on every route except GET /v1/health. "
+                "Re-run with --show-token to print it once."
+            )
+        print("Press Ctrl+C to stop.")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nLocal API stopped.")
+        finally:
+            server.stop()
+        return 0
+    return 2
+
+
+def _run_events_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "events_command", None)
+    if command is None:
+        print("Usage: pc-agent events list ...", file=sys.stderr)
+        return 2
+    if command == "list":
+        database = _open_database(settings)
+        repository = EventRepository(database)
+        events = repository.list(
+            since_id=args.since_id,
+            event_type=args.type,
+            task_id=args.task,
+            limit=args.limit,
+            descending=args.recent,
+        )
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "events": [event.to_dict() for event in events],
+                        "total": repository.count(),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+        if not events:
+            print("No application events recorded yet.")
+            return 0
+        for event in events:
+            stamp = event.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            print(f"#{event.id} {stamp} {event.event_type} [{event.source}] {event.summary}")
+        return 0
+    return 2
+
+
+def _run_profiles_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "profiles_command", None)
+    if command is None:
+        print(
+            "Usage: pc-agent profiles list|show|save-current|activate|deactivate|delete ...",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        if command == "list":
+            profiles = list_profiles(settings.data_dir)
+            active, source = active_profile_name(settings.data_dir)
+            payload = {
+                "profiles": [info.to_dict() for info in profiles],
+                "active": settings.active_profile or active,
+                "active_source": "settings" if settings.active_profile else source,
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            elif not profiles:
+                print("No settings profiles yet. Save one with: pc-agent profiles save-current work")
+            else:
+                for info in profiles:
+                    marker = " (active)" if info.name == payload["active"] else ""
+                    print(f"- {info.name}{marker}: {len(info.field_names)} field(s)")
+            return 0
+        if command == "show":
+            data = load_profile(settings.data_dir, args.name)
+            if args.json:
+                print(json.dumps({"name": args.name, "fields": data}, indent=2))
+            else:
+                print(f"Profile '{args.name}':")
+                for key in sorted(data):
+                    print(f"  {key} = {data[key]!r}")
+            return 0
+        if command == "save-current":
+            info = save_profile(
+                settings.data_dir, args.name, snapshot_from_settings(settings)
+            )
+            if args.json:
+                print(json.dumps({"saved": info.to_dict()}, indent=2))
+            else:
+                print(
+                    f"Profile '{info.name}' saved with {len(info.field_names)} field(s). "
+                    f"Activate it with: pc-agent profiles activate {info.name}"
+                )
+            return 0
+        if command == "activate":
+            set_active_profile(settings.data_dir, args.name)
+            if args.json:
+                print(json.dumps({"active": args.name}, indent=2))
+            else:
+                print(
+                    f"Profile '{args.name}' will be active for future runs. "
+                    "Explicit environment values still take precedence."
+                )
+            return 0
+        if command == "deactivate":
+            set_active_profile(settings.data_dir, None)
+            print("Active profile cleared." if not args.json else json.dumps({"active": None}))
+            return 0
+        if command == "delete":
+            if not args.yes:
+                print(
+                    "Refusing to delete a profile without --yes.",
+                    file=sys.stderr,
+                )
+                return 1
+            deleted = delete_profile(settings.data_dir, args.name)
+            if not deleted:
+                print(f"Profile '{args.name}' does not exist.", file=sys.stderr)
+                return 1
+            print(f"Profile '{args.name}' deleted.")
+            return 0
+    except PcAgentError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 2
+
+
+def _print_mission_text(payload: dict) -> None:
+    progress = payload.get("progress", {})
+    print(f"Mission {payload['id']} [{payload['status']}] {payload['name']}")
+    if payload.get("description"):
+        print(f"  {payload['description']}")
+    print(
+        "  Progress: "
+        + ", ".join(f"{key}={value}" for key, value in sorted(progress.items()))
+    )
+    for task in payload.get("tasks", []):
+        deps = ", ".join(dep[:8] for dep in task.get("depends_on", [])) or "-"
+        print(
+            f"  - {task['id'][:8]} [{task['status']}] after={deps} "
+            f"{task['instruction'][:80]}"
+        )
+    graph = payload.get("graph", {})
+    if graph.get("levels"):
+        print("  Execution graph levels:")
+        for index, level in enumerate(graph["levels"]):
+            print(f"    level {index}: {', '.join(task_id[:8] for task_id in level)}")
+
+
+def _run_missions_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "missions_command", None)
+    if command is None:
+        print(
+            "Usage: pc-agent missions create|list|show|add-task|link|run|cancel|delete ...",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        with LocalService(settings) as service:
+            if command == "create":
+                specs = [{"instruction": text} for text in args.task or []]
+                payload = service.create_mission(
+                    args.name, description=args.description, task_specs=specs, source="cli"
+                )
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    _print_mission_text(payload)
+                    print(f"Add tasks with: pc-agent missions add-task {payload['id']} \"...\"")
+                return 0
+            if command == "list":
+                payload = service.list_missions(limit=args.limit)
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                elif not payload["missions"]:
+                    print("No missions yet. Create one with: pc-agent missions create \"name\"")
+                else:
+                    for mission in payload["missions"]:
+                        progress = mission.get("progress", {})
+                        print(
+                            f"- {mission['id'][:8]} [{mission['status']}] {mission['name']} "
+                            f"(tasks={progress.get('total', 0)}, "
+                            f"succeeded={progress.get('succeeded', 0)})"
+                        )
+                return 0
+            if command == "show":
+                payload = service.get_mission(args.mission_id)
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    _print_mission_text(payload)
+                return 0
+            if command == "add-task":
+                payload = service.add_mission_task(
+                    args.mission_id,
+                    instruction=args.instruction,
+                    task_reference=args.task,
+                    depends_on=args.after,
+                    source="cli",
+                )
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    _print_mission_text(payload)
+                return 0
+            if command == "link":
+                payload = service.add_mission_dependency(
+                    args.mission_id,
+                    task_reference=args.task_id,
+                    depends_on_reference=args.depends_on,
+                )
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    _print_mission_text(payload)
+                return 0
+            if command == "run":
+                accepted = service.start_mission(
+                    args.mission_id, use_ai=bool(args.use_ai), source="cli"
+                )
+                payload = service.wait_for_mission(accepted["mission_id"])
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    _print_mission_text(payload)
+                return 0 if payload["status"] == "succeeded" else 1
+            if command == "cancel":
+                payload = service.cancel_mission(
+                    args.mission_id, reason=args.reason, source="cli"
+                )
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    print(
+                        f"Mission cancelled; {len(payload['cancelled_tasks'])} task(s) "
+                        "cancelled or asked to stop."
+                    )
+                return 0
+            if command == "delete":
+                if not args.yes:
+                    print("Refusing to delete a mission without --yes.", file=sys.stderr)
+                    return 1
+                payload = service.delete_mission(args.mission_id, source="cli")
+                print(json.dumps(payload, indent=2) if args.json else "Mission deleted (tasks kept).")
+                return 0
+    except PcAgentError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 2
+
+
+def _run_schedules_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "schedules_command", None)
+    if command is None:
+        print("Usage: pc-agent schedules add|list|toggle|delete|tick ...", file=sys.stderr)
+        return 2
+    try:
+        with LocalService(settings) as service:
+            if command == "add":
+                if (args.in_minutes is None) == (args.every_minutes is None):
+                    print(
+                        "Choose exactly one of --in-minutes (once) or --every-minutes.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                from datetime import timedelta
+
+                from .domain.task import utc_now
+
+                if args.in_minutes is not None:
+                    payload = service.create_schedule(
+                        args.name,
+                        instruction=args.instruction,
+                        kind="once",
+                        run_at=utc_now() + timedelta(minutes=args.in_minutes),
+                        use_ai=bool(args.use_ai),
+                        source="cli",
+                    )
+                else:
+                    payload = service.create_schedule(
+                        args.name,
+                        instruction=args.instruction,
+                        kind="interval",
+                        interval_seconds=args.every_minutes * 60,
+                        use_ai=bool(args.use_ai),
+                        source="cli",
+                    )
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    print(
+                        f"Schedule {payload['id']} '{payload['name']}' "
+                        f"next runs at {payload['next_run_at']}."
+                    )
+                return 0
+            if command == "list":
+                payload = service.list_schedules()
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                elif not payload["schedules"]:
+                    print("No schedules yet.")
+                else:
+                    for schedule in payload["schedules"]:
+                        state = "on" if schedule["enabled"] else "off"
+                        print(
+                            f"- {schedule['id']} [{state}] {schedule['name']} "
+                            f"kind={schedule['kind']} next={schedule['next_run_at']} "
+                            f"runs={schedule['run_count']}"
+                        )
+                return 0
+            if command == "toggle":
+                payload = service.set_schedule_enabled(
+                    args.schedule_id, enabled=args.enabled == "true", source="cli"
+                )
+                print(payload["id"] + (" enabled" if payload["enabled"] else " disabled"))
+                return 0
+            if command == "delete":
+                if not args.yes:
+                    print("Refusing to delete a schedule without --yes.", file=sys.stderr)
+                    return 1
+                service.delete_schedule(args.schedule_id, source="cli")
+                print("Schedule deleted.")
+                return 0
+            if command == "tick":
+                payload = service.run_due_schedules(source="cli")
+                for item in payload["triggered"]:
+                    service.wait_for_task(item["task_id"], timeout_seconds=1800)
+                if args.json:
+                    print(json.dumps(payload, indent=2))
+                else:
+                    print(f"Triggered {payload['total']} due schedule(s).")
+                return 0
+    except PcAgentError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 2
+
+
+def _format_bytes(value: object) -> str:
+    try:
+        amount = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "n/a"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if amount < 1024 or unit == "TB":
+            return f"{amount:.1f} {unit}" if amount != int(amount) else f"{amount:.0f} {unit}"
+        amount /= 1024
+    return f"{amount:.1f} TB"
+
+
+def _print_system_snapshot(snapshot: dict) -> None:
+    cpu = snapshot["cpu"]
+    memory = snapshot["memory"]
+    process_info = snapshot["process"]
+    network = snapshot["network"]
+    gpu = snapshot["gpu"]
+    print(
+        f"CPU: {cpu['percent'] if cpu['percent'] is not None else 'n/a'}% via "
+        f"{cpu['method']} ({cpu['logical_cores']} logical cores)"
+    )
+    print(
+        f"Memory: {_format_bytes(memory['used_bytes'])} of "
+        f"{_format_bytes(memory['total_bytes'])} used "
+        f"({memory['percent'] if memory['percent'] is not None else 'n/a'}%)"
+    )
+    for label, volume in sorted(snapshot["disks"].items()):
+        print(
+            f"Disk [{label}]: {_format_bytes(volume['used_bytes'])} of "
+            f"{_format_bytes(volume['total_bytes'])} used "
+            f"({volume['percent']}%), free {_format_bytes(volume['free_bytes'])}"
+        )
+    print(
+        f"Agent process: pid={process_info['pid']} rss="
+        f"{_format_bytes(process_info['rss_bytes'])} via {process_info['rss_method']}, "
+        f"threads={process_info['python_threads']}, uptime="
+        f"{process_info['uptime_seconds']}s"
+    )
+    print(
+        f"Network: down={_format_bytes(network['bytes_received'])} "
+        f"up={_format_bytes(network['bytes_sent'])} "
+        f"rates down={_format_bytes(network['receive_bytes_per_second'])}/s "
+        f"up={_format_bytes(network['send_bytes_per_second'])}/s via {network['method']}"
+    )
+    if gpu["available"]:
+        print(
+            f"GPU: {gpu['name']} util={gpu['utilization_percent']}% vram="
+            f"{gpu['memory_used_mib']}/{gpu['memory_total_mib']} MiB via {gpu['method']}"
+        )
+    else:
+        print(f"GPU: unavailable ({gpu['method']})")
+    if snapshot["battery"]:
+        battery = snapshot["battery"]
+        print(
+            f"Battery: {battery['percent']}% "
+            f"({'plugged in' if battery['plugged_in'] else 'on battery'})"
+        )
+    if snapshot["top_processes"]:
+        print("Top processes (RSS):")
+        for row in snapshot["top_processes"][:8]:
+            print(f"  - {row['pid']} {row['name']} {_format_bytes(row['rss_bytes'])}")
+
+
+def _run_system_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "system_command", None)
+    if command is None:
+        print("Usage: pc-agent system status|sample ...", file=sys.stderr)
+        return 2
+    from .system_monitor import SystemMonitor
+
+    monitor = SystemMonitor(
+        root_dir=settings.root_dir, workspace_dir=settings.workspace_dir
+    )
+    if command == "status":
+        monitor.snapshot()  # prime rate baselines
+        time.sleep(0.25)
+        snapshot = monitor.snapshot().to_dict()
+        if args.json:
+            print(json.dumps({"snapshot": snapshot, "history": monitor.history()}, indent=2))
+        else:
+            _print_system_snapshot(snapshot)
+        return 0
+    if command == "sample":
+        count = max(1, min(int(args.count), 20))
+        interval = max(0.1, min(float(args.interval), 10.0))
+        snapshots = []
+        for index in range(count + 1):
+            snapshot = monitor.snapshot(include_top_processes=False)
+            if index > 0:
+                snapshots.append(snapshot)
+                if not args.json:
+                    net = snapshot.network
+                    print(
+                        f"sample {index}: cpu={snapshot.cpu_percent}% "
+                        f"memory={snapshot.memory.get('percent')}% "
+                        f"net down={_format_bytes(net['receive_bytes_per_second'])}/s "
+                        f"up={_format_bytes(net['send_bytes_per_second'])}/s"
+                    )
+            if index < count:
+                time.sleep(interval)
+        if args.json:
+            print(json.dumps({"samples": [item.to_dict() for item in snapshots]}, indent=2))
+        return 0
+    return 2
+
+
+def _run_safety_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "safety_command", None)
+    if command is None:
+        print("Usage: pc-agent safety status|stop|resume ...", file=sys.stderr)
+        return 2
+    settings.ensure_directories()
+    emergency_stop = EmergencyStop(settings.data_dir)
+    if command == "status":
+        database = _open_database(settings)
+        state = emergency_stop.status()
+        pending = ExecutionRepository(database).pending_approval_center_count()
+        payload = {
+            "hard_timeouts": settings.safety_hard_timeouts,
+            "worker_isolation": settings.safety_worker_isolation,
+            "max_tool_seconds": settings.safety_max_tool_seconds,
+            "approval_expiry_minutes": settings.safety_approval_expiry_minutes,
+            "emergency_stop": state.to_dict(),
+            "emergency_stop_file": str(emergency_stop.path),
+            "pending_approvals": pending,
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print("Safety Kernel:")
+            print(f"  Hard tool timeouts: {'on' if settings.safety_hard_timeouts else 'OFF'}")
+            print(
+                "  Isolated worker: "
+                + ("on" if settings.safety_worker_isolation else "off")
+            )
+            print(f"  Max tool seconds: {settings.safety_max_tool_seconds:g}")
+            print(
+                "  Approval Center expiry: "
+                f"{settings.safety_approval_expiry_minutes} minutes"
+            )
+            print(f"  Emergency stop: {state.summary()}")
+            print(f"  Pending Approval Center requests: {pending}")
+        return 0
+    if command == "stop":
+        state = emergency_stop.engage(reason=args.reason, engaged_by="cli")
+        EventRepository(_open_database(settings)).record(
+            "safety.emergency_stop_engaged",
+            source="cli",
+            summary=f"Emergency stop engaged: {(args.reason or 'no reason given')[:160]}",
+        )
+        if args.json:
+            print(json.dumps(state.to_dict(), indent=2))
+        else:
+            print("EMERGENCY STOP ENGAGED: orchestrated tool execution is blocked.")
+            print(f"  {state.summary()}")
+            print("  Clear it with: pc-agent safety resume")
+        return 0
+    if command == "resume":
+        confirmed = bool(args.yes) if args.json else _confirm_direct_write(
+            "clear the emergency stop so orchestrated tool execution can run again",
+            preapproved=bool(args.yes),
+            heading="Approval required to clear the emergency stop:",
+        )
+        if not confirmed:
+            print("Emergency stop remains engaged; nothing was changed.")
+            return 3
+        state = emergency_stop.clear(cleared_by="cli")
+        EventRepository(_open_database(settings)).record(
+            "safety.emergency_stop_released",
+            source="cli",
+            summary="Emergency stop cleared.",
+        )
+        if args.json:
+            print(json.dumps(state.to_dict(), indent=2))
+        if state.engaged:
+            print(
+                "The stop file was cleared, but PC_AGENT_EMERGENCY_STOP is "
+                "still set in the environment, so execution remains blocked.",
+                file=sys.stderr,
+            )
+            return 3
+        if not args.json:
+            print("Emergency stop cleared; orchestrated tool execution is allowed.")
+        return 0
+    raise PcAgentError(f"Unknown safety command: {command}")
+
+
+def _run_approvals_command(settings: Settings, args: argparse.Namespace) -> int:
+    command = getattr(args, "approvals_command", None)
+    if command is None:
+        print(
+            "Usage: pc-agent approvals list|show|approve|deny ...",
+            file=sys.stderr,
+        )
+        return 2
+    database = _open_database(settings)
+    execution = ExecutionRepository(database)
+    if command == "list":
+        if args.limit < 1 or args.limit > 200:
+            raise PcAgentError("Approval list --limit must be between 1 and 200.")
+        requests = execution.list_approval_center_requests(
+            status=args.status, task_id=args.task, limit=args.limit
+        )
+        if args.json:
+            print(json.dumps([request.to_dict() for request in requests], indent=2))
+        elif not requests:
+            print("No Approval Center requests recorded.")
+        else:
+            for request in requests:
+                print(
+                    f"- {request.request_key} [{request.status}] "
+                    f"tool={request.tool_id} task={request.task_id} "
+                    f"expires={request.expires_at.isoformat()}"
+                )
+                print(f"  {request.summary}")
+        return 0
+    request = execution.get_approval_center_request(args.request_key)
+    if request is None:
+        raise PcAgentError(
+            f"Approval Center request was not found: {args.request_key}."
+        )
+    if command == "show":
+        if args.json:
+            print(json.dumps(request.to_dict(), indent=2))
+        else:
+            print(f"Request: {request.request_key}")
+            print(f"Status: {request.status}")
+            print(f"Task: {request.task_id}")
+            print(f"Action: {request.action}")
+            print(f"Tool: {request.tool_id}")
+            print(f"Arguments SHA-256: {request.arguments_sha256}")
+            print(f"Read roots: {', '.join(request.read_roots) or 'none'}")
+            print(f"Summary: {request.summary}")
+            print(f"Created: {request.created_at.isoformat()}")
+            print(f"Expires: {request.expires_at.isoformat()}")
+            print(f"Decided by: {request.decided_by or 'none'}")
+        return 0
+    if command in {"approve", "deny"}:
+        approved = command == "approve"
+        confirmed = bool(args.yes) if args.json else _confirm_direct_write(
+            f"{command} Approval Center request {request.request_key} for "
+            f"task {request.task_id} (tool {request.tool_id}; "
+            f"arguments SHA-256 {request.arguments_sha256[:16]}...; "
+            f"summary: {request.summary})",
+            preapproved=bool(args.yes),
+            heading="Approval Center decision for this exact scope:",
+        )
+        if not confirmed:
+            print("No decision recorded; the request is unchanged.")
+            return 3
+        decided = execution.decide_approval_center_request(
+            request.request_key, approved=approved, decided_by="cli"
+        )
+        if args.json:
+            print(json.dumps(decided.to_dict(), indent=2))
+        else:
+            print(
+                f"Approval Center request {decided.request_key} "
+                f"{'APPROVED' if approved else 'DENIED'} "
+                f"for task {decided.task_id}."
+            )
+            if approved:
+                print(f"Resume the task with: pc-agent task resume {decided.task_id}")
+        return 0
+    raise PcAgentError(f"Unknown approvals command: {command}")
 
 
 def _run_diagnostics_command(settings: Settings, args: argparse.Namespace) -> int:
@@ -8081,7 +12328,112 @@ def _print_env_cleanup_result(result: Any, *, as_json: bool) -> None:
     )
 
 
+def _run_providers_platform_command(
+    settings: Settings, args: argparse.Namespace
+) -> int:
+    from .provider_platform import (
+        capability_catalog,
+        load_latest_evaluation,
+        load_usage_records,
+        route_explanation,
+        run_evaluations,
+        usage_stats,
+        usage_summary_line,
+    )
+
+    command = args.providers_command
+    as_json = bool(getattr(args, "json", False))
+    if command == "capabilities":
+        router = build_model_router(settings)
+        catalog = capability_catalog(settings, router)
+        if as_json:
+            print(json.dumps({"capabilities": catalog}, indent=2))
+            return 0
+        for row in catalog:
+            flags = []
+            if row["local"]:
+                flags.append("local")
+            if row["streaming"]:
+                flags.append("streaming")
+            if row["vision"]:
+                flags.append("vision")
+            context = row["context_tokens"] or "unknown"
+            price = (
+                f"in={row['input_per_1k']}/1k out={row['output_per_1k']}/1k"
+                if row["priced"]
+                else "unpriced"
+            )
+            print(
+                f"{row['provider']} model={row['model']} "
+                f"configured={'yes' if row['configured'] else 'no'} "
+                f"in_route={'yes' if row['in_route'] else 'no'} "
+                f"[{', '.join(flags) or 'remote'}] context={context} price={price}"
+            )
+        print("No provider network call was made by this command.")
+        return 0
+    if command == "route":
+        router = build_model_router(settings)
+        explanation = route_explanation(settings, router)
+        if as_json:
+            print(json.dumps(explanation, indent=2))
+            return 0
+        print(f"Strategy: {explanation['strategy']} ({explanation['reason']})")
+        print(f"Configured order: {' -> '.join(explanation['configured_order']) or 'mock (default)'}")
+        print(f"Effective route: {' -> '.join(explanation['effective_route'])}")
+        print(f"Usage analytics: {'on' if explanation['analytics_enabled'] else 'off'}")
+        return 0
+    if command == "usage":
+        stats = usage_stats(load_usage_records(settings))
+        if as_json:
+            print(json.dumps({"usage": stats}, indent=2))
+            return 0
+        print(f"Provider usage: {usage_summary_line(stats)}")
+        for row in stats["by_model"]:
+            estimated = " (estimated tokens)" if row["estimated_tokens_used"] else ""
+            cost = (
+                f" est_cost={row['estimated_cost']}"
+                if row["estimated_cost"] is not None
+                else ""
+            )
+            print(
+                f"  {row['provider']}/{row['model']}: calls={row['calls']} "
+                f"success={row['successes']} median={row['median_latency_ms']}ms "
+                f"p95={row['p95_latency_ms']}ms tokens_in={row['input_tokens']} "
+                f"tokens_out={row['output_tokens']}{cost}{estimated}"
+            )
+        if not stats["by_model"]:
+            print("  No provider calls recorded yet (local analytics file is empty).")
+        return 0
+    if command == "evaluate":
+        if getattr(args, "show", False):
+            report = load_latest_evaluation(settings)
+            if report is None:
+                print("No evaluation has been run yet. Use: pc-agent providers evaluate")
+                return 1
+        else:
+            _require_license(settings, FEATURE_PROVIDERS)
+            settings.ensure_directories()
+            report = run_evaluations(settings, build_model_router(settings))
+        if as_json:
+            print(json.dumps(report, indent=2))
+            return 0 if report["passed"] == report["total"] else 1
+        for case in report["cases"]:
+            state = "PASS" if case["passed"] else "FAIL"
+            print(
+                f"[{state}] {case['id']}: {case['latency_ms']}ms "
+                f"via {case['provider']}/{case['model']} - {case['detail']}"
+            )
+        print(
+            f"Evaluations: {report['passed']}/{report['total']} passed "
+            f"(route: {' -> '.join(report['route'])})"
+        )
+        return 0 if report["passed"] == report["total"] else 1
+    return 2
+
+
 def _run_providers_command(settings: Settings, args: argparse.Namespace) -> int:
+    if args.providers_command in {"capabilities", "route", "usage", "evaluate"}:
+        return _run_providers_platform_command(settings, args)
     if args.providers_command == "verify-anthropic":
         _require_license(settings, FEATURE_PROVIDERS)
         settings.ensure_directories()
@@ -8102,8 +12454,8 @@ def _run_providers_command(settings: Settings, args: argparse.Namespace) -> int:
         return 0
     if args.providers_command != "list":
         print(
-            "Usage: pc-agent providers list|verify-anthropic|"
-            "verify-anthropic-report ...",
+            "Usage: pc-agent providers list|capabilities|route|usage|evaluate|"
+            "verify-anthropic|verify-anthropic-report ...",
             file=sys.stderr,
         )
         return 2
@@ -8133,6 +12485,12 @@ def _run_ask_command(settings: Settings, args: argparse.Namespace) -> int:
         temperature=args.temperature,
         max_output_tokens=args.max_tokens,
     )
+    if args.stream:
+        print("Streaming via the configured route...", file=sys.stderr)
+        for delta in router.stream_complete(request):
+            print(delta, end="", flush=True)
+        print()
+        return 0
     routed = router.complete(request, allow_fallback=not args.no_fallback)
     for attempt in routed.attempts:
         state = "success" if attempt.success else "failed"

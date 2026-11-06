@@ -4,20 +4,47 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from ..domain.task import Task, TaskStatus, parse_iso_datetime, utc_now
 from ..errors import StorageError
+from ..logging_config import redact_text
 from ..tools.registry import ToolResult
 from .db import Database
 
 
 def _format(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _approval_center_from_row(row: Any) -> ApprovalCenterRequest:
+    roots = _parsed_json(row["read_roots_json"], [])
+    return ApprovalCenterRequest(
+        id=int(row["id"]),
+        request_key=str(row["request_key"]),
+        task_id=str(row["task_id"]),
+        action=str(row["action"]),
+        tool_id=str(row["tool_id"]),
+        arguments_sha256=str(row["arguments_sha256"]),
+        read_roots=tuple(str(item) for item in roots) if isinstance(roots, list) else (),
+        summary=str(row["summary"]),
+        status=str(row["status"]),
+        decided_by=str(row["decided_by"]) if row["decided_by"] else None,
+        created_at=parse_iso_datetime(str(row["created_at"])),
+        decided_at=(
+            parse_iso_datetime(str(row["decided_at"])) if row["decided_at"] else None
+        ),
+        expires_at=parse_iso_datetime(str(row["expires_at"])),
+        consumed_at=(
+            parse_iso_datetime(str(row["consumed_at"])) if row["consumed_at"] else None
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +69,48 @@ class ApprovalRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovalCenterRequest:
+    """One out-of-band Approval Center request (Transformation Phase 2).
+
+    Raw tool arguments are never stored here; ``arguments_sha256`` binds
+    the decision to the exact approved scope.
+    """
+
+    id: int
+    request_key: str
+    task_id: str
+    action: str
+    tool_id: str
+    arguments_sha256: str
+    read_roots: tuple[str, ...]
+    summary: str
+    status: str  # pending | approved | denied | expired | consumed
+    decided_by: str | None
+    created_at: datetime
+    decided_at: datetime | None
+    expires_at: datetime
+    consumed_at: datetime | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "request_key": self.request_key,
+            "task_id": self.task_id,
+            "action": self.action,
+            "tool_id": self.tool_id,
+            "arguments_sha256": self.arguments_sha256,
+            "read_roots": list(self.read_roots),
+            "summary": self.summary,
+            "status": self.status,
+            "decided_by": self.decided_by,
+            "created_at": self.created_at.isoformat(),
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+            "expires_at": self.expires_at.isoformat(),
+            "consumed_at": self.consumed_at.isoformat() if self.consumed_at else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ToolInvocationRecord:
     id: int
     task_id: str
@@ -53,6 +122,30 @@ class ToolInvocationRecord:
     error: str | None
     elapsed_ms: float
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AppEventRecord:
+    """One global application event (Transformation Phase 3 event system)."""
+
+    id: int
+    event_type: str
+    source: str
+    task_id: str | None
+    summary: str
+    payload: Mapping[str, Any]
+    created_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "event_type": self.event_type,
+            "source": self.source,
+            "task_id": self.task_id,
+            "summary": self.summary,
+            "payload": dict(self.payload),
+            "created_at": self.created_at.isoformat(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +181,9 @@ class MemoryItemRecord:
     source_task_id: str | None
     created_at: datetime
     updated_at: datetime
+    # Transformation Phase 8 (Memory v2); vector bytes stay in the repo.
+    embedding_model: str | None = None
+    tags: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +448,7 @@ class MemoryRepository:
         title: str,
         content: Mapping[str, Any],
         source_task_id: str | None = None,
+        tags: str = "",
     ) -> MemoryItemRecord:
         if kind not in self._KINDS:
             raise StorageError(f"Unknown memory kind: {kind}")
@@ -361,16 +458,34 @@ class MemoryRepository:
         clean_title = title.strip() or clean_key
         if len(clean_title) > 200:
             raise StorageError("Memory title must be at most 200 characters.")
+        clean_tags = " ".join(tags.replace(",", " ").split())[:200]
         now = _format(utc_now())
         with self._db.connect() as connection:
             connection.execute(
                 "INSERT INTO memory_items (kind, key, title, content_json,"
-                " source_task_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " source_task_id, created_at, updated_at, tags)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(kind, key) DO UPDATE SET title = excluded.title,"
+                # Memory v2: a content change invalidates the stored vector.
+                " embedding = CASE WHEN excluded.content_json != memory_items.content_json"
+                " THEN NULL ELSE memory_items.embedding END,"
+                " embedding_model = CASE WHEN excluded.content_json != memory_items.content_json"
+                " THEN NULL ELSE memory_items.embedding_model END,"
+                " tags = CASE WHEN excluded.tags != '' THEN excluded.tags"
+                " ELSE memory_items.tags END,"
                 " content_json = excluded.content_json,"
                 " source_task_id = excluded.source_task_id,"
                 " updated_at = excluded.updated_at",
-                (kind, clean_key, clean_title, _json(dict(content)), source_task_id, now, now),
+                (
+                    kind,
+                    clean_key,
+                    clean_title,
+                    _json(dict(content)),
+                    source_task_id,
+                    now,
+                    now,
+                    clean_tags,
+                ),
             )
         record = self.get(kind, clean_key)
         if record is None:  # pragma: no cover - row was just written
@@ -418,8 +533,46 @@ class MemoryRepository:
             result[str(row["kind"])] = int(row["n"])
         return result
 
+    # -- Memory v2 semantic embeddings (Transformation Phase 8) ----------------
+    def set_embedding(self, kind: str, key: str, vector: bytes, model: str) -> bool:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE memory_items SET embedding = ?, embedding_model = ?"
+                " WHERE kind = ? AND key = ?",
+                (vector, model, kind, key),
+            )
+            return cursor.rowcount > 0
+
+    def notes_needing_embedding(
+        self, model: str, *, limit: int = 200
+    ) -> list[MemoryItemRecord]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM memory_items WHERE kind = 'note'"
+                " AND (embedding IS NULL OR embedding_model IS NULL"
+                " OR embedding_model != ?)"
+                " ORDER BY updated_at DESC, id DESC LIMIT ?",
+                (model, max(1, min(limit, 1000))),
+            ).fetchall()
+        return [self._record_from_row(row) for row in rows]
+
+    def embedded_notes(
+        self, model: str, *, limit: int = 5000
+    ) -> list[tuple[MemoryItemRecord, bytes]]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM memory_items WHERE kind = 'note'"
+                " AND embedding IS NOT NULL AND embedding_model = ?"
+                " ORDER BY updated_at DESC, id DESC LIMIT ?",
+                (model, max(1, min(limit, 20000))),
+            ).fetchall()
+        return [
+            (self._record_from_row(row), bytes(row["embedding"])) for row in rows
+        ]
+
     @staticmethod
     def _record_from_row(row: sqlite3.Row) -> MemoryItemRecord:
+        keys = row.keys()
         return MemoryItemRecord(
             id=int(row["id"]),
             kind=str(row["kind"]),
@@ -429,6 +582,12 @@ class MemoryRepository:
             source_task_id=str(row["source_task_id"]) if row["source_task_id"] else None,
             created_at=parse_iso_datetime(str(row["created_at"])),
             updated_at=parse_iso_datetime(str(row["updated_at"])),
+            embedding_model=(
+                str(row["embedding_model"])
+                if "embedding_model" in keys and row["embedding_model"]
+                else None
+            ),
+            tags=str(row["tags"]) if "tags" in keys and row["tags"] else "",
         )
 
 
@@ -572,6 +731,199 @@ class ExecutionRepository:
             )
             for row in rows
         ]
+
+    def create_approval_center_request(
+        self,
+        task_id: str,
+        *,
+        action: str,
+        tool_id: str,
+        arguments_sha256: str,
+        read_roots: tuple[str, ...],
+        summary: str,
+        expires_at: datetime,
+    ) -> ApprovalCenterRequest:
+        """Create (or reuse) a pending Approval Center request.
+
+        An identical pending request for the same task/tool/exact-arguments
+        is returned unchanged, so repeated non-interactive runs do not pile
+        up duplicate rows. Expired pendings are closed first.
+        """
+
+        self._expire_approval_center_requests()
+        for existing in self.list_approval_center_requests(task_id=task_id, limit=200):
+            if (
+                existing.status == "pending"
+                and existing.tool_id == tool_id
+                and existing.action == action
+                and existing.arguments_sha256 == arguments_sha256
+                and existing.read_roots == tuple(read_roots)
+            ):
+                return existing
+        request_key = f"apr-{secrets.token_hex(6)}"
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO approval_center_requests (request_key, task_id, action,"
+                " tool_id, arguments_sha256, read_roots_json, summary, status,"
+                " created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    request_key,
+                    task_id,
+                    action,
+                    tool_id,
+                    arguments_sha256,
+                    _json(list(read_roots)),
+                    summary[:300],
+                    _format(utc_now()),
+                    _format(expires_at),
+                ),
+            )
+            row_id = int(cursor.lastrowid)
+        created = self.get_approval_center_request(request_key)
+        assert created is not None and created.id == row_id
+        EventRepository(self._db).record(
+            "approval.requested",
+            source="approval-center",
+            task_id=task_id,
+            summary=f"Approval Center request {request_key} pending for {tool_id}.",
+            payload={"request_key": request_key, "tool_id": tool_id, "action": action},
+        )
+        return created
+
+    def get_approval_center_request(
+        self, request_key: str
+    ) -> ApprovalCenterRequest | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM approval_center_requests WHERE request_key = ?",
+                (request_key,),
+            ).fetchone()
+        return _approval_center_from_row(row) if row is not None else None
+
+    def list_approval_center_requests(
+        self,
+        *,
+        status: str | None = None,
+        task_id: str | None = None,
+        limit: int = 50,
+    ) -> list[ApprovalCenterRequest]:
+        self._expire_approval_center_requests()
+        query = "SELECT * FROM approval_center_requests"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
+        with self._db.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_approval_center_from_row(row) for row in rows]
+
+    def pending_approval_center_count(self) -> int:
+        self._expire_approval_center_requests()
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total FROM approval_center_requests"
+                " WHERE status = 'pending'"
+            ).fetchone()
+        return int(row["total"])
+
+    def decide_approval_center_request(
+        self, request_key: str, *, approved: bool, decided_by: str
+    ) -> ApprovalCenterRequest:
+        self._expire_approval_center_requests()
+        current = self.get_approval_center_request(request_key)
+        if current is None:
+            raise StorageError(f"Approval Center request was not found: {request_key}.")
+        if current.status != "pending":
+            raise StorageError(
+                f"Approval Center request {request_key} is {current.status} "
+                "and can no longer be decided."
+            )
+        with self._db.connect() as connection:
+            connection.execute(
+                "UPDATE approval_center_requests SET status = ?, decided_by = ?,"
+                " decided_at = ? WHERE request_key = ? AND status = 'pending'",
+                (
+                    "approved" if approved else "denied",
+                    decided_by[:40],
+                    _format(utc_now()),
+                    request_key,
+                ),
+            )
+        decided = self.get_approval_center_request(request_key)
+        assert decided is not None
+        EventRepository(self._db).record(
+            "approval.decided",
+            source="approval-center",
+            task_id=decided.task_id,
+            summary=(
+                f"Approval Center request {request_key} "
+                f"{decided.status} by {decided_by}."
+            ),
+            payload={
+                "request_key": request_key,
+                "tool_id": decided.tool_id,
+                "decision": decided.status,
+                "decided_by": decided_by,
+            },
+        )
+        return decided
+
+    def find_decided_approval_center_request(
+        self,
+        task_id: str,
+        *,
+        action: str,
+        tool_id: str,
+        arguments_sha256: str,
+        read_roots: tuple[str, ...],
+    ) -> ApprovalCenterRequest | None:
+        """Latest unconsumed approved/denied decision for an exact scope."""
+
+        for request in self.list_approval_center_requests(task_id=task_id, limit=200):
+            if (
+                request.status in {"approved", "denied"}
+                and request.action == action
+                and request.tool_id == tool_id
+                and request.arguments_sha256 == arguments_sha256
+                and request.read_roots == tuple(read_roots)
+            ):
+                return request
+        return None
+
+    def consume_approval_center_request(
+        self, request_key: str
+    ) -> ApprovalCenterRequest:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE approval_center_requests SET status = 'consumed',"
+                " consumed_at = ? WHERE request_key = ?"
+                " AND status IN ('approved', 'denied')",
+                (_format(utc_now()), request_key),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError(
+                    f"Approval Center request {request_key} could not be consumed."
+                )
+        consumed = self.get_approval_center_request(request_key)
+        assert consumed is not None
+        return consumed
+
+    def _expire_approval_center_requests(self) -> None:
+        with self._db.connect() as connection:
+            connection.execute(
+                "UPDATE approval_center_requests SET status = 'expired'"
+                " WHERE status IN ('pending', 'approved', 'denied')"
+                " AND expires_at <= ?",
+                (_format(utc_now()),),
+            )
 
     def record_tool_invocation(
         self, task_id: str, arguments: Mapping[str, Any], result: ToolResult
@@ -767,6 +1119,483 @@ class ExecutionRepository:
             created_at=parse_iso_datetime(str(row["created_at"])),
             updated_at=parse_iso_datetime(str(row["updated_at"])),
         )
+
+
+class EventRepository:
+    """Global application events: the Phase 3 event system's durable log.
+
+    Events are small, secret-redacted facts (task lifecycle, approvals,
+    safety, backups, API). Consumers poll with a ``since_id`` cursor;
+    the table is trimmed to the most recent ``MAX_EVENTS`` rows so it
+    cannot grow without bound.
+    """
+
+    MAX_EVENTS = 10_000
+
+    def __init__(self, Database: Database) -> None:
+        self._db = Database
+
+    def record(
+        self,
+        event_type: str,
+        *,
+        source: str,
+        summary: str,
+        task_id: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> AppEventRecord:
+        clean_type = event_type.strip()
+        if not clean_type or len(clean_type) > 80:
+            raise StorageError("Event type must be 1-80 characters.")
+        clean_source = source.strip()[:40] or "app"
+        clean_summary = redact_text(summary.strip())[:300]
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO app_events (event_type, source, task_id, summary,"
+                " payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    clean_type,
+                    clean_source,
+                    task_id,
+                    clean_summary,
+                    _json(dict(payload or {})),
+                    _format(utc_now()),
+                ),
+            )
+            row_id = int(cursor.lastrowid)
+            connection.execute(
+                "DELETE FROM app_events WHERE id <= "
+                "(SELECT COALESCE(MAX(id), 0) - ? FROM app_events)",
+                (self.MAX_EVENTS,),
+            )
+        created = self.get(row_id)
+        if created is None:  # Trimmed instantly only if MAX_EVENTS were 0.
+            raise StorageError("The recorded event could not be read back.")
+        return created
+
+    def get(self, event_id: int) -> AppEventRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM app_events WHERE id = ?", (event_id,)
+            ).fetchone()
+        return _app_event_from_row(row) if row is not None else None
+
+    def list(
+        self,
+        *,
+        since_id: int = 0,
+        event_type: str | None = None,
+        task_id: str | None = None,
+        limit: int = 100,
+        descending: bool = False,
+    ) -> list[AppEventRecord]:
+        query = "SELECT * FROM app_events WHERE id > ?"
+        params: list[Any] = [max(0, int(since_id))]
+        if event_type is not None:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        if task_id is not None:
+            query += " AND task_id = ?"
+            params.append(task_id)
+        query += " ORDER BY id " + ("DESC" if descending else "ASC") + " LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._db.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_app_event_from_row(row) for row in rows]
+
+    def count(self) -> int:
+        with self._db.connect() as connection:
+            row = connection.execute("SELECT COUNT(*) AS total FROM app_events").fetchone()
+        return int(row["total"])
+
+
+@dataclass(frozen=True, slots=True)
+class MissionRecord:
+    """One mission: a named group of tasks with a dependency graph."""
+
+    id: str
+    name: str
+    description: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "status": self.status,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleRecord:
+    """One recurring or one-off scheduled instruction (Phase 4)."""
+
+    id: str
+    name: str
+    instruction: str
+    kind: str
+    run_at: datetime | None
+    interval_seconds: int | None
+    next_run_at: datetime
+    enabled: bool
+    use_ai: bool
+    created_at: datetime
+    updated_at: datetime
+    last_run_at: datetime | None
+    last_task_id: str | None
+    run_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "instruction": self.instruction,
+            "kind": self.kind,
+            "run_at": self.run_at.isoformat() if self.run_at else None,
+            "interval_seconds": self.interval_seconds,
+            "next_run_at": self.next_run_at.isoformat(),
+            "enabled": self.enabled,
+            "use_ai": self.use_ai,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "last_run_at": self.last_run_at.isoformat() if self.last_run_at else None,
+            "last_task_id": self.last_task_id,
+            "run_count": self.run_count,
+        }
+
+
+MISSION_STATUSES = ("draft", "running", "succeeded", "failed", "cancelled")
+
+
+class MissionRepository:
+    """Missions, their task membership/dependencies, and task schedules."""
+
+    def __init__(self, Database: Database) -> None:
+        self._db = Database
+
+    # -- missions -------------------------------------------------------------
+    def create_mission(self, name: str, *, description: str = "") -> MissionRecord:
+        clean_name = name.strip()
+        if not clean_name or len(clean_name) > 120:
+            raise StorageError("Mission name must be 1-120 characters.")
+        mission_id = uuid.uuid4().hex
+        now = _format(utc_now())
+        with self._db.connect() as connection:
+            connection.execute(
+                "INSERT INTO missions (id, name, description, status, created_at,"
+                " updated_at) VALUES (?, ?, ?, 'draft', ?, ?)",
+                (mission_id, clean_name, description.strip()[:2000], now, now),
+            )
+        mission = self.get_mission(mission_id)
+        assert mission is not None
+        return mission
+
+    def get_mission(self, mission_id: str) -> MissionRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM missions WHERE id = ?", (mission_id,)
+            ).fetchone()
+        return _mission_from_row(row) if row is not None else None
+
+    def list_missions(self, *, limit: int = 100) -> list[MissionRecord]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM missions ORDER BY created_at DESC, id DESC LIMIT ?",
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        return [_mission_from_row(row) for row in rows]
+
+    def count_missions(self) -> int:
+        with self._db.connect() as connection:
+            row = connection.execute("SELECT COUNT(*) AS total FROM missions").fetchone()
+        return int(row["total"])
+
+    def update_mission_status(self, mission_id: str, status: str) -> MissionRecord:
+        if status not in MISSION_STATUSES:
+            raise StorageError(f"Unknown mission status: {status}")
+        now = utc_now()
+        completed = _format(now) if status in {"succeeded", "failed", "cancelled"} else None
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE missions SET status = ?, updated_at = ?, completed_at ="
+                " COALESCE(?, completed_at) WHERE id = ?",
+                (status, _format(now), completed, mission_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError(f"Mission not found: {mission_id}")
+        mission = self.get_mission(mission_id)
+        assert mission is not None
+        return mission
+
+    def delete_mission(self, mission_id: str) -> bool:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM missions WHERE id = ?", (mission_id,)
+            )
+            return cursor.rowcount == 1
+
+    # -- membership and dependencies --------------------------------------------
+    def add_task(self, mission_id: str, task_id: str) -> None:
+        with self._db.connect() as connection:
+            position = connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 AS next FROM mission_tasks"
+                " WHERE mission_id = ?",
+                (mission_id,),
+            ).fetchone()["next"]
+            connection.execute(
+                "INSERT OR IGNORE INTO mission_tasks (mission_id, task_id, position,"
+                " added_at) VALUES (?, ?, ?, ?)",
+                (mission_id, task_id, int(position), _format(utc_now())),
+            )
+
+    def remove_task(self, mission_id: str, task_id: str) -> bool:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM mission_tasks WHERE mission_id = ? AND task_id = ?",
+                (mission_id, task_id),
+            )
+            return cursor.rowcount == 1
+
+    def list_task_ids(self, mission_id: str) -> list[str]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT task_id FROM mission_tasks WHERE mission_id = ?"
+                " ORDER BY position, task_id",
+                (mission_id,),
+            ).fetchall()
+        return [str(row["task_id"]) for row in rows]
+
+    def add_dependency(self, mission_id: str, task_id: str, depends_on: str) -> None:
+        if task_id == depends_on:
+            raise StorageError("A task cannot depend on itself.")
+        members = set(self.list_task_ids(mission_id))
+        if task_id not in members or depends_on not in members:
+            raise StorageError("Both tasks must belong to the mission before linking.")
+        graph = self.list_dependencies(mission_id)
+        graph.setdefault(task_id, []).append(depends_on)
+        _assert_acyclic(graph)
+        with self._db.connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO mission_dependencies (mission_id, task_id,"
+                " depends_on_task_id, created_at) VALUES (?, ?, ?, ?)",
+                (mission_id, task_id, depends_on, _format(utc_now())),
+            )
+
+    def list_dependencies(self, mission_id: str) -> dict[str, list[str]]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT task_id, depends_on_task_id FROM mission_dependencies"
+                " WHERE mission_id = ? ORDER BY task_id, depends_on_task_id",
+                (mission_id,),
+            ).fetchall()
+        graph: dict[str, list[str]] = {}
+        for row in rows:
+            graph.setdefault(str(row["task_id"]), []).append(str(row["depends_on_task_id"]))
+        return graph
+
+    # -- schedules ---------------------------------------------------------------
+    def create_schedule(
+        self,
+        name: str,
+        *,
+        instruction: str,
+        kind: str,
+        run_at: datetime | None = None,
+        interval_seconds: int | None = None,
+        use_ai: bool = False,
+        now: datetime | None = None,
+    ) -> ScheduleRecord:
+        clean_name = name.strip()
+        if not clean_name or len(clean_name) > 120:
+            raise StorageError("Schedule name must be 1-120 characters.")
+        if not instruction.strip():
+            raise StorageError("Schedule instruction must not be empty.")
+        moment = now or utc_now()
+        if kind == "once":
+            if run_at is None:
+                raise StorageError("A one-off schedule needs a run_at time.")
+            next_run = run_at
+        elif kind == "interval":
+            if interval_seconds is None or interval_seconds < 60 or interval_seconds > 31_536_000:
+                raise StorageError("Interval schedules need 60..31536000 seconds.")
+            next_run = moment + timedelta(seconds=interval_seconds)
+        else:
+            raise StorageError(f"Unknown schedule kind: {kind}")
+        schedule_id = "sch-" + uuid.uuid4().hex[:12]
+        stamp = _format(moment)
+        with self._db.connect() as connection:
+            connection.execute(
+                "INSERT INTO task_schedules (id, name, instruction, kind, run_at,"
+                " interval_seconds, next_run_at, enabled, use_ai, created_at,"
+                " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                (
+                    schedule_id,
+                    clean_name,
+                    instruction.strip(),
+                    kind,
+                    _format(run_at) if run_at else None,
+                    interval_seconds,
+                    _format(next_run),
+                    1 if use_ai else 0,
+                    stamp,
+                    stamp,
+                ),
+            )
+        schedule = self.get_schedule(schedule_id)
+        assert schedule is not None
+        return schedule
+
+    def get_schedule(self, schedule_id: str) -> ScheduleRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM task_schedules WHERE id = ?", (schedule_id,)
+            ).fetchone()
+        return _schedule_from_row(row) if row is not None else None
+
+    def list_schedules(self, *, limit: int = 200) -> list[ScheduleRecord]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_schedules ORDER BY next_run_at, id LIMIT ?",
+                (max(1, min(int(limit), 1000)),),
+            ).fetchall()
+        return [_schedule_from_row(row) for row in rows]
+
+    def count_schedules(self, *, enabled_only: bool = False) -> int:
+        query = "SELECT COUNT(*) AS total FROM task_schedules"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        with self._db.connect() as connection:
+            row = connection.execute(query).fetchone()
+        return int(row["total"])
+
+    def due_schedules(self, *, moment: datetime | None = None) -> list[ScheduleRecord]:
+        stamp = _format(moment or utc_now())
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM task_schedules WHERE enabled = 1 AND next_run_at <= ?"
+                " ORDER BY next_run_at, id",
+                (stamp,),
+            ).fetchall()
+        return [_schedule_from_row(row) for row in rows]
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> ScheduleRecord:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE task_schedules SET enabled = ?, updated_at = ? WHERE id = ?",
+                (1 if enabled else 0, _format(utc_now()), schedule_id),
+            )
+            if cursor.rowcount != 1:
+                raise StorageError(f"Schedule not found: {schedule_id}")
+        schedule = self.get_schedule(schedule_id)
+        assert schedule is not None
+        return schedule
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM task_schedules WHERE id = ?", (schedule_id,)
+            )
+            return cursor.rowcount == 1
+
+    def mark_schedule_triggered(
+        self, schedule_id: str, *, task_id: str, moment: datetime | None = None
+    ) -> ScheduleRecord:
+        schedule = self.get_schedule(schedule_id)
+        if schedule is None:
+            raise StorageError(f"Schedule not found: {schedule_id}")
+        fired_at = moment or utc_now()
+        if schedule.kind == "once":
+            enabled = 0
+            next_run = schedule.next_run_at
+        else:
+            enabled = 1
+            interval = schedule.interval_seconds or 3600
+            next_run = fired_at + timedelta(seconds=interval)
+        with self._db.connect() as connection:
+            connection.execute(
+                "UPDATE task_schedules SET enabled = ?, next_run_at = ?, last_run_at = ?,"
+                " last_task_id = ?, run_count = run_count + 1, updated_at = ? WHERE id = ?",
+                (
+                    enabled,
+                    _format(next_run),
+                    _format(fired_at),
+                    task_id,
+                    _format(fired_at),
+                    schedule_id,
+                ),
+            )
+        updated = self.get_schedule(schedule_id)
+        assert updated is not None
+        return updated
+
+
+def _assert_acyclic(graph: dict[str, list[str]]) -> None:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> None:
+        if node in visited:
+            return
+        if node in visiting:
+            raise StorageError("That dependency would create a cycle in the mission graph.")
+        visiting.add(node)
+        for dependency in graph.get(node, []):
+            visit(dependency)
+        visiting.discard(node)
+        visited.add(node)
+
+    for node in graph:
+        visit(node)
+
+
+def _mission_from_row(row: Any) -> MissionRecord:
+    return MissionRecord(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        description=str(row["description"]),
+        status=str(row["status"]),
+        created_at=parse_iso_datetime(str(row["created_at"])),
+        updated_at=parse_iso_datetime(str(row["updated_at"])),
+        completed_at=parse_iso_datetime(str(row["completed_at"])) if row["completed_at"] else None,
+    )
+
+
+def _schedule_from_row(row: Any) -> ScheduleRecord:
+    return ScheduleRecord(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        instruction=str(row["instruction"]),
+        kind=str(row["kind"]),
+        run_at=parse_iso_datetime(str(row["run_at"])) if row["run_at"] else None,
+        interval_seconds=int(row["interval_seconds"]) if row["interval_seconds"] else None,
+        next_run_at=parse_iso_datetime(str(row["next_run_at"])),
+        enabled=bool(row["enabled"]),
+        use_ai=bool(row["use_ai"]),
+        created_at=parse_iso_datetime(str(row["created_at"])),
+        updated_at=parse_iso_datetime(str(row["updated_at"])),
+        last_run_at=parse_iso_datetime(str(row["last_run_at"])) if row["last_run_at"] else None,
+        last_task_id=str(row["last_task_id"]) if row["last_task_id"] else None,
+        run_count=int(row["run_count"]),
+    )
+
+
+def _app_event_from_row(row: Any) -> AppEventRecord:
+    return AppEventRecord(
+        id=int(row["id"]),
+        event_type=str(row["event_type"]),
+        source=str(row["source"]),
+        task_id=str(row["task_id"]) if row["task_id"] else None,
+        summary=str(row["summary"]),
+        payload=_json_object(str(row["payload_json"])),
+        created_at=parse_iso_datetime(str(row["created_at"])),
+    )
 
 
 class RecoveryRepository:
@@ -1514,3 +2343,765 @@ def _redact_json(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_redact_json(item) for item in value]
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeDocumentRecord:
+    """One ingested document in the local knowledge base (Phase 8)."""
+
+    id: int
+    source_name: str
+    source_path: str | None
+    kind: str
+    sha256: str
+    title: str
+    characters: int
+    chunk_count: int
+    embedding_model: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeChunkRecord:
+    """One embedded text chunk; ``vector`` is packed float32 bytes."""
+
+    id: int
+    document_id: int
+    ordinal: int
+    text: str
+    vector: bytes
+    embedding_model: str
+    document_title: str = ""
+    source_name: str = ""
+
+
+class KnowledgeRepository:
+    """Document + chunk storage for the local knowledge base (Phase 8).
+
+    Vectors are stored as packed float32 BLOBs tagged with the exact
+    embedding model that produced them; search only ever compares
+    vectors from one model, so switching embedding models can never
+    silently mix incompatible spaces.
+    """
+
+    def __init__(self, Database: Database) -> None:
+        self._db = Database
+
+    def get_document_by_sha(self, sha256: str) -> KnowledgeDocumentRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM knowledge_documents WHERE sha256 = ?", (sha256,)
+            ).fetchone()
+        return self._document_from_row(row) if row is not None else None
+
+    def get_document(self, document_id: int) -> KnowledgeDocumentRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM knowledge_documents WHERE id = ?", (document_id,)
+            ).fetchone()
+        return self._document_from_row(row) if row is not None else None
+
+    def add_document(
+        self,
+        *,
+        source_name: str,
+        source_path: str | None,
+        kind: str,
+        sha256: str,
+        title: str,
+        characters: int,
+        chunk_count: int,
+        embedding_model: str,
+    ) -> KnowledgeDocumentRecord:
+        now = _format(utc_now())
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO knowledge_documents (source_name, source_path, kind,"
+                " sha256, title, characters, chunk_count, embedding_model, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    source_name,
+                    source_path,
+                    kind,
+                    sha256,
+                    title,
+                    characters,
+                    chunk_count,
+                    embedding_model,
+                    now,
+                ),
+            )
+            document_id = int(cursor.lastrowid)
+        record = self.get_document(document_id)
+        if record is None:  # pragma: no cover - row was just written
+            raise StorageError("Knowledge document could not be reloaded after saving.")
+        return record
+
+    def add_chunks(
+        self,
+        document_id: int,
+        chunks: list[tuple[int, str, bytes]],
+        *,
+        embedding_model: str,
+    ) -> None:
+        now = _format(utc_now())
+        with self._db.connect() as connection:
+            connection.executemany(
+                "INSERT INTO knowledge_chunks (document_id, ordinal, text, vector,"
+                " embedding_model, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (document_id, ordinal, text, vector, embedding_model, now)
+                    for ordinal, text, vector in chunks
+                ],
+            )
+
+    def list_documents(self, *, limit: int = 200) -> list[KnowledgeDocumentRecord]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM knowledge_documents ORDER BY created_at DESC, id DESC"
+                " LIMIT ?",
+                (max(1, min(limit, 1000)),),
+            ).fetchall()
+        return [self._document_from_row(row) for row in rows]
+
+    def delete_document(self, document_id: int) -> bool:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM knowledge_documents WHERE id = ?", (document_id,)
+            )
+            return cursor.rowcount > 0
+
+    def chunks_for_model(
+        self, embedding_model: str, *, limit: int = 20000
+    ) -> list[KnowledgeChunkRecord]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT c.*, d.title AS doc_title, d.source_name AS doc_source"
+                " FROM knowledge_chunks c"
+                " JOIN knowledge_documents d ON d.id = c.document_id"
+                " WHERE c.embedding_model = ? ORDER BY c.id LIMIT ?",
+                (embedding_model, max(1, min(limit, 100000))),
+            ).fetchall()
+        return [self._chunk_from_row(row) for row in rows]
+
+    def counts(self) -> dict[str, Any]:
+        with self._db.connect() as connection:
+            documents = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS n FROM knowledge_documents"
+                ).fetchone()["n"]
+            )
+            chunks = int(
+                connection.execute("SELECT COUNT(*) AS n FROM knowledge_chunks").fetchone()[
+                    "n"
+                ]
+            )
+            models = [
+                str(row["embedding_model"])
+                for row in connection.execute(
+                    "SELECT DISTINCT embedding_model FROM knowledge_chunks"
+                    " ORDER BY embedding_model"
+                ).fetchall()
+            ]
+        return {"documents": documents, "chunks": chunks, "embedding_models": models}
+
+    @staticmethod
+    def _document_from_row(row: sqlite3.Row) -> KnowledgeDocumentRecord:
+        return KnowledgeDocumentRecord(
+            id=int(row["id"]),
+            source_name=str(row["source_name"]),
+            source_path=str(row["source_path"]) if row["source_path"] else None,
+            kind=str(row["kind"]),
+            sha256=str(row["sha256"]),
+            title=str(row["title"]),
+            characters=int(row["characters"]),
+            chunk_count=int(row["chunk_count"]),
+            embedding_model=str(row["embedding_model"]),
+            created_at=parse_iso_datetime(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _chunk_from_row(row: sqlite3.Row) -> KnowledgeChunkRecord:
+        keys = row.keys()
+        return KnowledgeChunkRecord(
+            id=int(row["id"]),
+            document_id=int(row["document_id"]),
+            ordinal=int(row["ordinal"]),
+            text=str(row["text"]),
+            vector=bytes(row["vector"]),
+            embedding_model=str(row["embedding_model"]),
+            document_title=str(row["doc_title"]) if "doc_title" in keys else "",
+            source_name=str(row["doc_source"]) if "doc_source" in keys else "",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AgentDefinitionRecord:
+    id: int
+    name: str
+    role: str
+    description: str
+    system_prompt: str
+    allowed_tools: tuple[str, ...]
+    provider: str
+    max_steps: int
+    token_budget: int | None
+    builtin: bool
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRunRecord:
+    id: int
+    team_run_id: str
+    agent_name: str
+    task_id: str | None
+    instruction: str
+    status: str
+    summary: str
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class AgentRepository:
+    """Agent Studio definitions + run ledger (Transformation Phase 9)."""
+
+    _RUN_STATUSES = frozenset(
+        {"running", "succeeded", "failed", "blocked", "cancelled", "needs_input"}
+    )
+
+    def __init__(self, Database: Database) -> None:
+        self._db = Database
+
+    # -- definitions ---------------------------------------------------------
+    def upsert_definition(
+        self,
+        *,
+        name: str,
+        role: str,
+        description: str,
+        system_prompt: str,
+        allowed_tools: tuple[str, ...],
+        provider: str = "",
+        max_steps: int = 5,
+        token_budget: int | None = None,
+        builtin: bool = False,
+        enabled: bool = True,
+    ) -> AgentDefinitionRecord:
+        now = _format(utc_now())
+        with self._db.connect() as connection:
+            connection.execute(
+                "INSERT INTO agent_definitions (name, role, description,"
+                " system_prompt, allowed_tools, provider, max_steps,"
+                " token_budget, builtin, enabled, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(name) DO UPDATE SET role = excluded.role,"
+                " description = excluded.description,"
+                " system_prompt = excluded.system_prompt,"
+                " allowed_tools = excluded.allowed_tools,"
+                " provider = excluded.provider,"
+                " max_steps = excluded.max_steps,"
+                " token_budget = excluded.token_budget,"
+                " enabled = excluded.enabled,"
+                " updated_at = excluded.updated_at",
+                (
+                    name,
+                    role,
+                    description,
+                    system_prompt,
+                    _json(list(allowed_tools)),
+                    provider,
+                    max_steps,
+                    token_budget,
+                    1 if builtin else 0,
+                    1 if enabled else 0,
+                    now,
+                    now,
+                ),
+            )
+        record = self.get_definition(name)
+        if record is None:  # pragma: no cover - row was just written
+            raise StorageError("Agent definition could not be reloaded after saving.")
+        return record
+
+    def get_definition(self, name: str) -> AgentDefinitionRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_definitions WHERE name = ?", (name,)
+            ).fetchone()
+        return self._definition_from_row(row) if row is not None else None
+
+    def list_definitions(
+        self, *, enabled_only: bool = False, limit: int = 200
+    ) -> list[AgentDefinitionRecord]:
+        query = "SELECT * FROM agent_definitions"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY builtin DESC, name ASC LIMIT ?"
+        with self._db.connect() as connection:
+            rows = connection.execute(query, (max(1, min(limit, 1000)),)).fetchall()
+        return [self._definition_from_row(row) for row in rows]
+
+    def delete_definition(self, name: str) -> bool:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM agent_definitions WHERE name = ?", (name,)
+            )
+            return cursor.rowcount > 0
+
+    def set_enabled(self, name: str, enabled: bool) -> bool:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE agent_definitions SET enabled = ?, updated_at = ?"
+                " WHERE name = ?",
+                (1 if enabled else 0, _format(utc_now()), name),
+            )
+            return cursor.rowcount > 0
+
+    def counts(self) -> dict[str, int]:
+        with self._db.connect() as connection:
+            definitions = connection.execute(
+                "SELECT COUNT(*) AS n, COALESCE(SUM(enabled), 0) AS enabled"
+                " FROM agent_definitions"
+            ).fetchone()
+            runs = connection.execute(
+                "SELECT COUNT(*) AS n FROM agent_runs"
+            ).fetchone()
+        return {
+            "agents": int(definitions["n"]),
+            "agents_enabled": int(definitions["enabled"]),
+            "agent_runs": int(runs["n"]),
+        }
+
+    # -- run ledger ----------------------------------------------------------
+    def start_run(
+        self, *, agent_name: str, instruction: str, team_run_id: str = ""
+    ) -> AgentRunRecord:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO agent_runs (team_run_id, agent_name, task_id,"
+                " instruction, status, summary, created_at, completed_at)"
+                " VALUES (?, ?, NULL, ?, 'running', '', ?, NULL)",
+                (team_run_id, agent_name, instruction, _format(utc_now())),
+            )
+            run_id = int(cursor.lastrowid)
+        record = self._get_run(run_id)
+        if record is None:  # pragma: no cover - row was just written
+            raise StorageError("Agent run could not be reloaded after saving.")
+        return record
+
+    def finish_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        task_id: str | None = None,
+        summary: str = "",
+    ) -> AgentRunRecord:
+        if status not in self._RUN_STATUSES or status == "running":
+            raise StorageError(f"Invalid agent run status: {status}")
+        with self._db.connect() as connection:
+            connection.execute(
+                "UPDATE agent_runs SET status = ?,"
+                " task_id = COALESCE(?, task_id), summary = ?,"
+                " completed_at = ? WHERE id = ?",
+                (status, task_id, summary[:500], _format(utc_now()), run_id),
+            )
+        record = self._get_run(run_id)
+        if record is None:
+            raise StorageError(f"Agent run not found: {run_id}")
+        return record
+
+    def list_runs(
+        self,
+        *,
+        agent_name: str | None = None,
+        team_run_id: str | None = None,
+        limit: int = 50,
+    ) -> list[AgentRunRecord]:
+        query = "SELECT * FROM agent_runs"
+        conditions: list[str] = []
+        params: list[object] = []
+        if agent_name is not None:
+            conditions.append("agent_name = ?")
+            params.append(agent_name)
+        if team_run_id is not None:
+            conditions.append("team_run_id = ?")
+            params.append(team_run_id)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(limit, 500)))
+        with self._db.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._run_from_row(row) for row in rows]
+
+    def _get_run(self, run_id: int) -> AgentRunRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agent_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return self._run_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _definition_from_row(row: sqlite3.Row) -> AgentDefinitionRecord:
+        tools = _parsed_json(row["allowed_tools"], [])
+        return AgentDefinitionRecord(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            role=str(row["role"]),
+            description=str(row["description"]),
+            system_prompt=str(row["system_prompt"]),
+            allowed_tools=tuple(str(item) for item in tools if isinstance(item, str)),
+            provider=str(row["provider"]),
+            max_steps=int(row["max_steps"]),
+            token_budget=(int(row["token_budget"]) if row["token_budget"] is not None else None),
+            builtin=bool(row["builtin"]),
+            enabled=bool(row["enabled"]),
+            created_at=parse_iso_datetime(str(row["created_at"])),
+            updated_at=parse_iso_datetime(str(row["updated_at"])),
+        )
+
+    @staticmethod
+    def _run_from_row(row: sqlite3.Row) -> AgentRunRecord:
+        return AgentRunRecord(
+            id=int(row["id"]),
+            team_run_id=str(row["team_run_id"]),
+            agent_name=str(row["agent_name"]),
+            task_id=(str(row["task_id"]) if row["task_id"] is not None else None),
+            instruction=str(row["instruction"]),
+            status=str(row["status"]),
+            summary=str(row["summary"]),
+            created_at=parse_iso_datetime(str(row["created_at"])),
+            completed_at=(
+                parse_iso_datetime(str(row["completed_at"]))
+                if row["completed_at"] is not None
+                else None
+            ),
+        )
+
+@dataclass(frozen=True, slots=True)
+class VoiceSessionRecord:
+    id: int
+    mode: str
+    state: str
+    engine_stt: str
+    engine_tts: str
+    started_at: datetime
+    ended_at: datetime | None
+    duration_ms: int
+    audio_seconds: float
+    audio_retained: bool
+    audio_path: str | None
+    transcript: str | None
+    transcript_chars: int
+    task_id: str | None
+    status: str
+    error: str
+    created_at: datetime
+
+
+class VoiceRepository:
+    """Voice session ledger (Transformation Phase 10).
+
+    Rows record *that* a capture happened and how long it lasted. Audio
+    bytes are only referenced when the user explicitly opted into
+    retention, and transcripts are only stored when transcript storage
+    is enabled - the default row proves a session happened without
+    keeping either.
+    """
+
+    MAX_SESSIONS = 2_000
+
+    def __init__(self, Database: Database) -> None:
+        self._db = Database
+
+    def add_session(
+        self,
+        *,
+        mode: str,
+        engine_stt: str = "",
+        engine_tts: str = "",
+        duration_ms: int = 0,
+        audio_seconds: float = 0.0,
+        audio_retained: bool = False,
+        audio_path: str | None = None,
+        transcript: str | None = None,
+        transcript_chars: int = 0,
+        task_id: str | None = None,
+        state: str = "completed",
+        status: str = "ok",
+        error: str = "",
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+    ) -> VoiceSessionRecord:
+        start = started_at or utc_now()
+        end = ended_at or utc_now()
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO voice_sessions (mode, state, engine_stt, engine_tts,"
+                " started_at, ended_at, duration_ms, audio_seconds, audio_retained,"
+                " audio_path, transcript, transcript_chars, task_id, status, error,"
+                " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mode,
+                    state,
+                    engine_stt,
+                    engine_tts,
+                    _format(start),
+                    _format(end),
+                    int(duration_ms),
+                    float(audio_seconds),
+                    1 if audio_retained else 0,
+                    audio_path,
+                    transcript,
+                    int(transcript_chars),
+                    task_id,
+                    status,
+                    error[:500],
+                    _format(utc_now()),
+                ),
+            )
+            session_id = int(cursor.lastrowid)
+            connection.execute(
+                "DELETE FROM voice_sessions WHERE id NOT IN"
+                " (SELECT id FROM voice_sessions ORDER BY id DESC LIMIT ?)",
+                (self.MAX_SESSIONS,),
+            )
+        record = self.get_session(session_id)
+        if record is None:  # pragma: no cover - row was just written
+            raise StorageError("Voice session could not be reloaded after saving.")
+        return record
+
+    def get_session(self, session_id: int) -> VoiceSessionRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM voice_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+        return self._session_from_row(row) if row is not None else None
+
+    def list_sessions(self, limit: int = 20) -> list[VoiceSessionRecord]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM voice_sessions ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        return [self._session_from_row(row) for row in rows]
+
+    def sessions_with_retained_audio(self) -> list[VoiceSessionRecord]:
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM voice_sessions WHERE audio_path IS NOT NULL"
+                " ORDER BY id DESC"
+            ).fetchall()
+        return [self._session_from_row(row) for row in rows]
+
+    def clear_audio_reference(self, session_id: int) -> None:
+        with self._db.connect() as connection:
+            connection.execute(
+                "UPDATE voice_sessions SET audio_retained = 0, audio_path = NULL"
+                " WHERE id = ?",
+                (session_id,),
+            )
+
+    def delete_session(self, session_id: int) -> bool:
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM voice_sessions WHERE id = ?", (session_id,)
+            )
+            return cursor.rowcount > 0
+
+    def count_sessions(self) -> int:
+        with self._db.connect() as connection:
+            row = connection.execute("SELECT COUNT(*) AS total FROM voice_sessions").fetchone()
+        return int(row["total"]) if row is not None else 0
+
+    def summary(self) -> dict[str, Any]:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS total,"
+                " COALESCE(SUM(audio_seconds), 0) AS audio,"
+                " COALESCE(SUM(transcript_chars), 0) AS chars,"
+                " COALESCE(SUM(audio_retained), 0) AS retained,"
+                " MAX(created_at) AS last_at"
+                " FROM voice_sessions"
+            ).fetchone()
+        if row is None:  # pragma: no cover - aggregate always returns a row
+            return {"total": 0, "audio_seconds": 0.0, "transcript_chars": 0, "retained": 0, "last_at": None}
+        return {
+            "total": int(row["total"]),
+            "audio_seconds": round(float(row["audio"]), 3),
+            "transcript_chars": int(row["chars"]),
+            "retained": int(row["retained"]),
+            "last_at": str(row["last_at"]) if row["last_at"] is not None else None,
+        }
+
+    @staticmethod
+    def _session_from_row(row: sqlite3.Row) -> VoiceSessionRecord:
+        return VoiceSessionRecord(
+            id=int(row["id"]),
+            mode=str(row["mode"]),
+            state=str(row["state"]),
+            engine_stt=str(row["engine_stt"]),
+            engine_tts=str(row["engine_tts"]),
+            started_at=parse_iso_datetime(str(row["started_at"])),
+            ended_at=(
+                parse_iso_datetime(str(row["ended_at"]))
+                if row["ended_at"] is not None
+                else None
+            ),
+            duration_ms=int(row["duration_ms"]),
+            audio_seconds=float(row["audio_seconds"]),
+            audio_retained=bool(row["audio_retained"]),
+            audio_path=(str(row["audio_path"]) if row["audio_path"] is not None else None),
+            transcript=(str(row["transcript"]) if row["transcript"] is not None else None),
+            transcript_chars=int(row["transcript_chars"]),
+            task_id=(str(row["task_id"]) if row["task_id"] is not None else None),
+            status=str(row["status"]),
+            error=str(row["error"]),
+            created_at=parse_iso_datetime(str(row["created_at"])),
+        )
+
+@dataclass(frozen=True, slots=True)
+class AutomationRunRecord:
+    id: int
+    kind: str
+    tool_id: str
+    action: str
+    target: str
+    status: str
+    detail: str
+    artifact_path: str | None
+    duration_ms: int
+    allowed: bool
+    created_at: datetime
+
+
+class AutomationRepository:
+    """Audit ledger for gated browser/desktop/vision actions (Phase 11).
+
+    One row per attempted automation action - including refusals, which are
+    the interesting ones for a security review. Rows hold identifiers and
+    counts, never content: no page text, no keystrokes, no pixels.
+    """
+
+    MAX_RUNS = 5_000
+    _KINDS = frozenset({"browser", "desktop", "vision"})
+    _STATUSES = frozenset({"ok", "refused", "failed", "partial"})
+
+    def __init__(self, Database: Database) -> None:
+        self._db = Database
+
+    def record(
+        self,
+        *,
+        kind: str,
+        tool_id: str,
+        action: str = "",
+        target: str = "",
+        status: str = "ok",
+        detail: str = "",
+        artifact_path: str | None = None,
+        duration_ms: int = 0,
+        allowed: bool = True,
+    ) -> AutomationRunRecord:
+        clean_kind = kind.strip().lower()
+        if clean_kind not in self._KINDS:
+            raise StorageError(f"Automation kind must be one of: {', '.join(sorted(self._KINDS))}.")
+        clean_status = status.strip().lower() or "ok"
+        if clean_status not in self._STATUSES:
+            raise StorageError(
+                f"Automation status must be one of: {', '.join(sorted(self._STATUSES))}."
+            )
+        with self._db.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO automation_runs (kind, tool_id, action, target, status,"
+                " detail, artifact_path, duration_ms, allowed, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    clean_kind,
+                    tool_id.strip()[:120],
+                    action.strip()[:120],
+                    target.strip()[:400],
+                    clean_status,
+                    detail.strip()[:500],
+                    artifact_path,
+                    max(0, int(duration_ms)),
+                    1 if allowed else 0,
+                    _format(utc_now()),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+            connection.execute(
+                "DELETE FROM automation_runs WHERE id NOT IN"
+                " (SELECT id FROM automation_runs ORDER BY id DESC LIMIT ?)",
+                (self.MAX_RUNS,),
+            )
+        record = self.get(run_id)
+        if record is None:  # pragma: no cover - row was just written
+            raise StorageError("Automation run could not be reloaded after saving.")
+        return record
+
+    def get(self, run_id: int) -> AutomationRunRecord | None:
+        with self._db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM automation_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def list_runs(
+        self, *, kind: str = "", limit: int = 50, status: str = ""
+    ) -> list[AutomationRunRecord]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if kind.strip():
+            clauses.append("kind = ?")
+            parameters.append(kind.strip().lower())
+        if status.strip():
+            clauses.append("status = ?")
+            parameters.append(status.strip().lower())
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        parameters.append(max(1, min(int(limit), 500)))
+        with self._db.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM automation_runs{where} ORDER BY id DESC LIMIT ?",
+                tuple(parameters),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
+    def summary(self) -> dict[str, Any]:
+        with self._db.connect() as connection:
+            totals = connection.execute(
+                "SELECT kind, COUNT(*) AS total FROM automation_runs GROUP BY kind"
+            ).fetchall()
+            refused = connection.execute(
+                "SELECT COUNT(*) AS total FROM automation_runs WHERE allowed = 0"
+            ).fetchone()
+            last = connection.execute(
+                "SELECT created_at FROM automation_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        by_kind = {str(row["kind"]): int(row["total"]) for row in totals}
+        return {
+            "total": sum(by_kind.values()),
+            "by_kind": by_kind,
+            "refused": int(refused["total"]) if refused is not None else 0,
+            "last_at": str(last["created_at"]) if last is not None else None,
+        }
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> AutomationRunRecord:
+        return AutomationRunRecord(
+            id=int(row["id"]),
+            kind=str(row["kind"]),
+            tool_id=str(row["tool_id"]),
+            action=str(row["action"]),
+            target=str(row["target"]),
+            status=str(row["status"]),
+            detail=str(row["detail"]),
+            artifact_path=(str(row["artifact_path"]) if row["artifact_path"] is not None else None),
+            duration_ms=int(row["duration_ms"]),
+            allowed=bool(row["allowed"]),
+            created_at=parse_iso_datetime(str(row["created_at"])),
+        )

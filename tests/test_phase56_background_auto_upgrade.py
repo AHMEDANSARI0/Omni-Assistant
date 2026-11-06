@@ -274,7 +274,7 @@ def test_phase56_configuration_defaults_validation_and_disabled_run(
         with pytest.raises(ConfigError, match=needle):
             _settings(root, **override)
 
-    status = get_auto_upgrade_status(default)
+    status = get_auto_upgrade_status(default, platform_name="win32")
     assert status.enabled is False
     assert status.ready is False
     assert status.scheduler_profile == "windows-scheduled-task"
@@ -498,7 +498,7 @@ def test_phase56_windows_scheduler_and_reserved_platform_profiles(
     }
     assert profiles == {
         "windows-scheduled-task": "implemented",
-        "linux-systemd-user": "planned",
+        "linux-systemd-user": "implemented",
         "macos-launchd": "planned",
     }
 
@@ -509,7 +509,7 @@ def test_phase56_windows_scheduler_and_reserved_platform_profiles(
     executable.write_bytes(b"fake")
     settings = _settings(root)
 
-    with pytest.raises(PcAgentError, match="not implemented"):
+    with pytest.raises(PcAgentError, match="only on Windows"):
         install_windows_auto_upgrade_schedule(
             settings,
             executable=executable,
@@ -641,9 +641,9 @@ def test_phase56_cli_gui_report_verification_and_scope(
     assert run.status == "disabled"
     assert "Background auto-upgrade:" in format_auto_upgrade_run(run)
 
-    assert __version__ == "0.60.0"
-    assert len(build_default_registry().list_tools()) == 62
-    assert database.schema_version() == 6
+    assert __version__ == "0.81.2"
+    assert len(build_default_registry().list_tools()) == 69
+    assert database.schema_version() == 18
 
     project_root = Path(__file__).resolve().parents[1]
     phase_doc = (project_root / "docs" / "phase56.md").read_text(

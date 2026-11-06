@@ -1,5 +1,1128 @@
 # Changelog
 
+## 0.81.2 - console-script bootstrap (broken-environment UX)
+
+The Windows machine ran `pc-agent gui` and got a bare
+`ModuleNotFoundError: No module named 'cryptography'` from the depth of the
+import chain. The command was the **global** shim
+(`C:\Users\UT\AppData\Local\Programs\Python\Python311\Scripts\pc-agent.exe`),
+not `D:\omni-assistant\.venv`, so the project's declared dependencies were not
+installed in the interpreter that was running. The product cannot fix a user's
+PATH, but it can refuse to be unhelpful about it.
+
+- **`src/pc_agent/entry.py`** is now the `pc-agent` console-script entry point. If
+  the CLI cannot import, it prints the missing package, the **interpreter actually
+  running**, whether that interpreter is inside a virtual environment, the path to
+  the project's own interpreter when one exists, and the two commands that fix it -
+  then exits **2** instead of dumping a traceback. It imports nothing heavy at
+  module import time, so it works inside exactly the broken environment it
+  describes.
+- `pyproject.toml`: `pc-agent = "pc_agent.entry:main"` (the repair bootstrap
+  `pc-agent-self-repair = "pc_agent.self_repair_cli:main"` is unchanged).
+- **7 tests** in `tests/test_cli_bootstrap.py`: delegation to the CLI, the message
+  names the package / interpreter / pip command, venv discovery on Windows and
+  POSIX layouts, an ImportError without a `name`, an unrecognised failure, the
+  console-script wiring, and a guard that the bootstrap stays import-safe.
+
+Suite: **1130 passed, 1 skipped**; Ruff clean; `release audit` READY (33 checks).
+
+## 0.81.1 - Windows acceptance hotfix for 0.81.0
+
+The 0.81.0 Windows run finished at **1064 passed / 4 failed / 9 skipped**. All four
+failures were in the tests added by 0.81.0, and two of them exposed a real output
+bug.
+
+### Product fixes
+
+- **`--json` printed two documents.** `pc-agent release evidence` wrote the gate
+  report as JSON and then appended a `Recorded evidence:` line, so the output
+  could not be parsed. Every path now emits **exactly one** JSON document; when the
+  command both runs the gates and knows the recorded state, the object is
+  `{"report": ..., "recorded": ...}`.
+- **`status` ran the gates.** On Windows, `release evidence` (no verb) runs the
+  gates by design, but `release evidence status` is now an explicit verb that
+  reports the recorded state and runs nothing - a status command that silently
+  launches a 20-minute suite was a design mistake.
+- **The exit status now matches the report**, in every branch: a run that records
+  `failed` exits non-zero instead of printing the failures and returning success.
+
+### Test fixes (no weakened intent)
+
+- `test_probe_cache_is_keyed_by_the_process_limit` and
+  `test_the_probe_survives_a_stale_working_directory` asserted that
+  `sys.executable` can start **under the strict one-process limit**. On a host
+  whose `python.exe` is a launcher shim that is exactly the thing that must fail -
+  the test encoded the bug. They now assert the real property: the *relaxed* probe
+  succeeds, the strict probe either succeeds or explains itself, and both answers
+  are cached under different keys.
+- A new test pins the property the Windows acceptance actually needs: at least one
+  interpreter candidate must start **inside** the strict limit, so the sandbox does
+  not depend on the last-resort launcher slot.
+- `test_cli_status_reports_pending_evidence` and
+  `test_cli_self_test_run_and_verify_and_record` now use the `status` verb, assert
+  that the exit code agrees with the report that was just written, and assert that
+  `--json` yields a single parseable document (the bug above, pinned as a test).
+
+Suite: **1123 passed, 1 skipped** under `TZ=UTC`, `TZ=Asia/Karachi` and
+`TZ=America/New_York`; Ruff clean; `release audit` READY with 33 checks.
+
+## 0.80.1 - Final production hardening (Transformation Phase 18)
+
+The eighteenth and last phase. It adds no new end-user capability: it makes the
+previous seventeen provable.
+
+### What is new
+- **`src/pc_agent/production_check.py`** - the real release chain, executed end to
+  end against a throw-away copy: allow-list scan, bundle build, verification
+  without extraction, **tamper detection**, signing with an **ephemeral** Ed25519
+  key, **unsigned-refusal** while signing is required, stage, apply (tree hash
+  compared), rollback (pre-apply tree hash compared) and cleanup. Ten steps,
+  ~1.7 s, `READY` on the verification host. The running install is never touched;
+  no production key is used and the report says so.
+- **`pc-agent release production-check [--out PATH] [--keep] [--json]`** plus
+  release check **32** `production_hardening`, a `Hardening:` doctor line,
+  `diagnostics.production_summary_line()` and a 20th dashboard tab
+  **Production** whose button runs the real check and renders the stored report.
+- **`.github/workflows/ci.yml`** - CI on `ubuntu-latest` + `windows-latest` ×
+  Python `3.11` + `3.13` running `ruff`, the suite, `release audit` and
+  `release production-check`; an accessibility/i18n/perf job; a tag-only
+  packaging job. `permissions: contents: read`, no secrets, `fail-fast: false`.
+- **`tests/test_security_suite.py`** (19 tests): SSRF including DNS rebinding,
+  non-web schemes, credential URLs, shell metacharacters, non-allow-listed and
+  path-traversal executables, archive traversal, secret leakage into
+  diagnostics/audit/reports, emergency stop, tool-schema pollution.
+- **`tests/test_performance_suite.py`** (9 tests): measured ceilings for settings
+  load, CLI import, `health()`, `system_status()`, event listing, `a11y_status()`,
+  heap growth over 200 status calls, database init and the release scan.
+- **`tests/test_transformation_phase18_hardening.py`** (24 tests): the chain's ten
+  steps, its honesty rules (no production key, nothing left behind, tree hashes),
+  the stored-report states (missing / passed / failed / unreadable), the CI
+  workflow's structure and gates, and the product wiring.
+- **Four documents the programme still owed**: `AUDIT_REPORT.md`,
+  `DEVELOPER_GUIDE.md`, `INSTALLATION_GUIDE.md`, `PLUGIN_DEVELOPMENT_GUIDE.md`.
+- **Windows acceptance evidence gate (closes the last open item).**
+  `src/pc_agent/windows_acceptance.py` plus `pc-agent release evidence
+  [status|verify|record]`: the harness runs the real gates on the user's machine
+  (platform, full suite, release audit, end-to-end release chain, a real
+  `-I -B` plugin worker, owner-only file hardening, the measured accessibility
+  report), writes `workspace/windows-acceptance.json` with a SHA-256 seal over the
+  report body, and refuses to run - or to claim anything - anywhere but Windows.
+  `pc-agent release evidence record` copies a **hash-verified, passed Windows**
+  report to `data/windows-acceptance.json`; only then does
+  `baseline.windows_acceptance_evidence()` return `verified:<date>` instead of
+  `pending_user_windows_evidence`, and the `Hardening:` doctor line reports it.
+  `--self-test` exercises the harness on any host and its report is marked
+  `self-test`, which can never be recorded as Windows evidence.
+- **19 tests** in `tests/test_windows_acceptance_evidence.py`: pending default,
+  a verified report flips the baseline, an edited body is refused, non-Windows and
+  non-passed reports are refused, six parametrised rejection cases (unknown
+  status, wrong platform, missing gate, failing gate, wrong version, key material),
+  the non-Windows refusal, the self-test, the record path, no secrets in the file,
+  and the CLI status/self-test/verify/record flows.
+
+### Full voice assistant: intent routing, hands-free loop, sealed acceptance
+
+The Phase 10 voice pipeline could capture, transcribe and speak, but nothing in
+the product turned a *transcript into an action*, and "full voice assistant" was
+a claim with no acceptance artefact.
+
+- **`src/pc_agent/voice/intents.py`** - a **deterministic** router: one utterance
+  becomes exactly one of `stop`, `help`, `status`, `time`, `note`, `reminder`,
+  `speak`, `task` or `empty`, with no model call and no guessing, so a spoken
+  command is testable and auditable. The wake phrase is stripped and reported
+  separately (`addressed`), and only at the **start** of an utterance, so
+  "I told Jarvis yesterday" is not an address. `help` is generated from the same
+  list the router implements, so the two cannot drift.
+- **`VoiceIntentExecutor`** - performs an intent against the real services:
+  notes go to the memory repository, reminders to the proactive engine, free text
+  to `LocalService.create_task(..., source="voice")`. Voice therefore gains **no
+  privilege**: a task that needs approval still stops at the approval centre, and
+  the reply says "that needs your approval before it runs".
+- **`src/pc_agent/voice/listener.py`** - the hands-free session loop: bounded
+  `listen -> transcribe -> act -> speak` cycles with `max_cycles`, `max_seconds`
+  and per-cycle `voice_max_seconds` caps, a **visible state**
+  (`idle/listening/capturing/thinking/speaking/stopped/blocked`), an immediate
+  `stop()` that aborts between phases, and a per-cycle record of what was heard,
+  which intent ran and what was said back. It refuses to start when the
+  persisted microphone gate is off, when wake-word mode has no second opt-in,
+  when the emergency stop is engaged, or when no capture backend exists - each
+  with its own reason. Wake-phrase matching is **transcript-based** and that
+  limitation is written down rather than hidden.
+- **`src/pc_agent/voice/acceptance.py`** - `pc-agent voice acceptance`: seven
+  real gates (privacy gate enable/disable round trip with the user's setting
+  restored, capture backend, wake-phrase parsing, intent routing over 8
+  utterances, the STT engine in use, a **real synthesis** to a temporary file,
+  retention policy), sealed with the same `acceptance_body_sha256` seal the
+  Windows acceptance harness uses, and verified offline by
+  `pc-agent voice acceptance-verify`.
+- CLI: `pc-agent voice intent "<sentence>" [--execute]`, `pc-agent voice loop
+  [--max-cycles N] [--cycle-seconds S] [--no-wake-word] [--no-speak]`,
+  `pc-agent voice acceptance [--out PATH]`, `pc-agent voice acceptance-verify`.
+- The report has three outcomes, not two: `passed` (every gate ran and passed),
+  `incomplete` (none failed, at least one could not run - what a headless build
+  machine sees) and `failed`. A missing microphone or speech engine never turns
+  into a green tick.
+
+### Signed installation tooling: Authenticode
+
+The update bundle has been Ed25519-signed and enforced since Phase 21. The other
+half - the Authenticode signature on the installer EXE, which Windows and
+SmartScreen evaluate - is now shipped:
+
+- **`src/pc_agent/windows_signing.py`**: `signtool` discovery (PATH, then the
+  newest Windows SDK), command construction that **never puts a password on a
+  command line** in the recommended thumbprint mode, a timestamp by default, and
+  verification through the operating system's own `WinVerifyTrust` API (called
+  through `ctypes`) instead of parsing a log line. On a non-Windows host the
+  answer is `unverifiable`, never a guess.
+- PFX files are supported as a fallback, but the password must come from the
+  environment and the caller must pass `--allow-argv-password`, because
+  `signtool` requires `/p <password>` in `argv` and `argv` is world-readable on
+  the machine. The refusal message says exactly that. Passwords are scrubbed from
+  captured output and never stored in the report.
+- CLI: `pc-agent release signing`, `pc-agent release sign FILE
+  [--thumbprint T | --pfx FILE --allow-argv-password] [--timestamp-url URL]`,
+  `pc-agent release signature FILE`.
+- Release audit check **33** `windows_authenticode` (audit now runs **33**
+  checks): `PASS` when the installer is honestly unsigned, `PASS` with the
+  verification text when it is signed and verified, `WARN` when a recorded
+  attempt did not verify. The `Hardening:` doctor line gains
+  `authenticode=<status>`.
+
+### Version
+
+0.80.1 → **0.81.0**; `baseline.PREVIOUS_TRANSFORMATION_VERSION` moves to `0.80.1`
+and the future-version pins in the update tests move to `0.82.0`.
+
+### Windows sandbox fix (found by the 0.80.1 acceptance run, fixed here)
+
+The 0.80.0 tree finished the user's Windows run at **1027 passed / 10 failed / 8
+skipped**. Nine failures had one cause: every plugin tool call died with
+
+```
+Unable to create process using '"C:\Users\UT\AppData\Local\Programs\Python\Python311\python.exe" -I -B D:\omni-assistant\src\pc_agent\plugins\worker.py'
+```
+
+Root cause: that install's `D:\omni-assistant\.venv\Scripts\python.exe` is a
+**launcher shim** (a virtualenv-style redirector), so starting it is *two*
+processes - the shim, then the real interpreter it creates. The sandbox put the
+worker in a Windows Job Object with `ACTIVE_PROCESS` capped at 1, which forbids
+exactly that second process; the shim then reported the refusal as its own error
+and exited 101. Two defects made this invisible:
+
+1. the job limits were set **after** the process joined the job, so the window in
+   which a shim could start its child was a race the parent usually lost, and
+2. the interpreter probe ran **outside** the sandbox (`subprocess.run` with no job
+   object), so a shim probed green and failed every real call.
+
+Fixed in `src/pc_agent/plugins/sandbox.py`:
+- job limits (`KILL_ON_JOB_CLOSE`, `PROCESS_MEMORY`, `ACTIVE_PROCESS`) are set
+  **before** `AssignProcessToJobObject`, so the policy is in force for the entire
+  life of the child and the failure is deterministic instead of flaky;
+- the probe runs **inside the same limits** as the real spawn, and its cache is
+  keyed by `(interpreter, active-process-limit)` - a green probe at one limit can
+  no longer vouch for another;
+- interpreters are resolved better: `sys.executable`, `sys._base_executable`, the
+  base prefix (`python.exe` / `bin/python3`) and `pyvenv.cfg`'s `home` are tried
+  in order, so a shim environment reaches the *real* interpreter and runs the
+  worker as a single process with the strict limit;
+- if - and only if - no candidate can run under the strict limit, one extra slot
+  is granted for the launcher chain (`passes = (0, 1)`), and the result says so:
+  `mechanism` becomes `job-object + isolated-interpreter + audit-hook
+  +launcher-slot(active-process-limit=2)`. Two processes is the total: the shim
+  and the worker, with no room for a third, and the worker's audit hook still
+  refuses subprocess creation from plugin code. Securing this did not weaken any
+  limit - it removed a limit that was misapplied.
+
+The tenth failure was a test defect: `test_commands_never_go_through_a_shell`
+used `echo`, which is a `cmd` **builtin** on Windows and therefore cannot be
+launched at all. It now uses the running interpreter and asserts the same
+property (metacharacters arrive as `argv` items, the marker file is never
+created).
+
+**13 new tests** in `tests/test_windows_launcher_sandbox.py`: effective-limit
+arithmetic, the "no slack means the same object" case, job-limits-before-assign
+ordering, probe caching per limit, probe failure reasons, the strict-then-slack
+ladder, the reported launcher slot, end-to-end worker execution through the
+chosen interpreter, base-interpreter derivation from `base_prefix`/`pyvenv.cfg`,
+and survival of a stale working directory.
+
+### Changed
+- `release audit` now runs **32** checks (was 31) and distinguishes "never ran the
+  chain check" from "the chain check passed".
+- Dashboard tab count **19 → 20**; tests, docs and the patcher updated together.
+- `baseline.py`: phase **18**, label `TRANSFORMATION PHASE 18 Production Hardening`.
+- No schema change: still **v18**, no migration.
+
+## 0.79.1 - Windows acceptance hotfix (Phase 17.1)
+
+The 0.79.0 Windows acceptance run finished at **919 passed / 12 failed / 8 skipped**.
+Every one of those twelve failures is fixed here, and each fix is either a real
+product defect or a test that encoded a POSIX/UTC-only assumption.
+
+### Product fixes
+- **Proactive hourly cap (real defect, Phase 14).** `count_notifications_since()`
+  counted every notification row, including the `deferred` rows the cap itself
+  writes. Each suppressed tick therefore refilled its own budget: the cap fired
+  at `(3/3)`, then `(4/3)`, and reminders that should have been released an hour
+  later were starved forever. The budget now counts `status = 'delivered'` rows
+  only - suppression is a ledger fact, not a notification the user saw.
+- **Suppressed rows were stamped with the wall clock (real defect, Phase 14).**
+  The quiet-hours row already used the engine clock, but the cap and cooldown rows
+  used `datetime.now()`, so the ledger mixed two timelines whenever a tick ran
+  with an injected clock. All suppression rows now carry the tick instant.
+- **Plugin sandbox could not start a worker on Windows (Phase 15).** The scrubbed
+  child environment kept only `SYSTEMROOT`/`SYSTEMDRIVE`/`WINDIR`/`TEMP`/`TMP`/`PATH`
+  when they happened to be set, and the spawn path had no fallback: a host that
+  could not create the process reported
+  `Unable to create process using '"…python.exe" -I -B …worker.py'` as a *plugin*
+  failure. Now: a fixed non-secret allow-list of Windows essentials is always
+  present (with `GetWindowsDirectoryW`/`tempfile` fallbacks), every interpreter
+  candidate (`sys.executable`, `sys._base_executable`, `python3`, `python`) is
+  probed once and cached, the first one that actually starts is used, the
+  interpreter that ran is reported in the result, and a host that cannot start
+  any of them produces `spawn_error` instead of an exception or a misleading
+  plugin error. Isolation is unchanged: same scrubbed env, same job object, same
+  `-I -B` isolated interpreter, same audit hook on every attempt.
+- **Owner-only files on Windows (real gap, Phase 16).** `os.chmod(path, 0o600)` is
+  a no-op on NTFS (the mode always reads `0o666`), so sync identity keys and
+  bundles were only as private as the profile ACL. New `pc_agent.sync.perms`
+  applies a real owner-only ACL on Windows (`icacls /inheritance:r /grant:r
+  <user>:(F)`), reads the ACL back to verify no inherited ACE remains, and returns
+  a report (`mechanism`, `applied`, `owner_only`, `detail`) that is stored with
+  the artefact, returned in the export payload and asserted on. On a volume
+  without ACL support the report says `applied: False` instead of pretending.
+
+### Test fixes (no weakened intent)
+- Phase 14: a naive ISO due time is *local* wall clock, so the assertion now
+  compares instants (`== datetime(...,).astimezone(UTC)`) instead of a UTC
+  string prefix; the reschedule assertion compares `datetime` instants instead of
+  two ISO strings that carried different offsets.
+- Phase 15: the "write outside the capability roots" plugin targeted `/tmp`,
+  which does not exist on Windows. It now uses `tempfile.gettempdir()` - the
+  property under test (a path outside the declared roots) is unchanged.
+- Phase 16: the mode assertion became `_assert_owner_only()`, which checks the
+  POSIX mode on POSIX and the verified ACL on Windows. No skip, no `chmod` lie.
+
+### New regression tests
+- 10 tests in `tests/test_transformation_phase17_1_hotfix.py`: cap counts only
+  delivered rows, the cap still bites inside the same hour, suppression rows carry
+  the ledger instant, naive-ISO/offset parsing is host-timezone independent,
+  host spawn failures are structured (`spawn_error`), interpreter substitution is
+  reported and not silent, a real `-I -B` worker runs end to end, the child
+  environment keeps the essentials and leaks no `*_API_KEY`, and the permission
+  report matches the mechanism the host actually has.
+- Full suite verified three times under different host timezones
+  (`TZ=UTC`, `TZ=Asia/Karachi`, `TZ=America/New_York`): **993 passed, 1 skipped**
+  each time (the skip is the Tk window test on a headless host).
+
+## 0.79.0 - Accessibility, multilingual UI, RTL and polish
+
+### What is new
+- **`src/pc_agent/i18n/`**: 61 interface keys in **four real locales** - English
+  (source of truth), Spanish, Urdu and Arabic - with an explicit statement that
+  user content is never machine-translated. `{placeholder}` substitution is done
+  from a mapping (never `str.format` on caller text), a missing key falls back to
+  English and is **counted**, an unknown key echoes itself, and `en-US`/`UR_pk`
+  are normalised. A four-entry allow-list means a locale that simply copies the
+  English string fails the test suite.
+- **`src/pc_agent/a11y.py`**: real WCAG 2.1 relative-luminance and contrast-ratio
+  maths, a new high-contrast palette, and `a11y_status()` that reports the
+  language, direction, text scale, theme, motion state, every locale's computed
+  coverage, the measured contrast table with `passing/total` and the resulting
+  WCAG level, the documented keyboard shortcuts, the claims this build can make
+  (each with how it is verified) and **five disclosed limitations**.
+- **`src/pc_agent/ui_prefs.py`**: `data/ui.json` persistence (six presentation
+  values) with precedence *environment → ui.json → default*, tolerant of a corrupt
+  file. No schema migration: schema stays **v18**.
+- **19th GUI tab Accessibility**: language picker, text size 80-200 %, high
+  contrast, reduce motion, Save/Refresh/Run-check, and a report pane that renders
+  the measured contrast table, shortcuts, claims and limits. Text styles scale from
+  the base font and RTL **mirrors the header layout**.
+- **Web Command Center**: real `lang`/`dir` switching with `[dir="rtl"]` mirroring,
+  a skip link, `role="banner"`/`role="main"`, `aria-live` status regions,
+  `:focus-visible` outlines, `prefers-reduced-motion`, a high-contrast class and a
+  working Accessibility panel (apply-now and save).
+- **CLI/API**: `pc-agent i18n status|list|strings|set`,
+  `pc-agent a11y status|check|contrast`, `pc-agent perf bench`, an
+  `Accessibility:` doctor line, an `a11y` diagnostics section, release check 31
+  (`accessibility`) and five routes (`/v1/i18n/*`, `/v1/a11y/status`,
+  `/v1/perf/bench`).
+- 6 new settings (`PC_AGENT_UI_LOCALE`, `_SCALE`, `_HIGH_CONTRAST`, `_REDUCE_MOTION`,
+  `_KEYBOARD_SHORTCUTS`, `_CLI_COLOR`), all validated at load with the accepted list.
+- 44 new tests in `tests/test_transformation_phase17_accessibility.py`.
+
+### Fixes found while building this phase
+- The `Plugins:`/`Sync:` doctor lines referenced their import inside the wrong
+  order; both now import before printing, so `pc-agent doctor` cannot raise a
+  `NameError`.
+- `unit.percent` ("%") was flagged as an untranslated copy of English; symbols are
+  now part of the explicit `IDENTICAL_OK` allow-list instead of weakening the check.
+
+## 0.78.0 - Encrypted device sync and secure remote coordination
+
+### What is new
+- **`src/pc_agent/sync/`**: optional, local-first, end-to-end encrypted sync
+  between *your own* devices. `crypto.py` (Ed25519 device identity + X25519
+  ephemeral-static ECDH + HKDF-SHA256 + AES-256-GCM with the header as AAD and an
+  Ed25519 signature binding every recipient entry), `store.py` (schema v18 ledger,
+  bounded to 400 bundles / 200 requests), `service.py` (the only gate keeper).
+- **Transport is a folder you already sync** - OneDrive, Dropbox, a USB stick, a LAN
+  share. No port is opened, no server runs, no account is needed, nothing is sent
+  anywhere by this code.
+- **Pairing** records another device's Ed25519 + X25519 public keys plus a grouped
+  fingerprint; `confirm="PAIR"` is required everywhere. Pause, resume and unpair are
+  real state changes; a bundle from an unpaired device, or from a paired device
+  whose signing key changed, is refused.
+- **Replay and clock safety**: a processed `bundle_id` is never processed again, the
+  per-sender `seq` must strictly increase, and `created_at` must sit inside
+  `PC_AGENT_SYNC_CLOCK_SKEW_SECONDS` (default 900 s).
+- **Conflict handling that never destroys local data**: reminders de-duplicate on
+  `(title, due)`, flows follow `local|newest|remote` (default `newest`), profiles are
+  create-only. Every skipped record is reported as a conflict.
+- **Coordination without execution**: `remind`, `notify` and `ping` requests travel
+  inside a normal encrypted bundle and wait in `sync_requests` for a human accept;
+  accepting calls only the existing governed reminder/notification paths.
+- **`pc-agent sync status|identity|peers|pair|unpair|pause|resume|export|import|tick|bundles|requests|request|decide`**,
+  **12 HTTP routes** under `/v1/sync/*`, the 18th GUI tab **Sync**, a web
+  **Device sync** panel, a `sync` diagnostics section, a `Sync:` doctor line and
+  release check 30 (`device_sync`).
+- Schema **v18**: `sync_devices`, `sync_bundles`, `sync_requests`, `sync_state`.
+- 8 new settings (`PC_AGENT_ALLOW_SYNC` off by default, device name, sync dir,
+  bundle byte cap, record cap, retention days, conflict policy, clock skew), all
+  validated at load.
+- 51 new tests in `tests/test_transformation_phase16_sync.py`: two real device
+  identities in two data directories, real bundles on disk, and real refusals for
+  replay, tampering, key changes, unpaired senders, clock skew and oversize input.
+
+### Fixes found while building this phase
+- `_iso()` in the sync service had a required `moment` argument but was called with
+  none; the default is now `None` (i.e. *now*).
+- The sync apply path called `ProactiveStore.add_reminder()` (which wants a
+  `datetime` and is internal) instead of the public, validating
+  `ProactiveEngine.add_reminder(due=...)`; both the import and the coordination
+  paths now use the public API, so `+30m`/ISO strings are parsed by the one parser.
+- The `sync` CLI dispatcher and the `Plugins:`/`Sync:` doctor lines referenced names
+  before their local imports; the import order is fixed.
+- `pc_agent.sync` did not re-export `COLLECTIONS` / `REQUEST_KINDS` /
+  `BUNDLE_SUFFIX`, so tests and integrations could not discover the closed sets.
+
+## 0.77.0 - Plugin ecosystem (signed manifests + OS sandboxing)
+
+### What is new
+- **`src/pc_agent/plugins/`**: a complete third-party extension point -
+  `manifest.py` (strict contract, canonical JSON, content checksum, Ed25519
+  verification), `sandbox.py` (POSIX `setrlimit` / Windows Job Object, isolated
+  interpreter, scrubbed environment, hard timeout), `worker.py` (audit-hook
+  enforced child process, one declared tool call, JSON-only protocol),
+  `store.py` (schema v17 registry, version history, run ledger) and
+  `service.py` (the only gate keeper).
+- **Signed bundles**: `manifest.json` + `manifest.sig.json`; the signature covers
+  the exact manifest bytes and names the content checksum, so a modified bundle
+  is refused. Unsigned bundles are refused unless `PC_AGENT_PLUGIN_ALLOW_UNSIGNED`
+  is set, and only keys in `PC_AGENT_PLUGIN_TRUSTED_KEYS` are accepted.
+- **Capabilities** are a closed list (`read_workspace`, `write_workspace`,
+  `read_plugin_files`, `network`, `subprocess`); `network` and `subprocess` are
+  refused at install time because this build cannot grant them, and the worker
+  additionally denies sockets, subprocesses and writes outside the granted roots
+  through a `sys.addaudithook` hook.
+- **Lifecycle**: verify, install, enable/disable, rollback to an earlier version
+  (5 kept), uninstall; every step is an event and the tool runs are a bounded
+  ledger (500 rows).
+- **12 HTTP routes** under `/v1/plugins/*`, a `pc-agent plugins …` CLI (with
+  `run --arg name=json --confirm <plugin id>`), the 17th GUI tab **Plugins**, a
+  web dashboard panel, a `Plugins:` doctor line, a `plugins` diagnostics section
+  and release check 29 (`plugin_ecosystem`).
+- Schema **v17**: `plugins`, `plugin_versions`, `plugin_runs`, `plugin_state`.
+- 9 new settings (gate, unsigned opt-in, trust store, timeout, memory, CPU,
+  bundle size, file count, per-file size), all validated at load.
+- 36 new tests in `tests/test_transformation_phase15_plugins.py` with real
+  Ed25519 keys, real zips and real subprocesses.
+
+### Fixes found while building this phase
+- The worker's `os.setsid()` collided with `start_new_session=True`
+  (`Exception occurred in preexec_fn`); the preexec hook now only applies
+  rlimits and the session is created by `subprocess`.
+- The plugin `INSERT` had 17 columns against 15 bound values; rewritten with
+  explicit column/value alignment.
+- A `NOTEBOOK_TAB_COUNT` constant was first inserted inside an import block
+  (SyntaxError); it now lives below the Tk import guard.
+- The doctor line lost its `Proactive:` import during the edit and raised
+  `NameError`; restored and covered by the doctor test.
+
+### Verification
+- Full suite **887 passed, 1 skipped**; `ruff check` clean; release audit
+  `READY`, 29 checks, 0 failures, 1 warning.
+- End-to-end by hand: signed bundle verify/install/enable/run/skills/runs/remove
+  through the CLI, and the same flow over a real `LocalApiServer` HTTP listener.
+- Containment proven, not asserted: a 30 s sleep is killed by a 1 s timeout, a
+  `socket.create_connection` is refused, and a write outside the granted roots
+  raises `PermissionError` without creating the file.
+
+### Known limits
+- The audit hook protects Python-level work; native code could bypass it, which
+  is why OS limits are the second layer.
+- Reads are not path-confined in this phase (writes are).
+- No registry/marketplace fetch, no native plugins, and plugin tools are not yet
+  offered to the AI planner.
+
+## 0.76.0 - Proactive intelligence
+
+### What is new
+- **Reminders** (`src/pc_agent/proactive.py`): durable, time-driven, one-shot or
+  repeating, with `HH:MM`, ISO-8601 and `+15m`/`+2h`/`+3d` due formats;
+  snooze/dismiss/done/delete/enable, and a bounded open-reminder count.
+- **Notification policy**: quiet hours (wraparound-aware, optional `critical`
+  crossover), rolling hourly cap (default 20, max 500), per-key cooldown
+  (default 300 s) and an outbound switch that is **off by default**. Deferrals
+  carry an explicit reason instead of being dropped silently.
+- **Daily briefings**: reminders, calendar, drive, flows, tasks and system —
+  composed from live state only, one per local date, idempotent.
+- **Scheduler step**: the real `api_server` scheduler now calls
+  `service.proactive_tick(source="scheduler")` so reminders fire without a UI.
+- **13 HTTP routes** under `/v1/proactive/*`, a `pc-agent proactive …` CLI tree,
+  the 16th GUI tab **Proactive**, a web dashboard panel, a `Proactive:` doctor
+  line, a `proactive` diagnostics section and release check 28
+  (`proactive_intelligence`).
+- Schema **v16**: `reminders`, `notifications`, `proactive_briefings`,
+  `proactive_state` (+5 indexes).
+- 10 new settings: `PC_AGENT_ALLOW_PROACTIVE`, `PC_AGENT_ALLOW_PROACTIVE_OUTBOUND`,
+  `PC_AGENT_QUIET_HOURS`, `PC_AGENT_QUIET_HOURS_ALLOW_CRITICAL`,
+  `PC_AGENT_NOTIFICATION_MAX_PER_HOUR`, `PC_AGENT_NOTIFICATION_COOLDOWN_SECONDS`,
+  `PC_AGENT_BRIEFING_ENABLED`, `PC_AGENT_BRIEFING_TIME`,
+  `PC_AGENT_REMINDER_MAX_OPEN`, `PC_AGENT_PROACTIVE_TICK_LIMIT`.
+- 24 new tests in `tests/test_transformation_phase14_proactive.py`, including a
+  simulated 24-hour determinism test.
+
+### Fixes found while building this phase
+- `argparse` treated `--due -1m` as a flag, so negative offsets were
+  unusable; `_fold_negative_values` now folds `--due`/`--for` into
+  `--flag=value` before parsing.
+- Notification writes used the wall clock, which made the hourly cap and the
+  cooldown untestable (and, on a slow write, slightly wrong); the engine clock
+  is now threaded into `record_notification`.
+- The connectors release-check detail hard-coded `schema v15`; it now reads
+  `LATEST_SCHEMA_VERSION` so it cannot go stale again.
+- Test-suite identity sweep to 0.76.0 (label, previous version, schema version,
+  future-feed version so update-gate tests keep failing closed on a real
+  mismatch).
+
+### Verification
+- Full suite **851 passed, 1 skipped**; `ruff check` clean; release audit
+  `READY`, 28 checks, 0 failures, 1 warning.
+- End-to-end smokes over real files, a real `LocalApiServer` HTTP listener and
+  the real CLI (not mocks): reminder add/list/tick/snooze/done/delete, forced
+  briefing, notify, notification clear, invalid due time refused with exit 1.
+
+### Known limits
+- No OS toast delivery (deliberate: it is an outbound channel and belongs behind
+  the outbound gate with its own tests).
+- Reminders only fire while the service (or GUI, which embeds it) is running;
+  a closed app reports them late on next start.
+- Quiet hours are one daily window, not per weekday.
+
+## 0.75.1 - Process scan hotfix (real Windows evidence)
+
+### The defect
+- On the user's Windows machine `pytest` failed with
+  `test_live_snapshot_on_this_machine`: `top_processes == []` while every
+  other metric was correct. `_top_processes_windows()` wrapped the whole
+  scan in one broad `except`, so *any* failure - a missing PSAPI export, a
+  refused `OpenProcess`, an empty enumeration - returned an empty list that
+  looked exactly like "this machine has no processes".
+
+### The fix
+- `top_processes` is now produced by an explicit, layered chain in
+  `src/pc_agent/system_monitor.py`:
+  1. `win32-enum` - EnumProcesses + GetProcessMemoryInfo;
+  2. `win32-toolhelp` - CreateToolhelp32Snapshot/Process32FirstW for PIDs and
+     image names plus the same memory reader (independent of PSAPI);
+  3. `tasklist` - the OS's own `tasklist /FO CSV /NH`, parsed by shape so
+     localised headers and `1,234 K` / `1.234 K` / `12 345 K` all work;
+  4. `powershell` - `Get-Process ... WorkingSet64` as the last resort.
+- Nothing is guessed: each layer returns a `ProcessScan(rows, source, detail)`
+  and the snapshot now carries `top_processes_source` and
+  `top_processes_detail` (`opened=250/312 unreadable=3`, `snapshot=300 …`,
+  `GetProcessMemoryInfo export missing`, …) plus a `processes=<n> (<source>)`
+  field in the `System:` doctor line, so an empty scan can never again be
+  mistaken for a healthy one.
+- Helper processes are invoked with a fixed, argument-free argv and
+  `CREATE_NO_WINDOW`, an 8 s timeout and capped output; they run only after
+  the in-process API produced nothing.
+
+### Tests
+- `tests/test_transformation_phase6_monitoring.py` grows from 10 to 18 tests:
+  fallback ordering, reason preservation, locale-tolerant `tasklist` parsing
+(comma/dot/space separators, MB, malformed rows), PowerShell parsing, the
+  enum layer's opened/unreadable counters, a missing-export reason, the
+  Toolhelp layer, and a snapshot that reports `unavailable` honestly.
+- Full suite **827 passed, 1 skipped**; ruff clean; release audit unchanged at
+  27 checks.
+
+## 0.75.0 - TRANSFORMATION PHASE 13 Connectors
+
+### Connectors (new)
+- `src/pc_agent/connectors/` - five local-first connectors behind explicit,
+  default-off gates, plus one durable ledger for every interaction:
+  - **calendar** (`calendar_ics.py`): reads and writes a real `.ics` file
+    (RFC 5545 line folding, escaped text, `UID` + `DTSTART` validation, atomic
+    temp-file replace, existing events preserved). Naive input times are treated
+    as local time and written as UTC - never relabelled as UTC.
+  - **drive** (`drive.py`): SHA-256 content index of one local folder (the folder
+    the user's own cloud client already syncs). Symlinks/junctions escaping the
+    root are skipped, well-known secret names/directories are skipped
+    (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.env`, `*.key`, `*.pem`, `*.kdbx`, …),
+    per-file and total caps are enforced and truncation is reported.
+  - **email** (`email.py`): IMAP4-SSL **headers only**
+    (`BODY.PEEK[HEADER.FIELDS (...)])`, RFC 2047 subject decoding, never a body
+    or attachment; SMTP StartTLS sending behind a **second** gate
+    (`PC_AGENT_ALLOW_EMAIL_CONNECTOR`) plus a per-message `confirm="SEND"` token,
+    CRLF/NUL header-injection refusal and a 5-recipient cap.
+  - **chat** (`chat.py`): one signed HTTPS POST (`X-PcAgent-Signature:
+    sha256=HMAC(secret, timestamp.body)`), SSRF-validated with the browser
+    tool's validator, redirects refused, delivery recorded with status code,
+    bytes and duration.
+  - **webhook** (`webhook.py`): inbound verification only - bounded body,
+    numeric timestamp inside a configurable skew window, constant-time signature
+    comparison, replay protection keyed on `kind:external_id`, control characters
+    and lengths sanitised before storage.
+- `ConnectorService` is the single gate keeper: a closed gate raises an
+  actionable `ConnectorError` naming the exact setting, never a silent no-op.
+
+### Storage - schema v15
+- New tables `connector_events` (inbound items + refusals), `connector_deliveries`
+  (outbound attempts, including failures) and `connector_state` (drive manifest,
+  last sync), with three indexes and bounded row counts.
+
+### Configuration (all default off)
+- `PC_AGENT_ALLOW_CONNECTORS`, `PC_AGENT_ALLOW_EMAIL_CONNECTOR`,
+  `PC_AGENT_CONNECTOR_CALENDAR`, `…_DRIVE_ROOT`, `…_CHAT_URL`,
+  `…_CHAT_SECRET`, `…_WEBHOOK_SECRET`, `…_EMAIL_HOST/USER/PASSWORD/FOLDER`,
+  `…_SMTP_HOST/PORT`, `…_MAX_ITEMS` (1-100), `…_TIMEOUT_SECONDS` (1-120),
+  `…_WEBHOOK_SKEW_SECONDS` (30-86400) and `…_ALLOW_PRIVATE_ENDPOINTS` (opt-in
+  LAN chat targets). Out-of-range values raise `ConfigError` instead of being
+  silently clamped; `public_summary()` exposes only masked labels.
+
+### Surfaces
+- Service: 12 connector methods (`connector_status/summary/events/deliveries/
+  calendar_events/calendar_add/drive_sync/mail_inbox/mail_send/chat_send/
+  webhook_receive`).
+- CLI: `pc-agent connectors status|events|deliveries`, `connectors calendar
+  list|add`, `connectors drive sync`, `connectors mail inbox|send`,
+  `connectors chat send`, `connectors webhook receive`.
+- 9 HTTP routes under `/v1/connectors/…`; GUI **Connectors** tab (15th) with
+  probe, calendar, drive, mail, chat and webhook controls; a live web dashboard
+  panel; a `Connectors:` doctor line; a `connectors` diagnostics section and
+  release-audit check **27**.
+
+### Documentation
+- `docs/transformation_phase13.md` records what existed, what was missing, the
+  changes, files, tests, security/performance implications, limitations and the
+  next tasks.
+
+## 0.74.0 - TRANSFORMATION PHASE 12 Visual Workflow Builder
+
+### Visual workflow builder (new)
+- `src/pc_agent/flows.py` — a flow is a **versioned, validated graph of
+  instruction nodes** that compiles into an ordinary Mission Center mission, so
+  every node keeps the same Safety Kernel, approvals, token budgets, hard
+  timeouts, verification and recovery as a hand-written mission.
+- Strict validation: unknown keys are refused (never ignored), `flow_schema`
+  must be 1, node ids must match `^[a-z0-9][a-z0-9_-]{0,31}$`, duplicate
+  ids/edges and edges to unknown nodes are refused, `{{variable}}` placeholders
+  must resolve, and a cycle is refused by Kahn's algorithm with
+  `The flow graph contains a cycle.` Every message names the exact field.
+- Limits: <=20 nodes, <=8 variables, <=8 triggers per flow, schedule interval
+  60 s .. 30 days, import <=64 000 bytes, <=500 runs listed.
+- `FlowStore` keeps **immutable versions** (`flow_versions` with per-version
+  SHA-256), triggers and a run ledger; `FlowRunner` compiles + starts the
+  mission, records `started`/`failed`, reconciles runs whose mission already
+  finished, and `tick()` fires each due trigger **at most once per tick** with a
+  hard budget and an `app_events` watermark for event triggers (no replay).
+- Portable export/import: `{flow_schema, exported_by, flow, triggers, checksum}`
+  where the checksum is SHA-256 over canonical JSON of `{flow, triggers}`; an
+  edited document is refused, and overwrite requires an explicit flag.
+
+### Triggers and schedules
+- `manual`, `schedule` (interval or one-shot future `run_at`) and `event`
+  (exact `app_events.event_type` matched above `last_event_id`); disabled flows
+  are skipped, never executed late; one active run per flow.
+
+### Storage - schema v14
+- New tables `flow_definitions`, `flow_versions`, `flow_triggers`, `flow_runs`
+  (+6 indexes). Migration 14 is applied after migration 13, so the Phase 11
+  `automation_runs` ledger survives (covered by a test).
+
+### Surfaces
+- Service: 22 flow methods, including `resolve_flow_id` (full id, unique prefix
+  or exact name) and mission-state injection for run reconciliation.
+- CLI: `pc-agent flows list|show|create|update|validate|enable|disable|delete|
+  run|runs|export|import|trigger add|list|enable|disable|delete|tick|stats`,
+  `--json` on every sub-command, plus a live `Flows:` line in `pc-agent doctor`.
+- HTTP API (loopback + bearer token): 18 flow routes including
+  `POST /v1/flows/validate`, `POST /v1/flows/import`, `POST /v1/flows/tick`,
+  `GET /v1/flows/stats`, `GET /v1/flow-runs`, `POST /v1/flows/{ref}/run` (202),
+  `POST /v1/flows/{ref}/definition` (update) and the trigger routes. There is
+  still no `PUT`/`PATCH` handler.
+- GUI: 14th tab **Workflows** with real state (summary, flow list, JSON document,
+  validate/save/update/import/show/run/export/tick, schedule and event trigger
+  creation, recent runs) on the worker thread.
+- Web command center: a **Workflow Builder** panel wired to the same endpoints.
+- Diagnostics: `flows` section + `flows_summary_line()`; release audit check 26
+  `flow_builder` (PASS).
+
+### Windows fix folded in from real user evidence (0.73.0 build)
+- The first native Windows run of 0.73.0 reported **746 passed, 8 skipped, 1
+  failed**: `test_transformation_phase6_monitoring.py::test_live_snapshot_on_this_machine`
+  failed because `top_processes` came back `[]` on Windows.
+- Root cause: `system_monitor.WindowsProcessApi._resolve()` returns a
+  `(function, export_name)` pair, and the memory entry points unwrapped
+  `entry[0]` while `EnumProcesses` stored the raw tuple. Calling a tuple raised
+  `TypeError`, the scan's `except` swallowed it, and every Windows snapshot
+  silently reported zero processes. Fixed by unwrapping the enumeration entry
+  the same way.
+- Hardening from the same pass: the scan now retries `OpenProcess` with the
+  Vista+ `PROCESS_QUERY_LIMITED_INFORMATION` right when the full query rights
+  are refused, so protected-but-readable processes are still reported; the DLL
+  loader is injectable, so the mapping (`_windows_process_rows`) and the
+  callable-vs-tuple contract are covered by tests that run on every platform.
+- `voice devices` now names the Windows privacy setting when no audio endpoint
+  is reported, instead of implying the probe simply found nothing.
+
+### Security hardening
+- `redact_text()` now also removes bare provider keys (`sk-…`, `ghp_…`,
+  `AIza…`, `xai-…`, `gsk_…`) that appear without an `api_key=` label, so a
+  provider rejection message can never be persisted in `flow_runs.error`.
+- Flows cannot run a shell, open a socket or skip a tool gate; import is
+  bounded + checksum-verified + key-strict; triggers are capped and budgeted.
+
+## 0.73.0 - TRANSFORMATION PHASE 11 Advanced Automation
+
+### Offline computer vision (new)
+- `src/pc_agent/perception.py` (Pillow only, no network, no OCR claim):
+  `analyse_image` measures width/height/mode/format/size, mean brightness,
+  contrast, five dominant colours and a `rows x columns` grid (<= 12) of mean
+  brightness **and** ink density, plus `busy_cells`, `text_likely` and a
+  plain-language `region_hint`.
+- Ink density is **resolution-normalised** (each cell reduced to a 128 px working
+  width and filtered with a gradient kernel in Pillow's C code), so the same page
+  reads comparably at 1366x768 and 2560x1440; the old averaged-ink threshold that
+  always reported `text_likely=False` is gone.
+- `locate_template` is a two-stage **verified** search: coarse sampled scan ->
+  non-neighbouring peak nomination -> full-pixel re-score at reduced size ->
+  pixel refinement and full-pixel verification on the full-size screenshot. Only
+  verified positions at or above the threshold are reported, and the reported
+  `score` is that verified measurement.
+- Caps: source <= 20 MB / 40 MP, grid <= 12, template <= 250 000 px, <= 40 000
+  sampled search steps, scales 1.0/0.75/0.5, threshold 0.90, verification
+  tolerance 24/255. A flat template is refused (`MIN_TEMPLATE_CONTRAST`).
+- `image_crop` / `read_image_file` stay inside the workspace.
+
+### Browser: real waiting and tab control
+- `PageSession.wait_for(selector|text|url_contains, timeout<=120s, poll)` with
+  `_wait_probe_js` (every interpolated value JSON-quoted).
+- New tools `browser.wait` and `browser.tabs` (list/activate/close;
+  `BrowserClient.close_tab` refuses to close the last page tab; the handler
+  normalises backend replies so a non-mapping reply cannot crash it).
+
+### Desktop: window state control (Windows)
+- `WindowStateChange` + `set_window_state(selector, state, bounds=None)` for
+  `minimize|maximize|restore|move|resize`; bounds within +/-32000, minimum
+  120x120, clamped to the virtual screen, own window refused, `SetWindowPos`
+  declared with explicit argtypes.
+- New tool `desktop.window_state` with schema-level bounds validation.
+
+### Automation ledger (schema v13)
+- `automation_runs` table + two indexes; `AutomationRepository`
+  (`record`, `get`, `list_runs`, `summary`) and `AutomationRunRecord`.
+- Records allowed **and** refused actions; stores action/target label/short
+  detail only - no page text, screenshots or file contents; 5 000-row retention;
+  writes are best-effort so an audit failure never blocks a user action.
+
+### Surfaces
+- CLI `pc-agent automation capabilities|runs|stats|screen|locate` (`--json`).
+- HTTP `GET /v1/automation/capabilities|runs|stats`,
+  `POST /v1/vision/screen|locate`, `/v1/browser/wait`, `/v1/browser/tabs`,
+  `/v1/desktop/window-state`.
+- GUI 13th tab **Automation** (capabilities, ledger, screen analysis, template
+  search, browser wait, recent runs) with startup refresh.
+- Web Command Center panel reusing the same routes.
+- Diagnostics `automation` section; new `pc-agent doctor` `Automation:` line;
+  release audit grows to **25 checks** (`automation_audit`).
+
+### Identity
+- `__version__ = 0.73.0`, schema **v13**, transformation phase **11**,
+  label `TRANSFORMATION PHASE 11 Advanced Automation`, previous transformation
+  version `0.72.0`, **69** built-in tools.
+
+### Tests
+- `tests/test_transformation_phase11_automation.py` (23 tests).
+- Full suite **754 passed, 1 skipped** (the skip needs a real display).
+
+## 0.72.0 - TRANSFORMATION PHASE 10 Voice Pipeline
+
+**Specialized voice, microphone privacy, two Windows acceptance fixes.**
+
+### Voice pipeline (new, schema v12)
+
+- **Push-to-talk by default.** The microphone is *off* until the user turns it
+  on, and that consent is persisted (`voice.enabled` preference) so a restart
+  never silently re-opens it. Wake-word listening is a separate, second opt-in.
+- **Real capture backends, no fake audio:** native Windows `winmm` `waveIn*`
+  through `ctypes` (no bundled binary, no third-party audio package) and ALSA
+  `arecord` on Linux. When neither exists the subsystem reports
+  `backend=none` with the reason instead of pretending to listen.
+- **Local-first speech-to-text:** Windows System.Speech (built in, offline),
+  `faster-whisper`, `whisper.cpp` (explicit model path). A cloud
+  OpenAI-compatible `/audio/transcriptions` engine is optional and requires
+  **both** `PC_AGENT_VOICE_CLOUD_STT=1` and a per-call consent flag; without
+  consent the audio is never uploaded.
+- **Offline text-to-speech:** Windows System.Speech and `espeak-ng`. Text
+  reaches the engine through a temporary UTF-8 file (PowerShell) or stdin
+  (espeak), never through a command line, so quoted text and shell
+  metacharacters cannot turn into script.
+- **Privacy ledger:** every capture writes a `voice_sessions` row (mode,
+  duration, engine, character count, status) - transcripts only when
+  `PC_AGENT_VOICE_STORE_TRANSCRIPTS=1`, audio only when
+  `PC_AGENT_VOICE_RETAIN_AUDIO=1`. `pc-agent voice privacy --purge-audio` and
+  `--clear-history` delete retained recordings and the ledger.
+- **Silence is reported, not transcribed:** RMS/peak analysis marks an
+  empty recording as "no speech detected".
+- **Emergency stop integration:** an engaged stop refuses captures and forces
+  the microphone state to `disabled`.
+
+### Surfaces
+
+- CLI: `pc-agent voice status|devices|enable|disable|wake-word|ptt|transcribe|say|sessions|privacy`.
+- HTTP API: `/v1/voice/status`, `/v1/voice/devices`, `/v1/voice/privacy`,
+  `/v1/voice/enable`, `/v1/voice/wake-word`, `/v1/voice/capture/{start,stop,cancel}`,
+  `/v1/voice/speak`, `/v1/voice/transcribe`, `/v1/voice/sessions`,
+  `/v1/voice/purge`, `/v1/voice/clear`.
+- GUI: new **Voice** tab (12th) with persisted enable/wake-word toggles,
+  push-to-talk start/stop/cancel, speak box, purge button and the live
+  `● REC` / `○ ready` / `✕ off` indicator.
+- Web Command Center: **Voice** panel with the same live state and controls.
+- Diagnostics: `voice` section. Release audit: 24 checks, new
+  `voice_privacy` check (warns if continuous wake-word listening is on).
+
+### Windows acceptance fixes reported by the user
+
+- **`test_worker_hard_timeout_kills_hung_tool_and_recovers` failed on Windows**
+  because the probe hard-coded `python3`, which does not exist on Windows, so
+  the allowlist rejected the call before the timeout path ran. The test now
+  resolves a bare, PATH-resolvable interpreter (`python.exe` on Windows).
+- **`test_live_snapshot_on_this_machine` failed on Windows**: process RSS was
+  `None`, i.e. the monitor could not read `GetProcessMemoryInfo`. Root cause:
+  `psapi!GetProcessMemoryInfo` was the only entry point tried and 64-bit
+  HANDLEs were passed with ctypes' default 32-bit `int` restype, truncating
+  them. `WindowsProcessApi` now probes `K32GetProcessMemoryInfo`,
+  `psapi!GetProcessMemoryInfo` and the kernel32 forwarder in order, declares
+  explicit `HANDLE`/buffer signatures, and is shared by the self-RSS reading
+  and the top-process scan (which also gets `K32EnumProcesses`).
+
+### Not changed
+
+- Registered tools stay at **64** (voice is not a tool: it is a user-initiated
+  surface, so an agent cannot open a microphone on its own).
+- Phase 1-9 behaviour, schema migrations 1-11 and every safety gate are
+  preserved; migration 12 only adds `voice_sessions`.
+
+
+## 0.71.0 - TRANSFORMATION PHASE 9 Multi-Agent Studio
+
+- Adds `src/pc_agent/agents.py` (specialized multi-agent runtime +
+  Agent Studio). Schema **v11**: `agent_definitions` (role, persona
+  prompt, builtin-tool allow-list, preferred provider, step/token
+  budgets) and an `agent_runs` ledger linked to real tasks. Six
+  builtin specialists seed idempotently (coordinator, researcher,
+  document-worker, data-analyst, knowledge-keeper, reviewer);
+  builtins are editable/disable-able but not deletable.
+- Least privilege by construction: an agent run is an ordinary task
+  whose orchestrator is built with a **filtered tool registry**, so
+  disallowed tools do not exist for planning or execution (Safety
+  Kernel, approvals, verification, recovery, budgets unchanged;
+  dynamic tools never included). `PlannerOptions` gains
+  `agent_system_prompt` + `allowed_tool_ids`: the AI planner sees a
+  narrowed catalog plus the persona, and out-of-restriction plans
+  are rejected pre-execution.
+- Team runs: at most 6 assignments as a topological dependency
+  graph (Mission Center level engine, bounded parallelism, failed
+  dependencies block dependents without creating tasks). Explicit
+  assignments work fully offline; otherwise the coordinator
+  proposes them through one strictly validated JSON completion
+  (goal treated as untrusted data). Delegation depth is exactly 1
+  and no agent capability is exposed as a tool (registry stays 64).
+- Surfaces: CLI `agents list|show|create|delete|enable|disable|run|
+  team|runs|stats` + doctor `Agents:` line; API
+  `GET/POST /v1/agents`, `GET/DELETE /v1/agents/{name}`,
+  `POST /v1/agents/{name}/run` + `/v1/agents/team` (202 background),
+  `GET /v1/agents/team/{id}|runs|stats`; GUI Agents tab (11th) with
+  the Studio editor; web Agent Studio panel; diagnostics `agents`
+  section; release audit gains a 23rd check (`agent_studio`).
+  Parallel branches run without an interactive approval callback by
+  design (Approval Center rules still apply). `AgentError` added to
+  `pc_agent.errors`.
+
+
+## 0.70.0 - TRANSFORMATION PHASE 8 Memory and Knowledge
+
+- Adds `src/pc_agent/knowledge.py` + `src/pc_agent/embeddings.py`
+  (Memory v2, knowledge base, embeddings, hybrid search, RAG). Schema
+  **v10**: `memory_items` gains model-tagged packed-float32
+  `embedding`/`embedding_model` and `tags` (a content edit atomically
+  invalidates the vector); new `knowledge_documents`/`knowledge_chunks`
+  tables store explicitly ingested text/PDF/Office files as bounded,
+  SHA-256-deduped, model-tagged chunks (never silent OCR — a
+  text-less PDF is an explicit error).
+- Embeddings: offline deterministic signed feature-hashing embedder by
+  default (`local-hashing-384`, light stemming + bigrams; honestly
+  lexical, not neural); optional OpenAI/OpenRouter/OpenAI-compatible
+  `/embeddings` or Ollama `/api/embed` backends via
+  `PC_AGENT_EMBEDDING_PROVIDER|MODEL|DIMENSIONS` (64-2048). Vector
+  search only compares same-model vectors; on embedder failure search
+  degrades to a labelled `keyword-fallback`.
+- Grounded answers: `knowledge ask` retrieves first and routes one
+  cited (`[S#]`) prompt through the Phase 7 metering path with
+  sources marked as untrusted data; no sources means no provider
+  call. Ask stays user-invoked and license-gated on CLI/GUI; there is
+  deliberately no agent ask tool.
+- Surfaces: CLI `knowledge ingest|list|search|ask|remove|stats`,
+  `memory search|reindex`, `note-set --tags` with fail-soft
+  auto-embed; tools `knowledge.ingest`/`knowledge.search`
+  (worker-excluded; registry 62 -> **64**); API
+  `GET /v1/knowledge/documents|search|stats`, `POST
+  /v1/knowledge/ingest|ask`, `DELETE /v1/knowledge/documents/{id}`,
+  `GET /v1/memory/search` (API path ingestion workspace-contained);
+  GUI Knowledge tab (10th); web Knowledge & Memory v2 panel; doctor
+  `Knowledge:` line; diagnostics `knowledge` section; release audit
+  gains a 22nd check (`knowledge_base`).
+- `KnowledgeError` now lives in `pc_agent.errors` (re-exported from
+  `pc_agent.knowledge`) to keep the tools import graph acyclic.
+
+## 0.69.0 - TRANSFORMATION PHASE 7 Provider Platform
+
+- Adds `src/pc_agent/provider_platform.py` (Provider Platform v2):
+  a capability catalog (local/streaming/vision plus user-configured
+  context sizes and per-1k prices via `PC_AGENT_MODEL_CONTEXT_TOKENS` /
+  `PC_AGENT_PROVIDER_PRICES` — never guessed), strategy routing
+  (`PC_AGENT_PROVIDER_STRATEGY`: default, local-first, fastest by
+  measured median latency, cheapest by configured prices), local usage
+  analytics (append-only `data/provider-usage.jsonl` with token counts
+  from provider usage or clearly labelled estimates, latency, priced
+  cost sums; no prompt text stored; `PC_AGENT_PROVIDER_ANALYTICS=0`
+  disables), and a built-in 4-case evaluation suite with saved reports.
+- Adds streaming completions: mock, OpenAI-compatible (SSE), Ollama
+  (NDJSON), and Anthropic (SSE) adapters gain `stream_complete()`;
+  `ModelRouter.stream_complete()` falls back only before the first
+  delta. Gemini streaming is honestly reported as not implemented.
+  Surfaces: `pc-agent ask --stream`, `POST /v1/providers/stream`
+  (NDJSON), and the web Command Center Stream Ask box.
+- New CLI: `providers capabilities|route|usage|evaluate`; new API:
+  `GET /v1/providers/capabilities|usage|evaluations`,
+  `POST /v1/providers/evaluations/run`; `/v1/providers` enriched with
+  strategy/route/capability flags. Doctor gains a `Provider platform:`
+  line; diagnostics gain a `provider_platform` section; the release
+  audit gains a 21st check (`provider_platform`); the Tkinter
+  Providers tab shows the platform summary and can run evaluations.
+- No schema change (still v9); planning still uses non-streaming
+  completions, so approvals, budgets, and verification are untouched.
+
+## 0.68.0 - TRANSFORMATION PHASE 6 Live Monitoring
+
+- Adds `src/pc_agent/system_monitor.py`: stdlib-only, fail-soft live
+  telemetry — CPU % between samples (Windows `GetSystemTimes`, Linux
+  `/proc/stat`), memory (`GlobalMemoryStatusEx`, `/proc/meminfo`, `sysconf`),
+  disk per volume, agent process RSS/thread count/uptime, system uptime,
+  network byte counters with up/down rates (`/proc/net/dev`, best-effort
+  Windows `GetIfTable`), GPU via `nvidia-smi` when present (non-NVIDIA
+  systems report an honest "unavailable" instead of an invented value),
+  battery (`GetSystemPowerStatus`, `/sys/class/power_supply`), and a
+  top-process-by-RSS table (Linux `/proc`; Windows `EnumProcesses` +
+  `GetProcessMemoryInfo`, skipping protected processes).
+- New surfaces: `pc-agent system status|sample`, authenticated
+  `GET /v1/system` (`{snapshot, history}`, one stateful monitor per
+  service), doctor `System:` line, a `system` section in diagnostics
+  export, a 20th release-audit check (`system_monitor`), the web
+  Command Center **System (live)** panel (real CPU/memory/disk bars,
+  network rates, agent RSS, GPU, battery, top processes), and a
+  `System:` live line in the Tkinter Command Center.
+- No schema change (still v9): telemetry is live state, never stored or
+  fabricated; first samples report rate fields as null until a baseline
+  exists.
+
+## 0.67.0 - TRANSFORMATION PHASE 5 JARVIS Command Center
+
+- Adds `src/pc_agent/web_ui.py`: a self-contained web **Command Center**
+  served by the local API at `/` (CSP + anti-framing headers; the page
+  itself holds no data). It renders only live `/v1` state — overview,
+  quick-run, tasks (run/cancel/delete), Mission Center (create, run,
+  cancel, execution-graph levels by live status), Safety (emergency
+  stop engage/clear), Approval Center approve/deny, schedules + run-due,
+  a cursor-based live event tail, providers, tools, and public
+  settings. The bearer token lives only in `sessionStorage`.
+  `pc-agent api serve` now prints the Command Center URL.
+- Adds a Tkinter **Command Center** tab with the same real state:
+  4-second overview refresh, mission tree/detail, run/cancel through
+  `MissionRunner`, emergency-stop controls, Approval Center decisions,
+  and a live events tail, backed by new transport-independent
+  `GuiController` methods. GUI mission runs deny inline approvals (the
+  request appears in the Approval Center list); single-task GUI runs
+  keep the existing in-band broker.
+- No simulated widgets: CPU/GPU/monitoring panels deliberately wait
+  for Phase 6 sensors.
+
+## 0.66.0 - TRANSFORMATION PHASE 4 Mission Center
+
+- Adds schema **v9** (`missions`, `mission_tasks`,
+  `mission_dependencies`, `task_schedules`) and `src/pc_agent/missions.py`:
+  missions are DAGs of existing tasks; cycles are rejected on link and
+  before a run; `execution_levels()` exposes the graph; the ready-set
+  runner executes with bounded parallelism
+  (`PC_AGENT_MISSION_MAX_PARALLEL`, 1-8, default 3), giving every branch
+  its own orchestrator/Safety Kernel/worker so approvals, budgets,
+  verification, recovery, and the emergency stop behave exactly like
+  single runs. A failed/cancelled/needs-input dependency leaves its
+  dependents QUEUED with a `mission_blocked` event; the mission ends
+  failed and can be re-run to resume.
+- Adds `pc-agent missions create|list|show|add-task|link|run|cancel|delete`
+  and API `/v1/missions` CRUD + `/run|cancel|tasks|graph`.
+- Adds task schedules (`sch-…`): one-off and interval instructions via
+  `pc-agent schedules add|list|toggle|delete|tick` and `/v1/schedules`;
+  the API process ticks them every
+  `PC_AGENT_SCHEDULER_INTERVAL_SECONDS` (0 disables). Interval schedules
+  advance from the fire time; missed runs are not replayed. OS-level
+  registration is intentionally out of scope.
+- Doctor gains a `Mission center:` line, diagnostics a `missions`
+  section, the release audit a `mission_center` check (19 total), the
+  GUI doctor summary a `mission_summary` line, and profiles may carry
+  the two new bounded settings.
+
+## 0.65.0 - TRANSFORMATION PHASE 3 Local Service and API
+
+- Adds `src/pc_agent/service.py`: one transport-independent **Local
+  Service** that runs tasks on a background thread through the unchanged
+  orchestrator/Safety Kernel/Approval Center stack (API approvals are
+  never granted inline), plus task cancel/delete, approvals list/decide,
+  safety stop/resume, events, settings, tools, and providers surfaces.
+- Adds `src/pc_agent/api_server.py` and `pc-agent api status|serve`: a
+  loopback-only token-authenticated JSON API (`/v1/...`, see
+  `API_DOCUMENTATION.md`). The host is validated loopback in
+  configuration; tokens come from `PC_AGENT_API_TOKEN` or a generated
+  `data/api-token` file.
+- Adds the durable **global event system** (schema **v8**, `app_events`,
+  newest 10,000 rows retained) with producers for task lifecycle,
+  approvals, safety, maintenance, and API startup; `pc-agent events list`
+  and `GET /v1/events` poll with a `since_id` cursor.
+- Adds optional **structured JSON logging** (`PC_AGENT_LOG_FORMAT=json`,
+  rotating `data/logs/pc-agent.jsonl`, messages redacted).
+- Adds **file-based settings profiles** (`src/pc_agent/profiles.py`,
+  `pc-agent profiles list|show|save-current|activate|deactivate|delete`):
+  a strict whitelist of non-secret, non-gate settings under
+  `data/profiles/`, selected by `PC_AGENT_PROFILE` or
+  `data/active-profile`; explicit environment values always win and a
+  broken profile fails closed.
+- Doctor gains a `Local service:` line, diagnostics gains a `service`
+  section, the release audit gains a `local_service` check (18 total)
+  and now requires `API_DOCUMENTATION.md`, and the GUI doctor summary
+  gains a `service_summary` line.
+
+## 0.64.0 - TRANSFORMATION PHASE 2 Safety Kernel
+
+- Adds `src/pc_agent/safety.py` + `src/pc_agent/safety_worker.py`: every
+  orchestrated tool call (including verification re-checks) now runs
+  through the Safety Kernel with a **hard timeout** (tool timeout clamped
+  by `PC_AGENT_SAFETY_MAX_TOOL_SECONDS`). Data-context tools execute in
+  an isolated worker subprocess that is killed at the deadline;
+  browser/desktop/vision tools keep their live factories on a bounded
+  daemon-thread path whose late results are abandoned. Custom registries
+  overriding `invoke()` and ad-hoc parent-only tools stay in-process.
+- Adds a file-backed **emergency stop** (`pc-agent safety status|stop|
+  resume`, `data/emergency_stop.json`, `PC_AGENT_EMERGENCY_STOP=1`
+  override) checked on execute/resume/workflow/every step and inside
+  the kernel; tasks stop as cancelled with an `emergency_stop` event.
+- Adds the **Approval Center** (schema **v7**,
+  `approval_center_requests`): non-interactive runs record a pending
+  exact-scope request bound to the SHA-256 of the arguments;
+  `pc-agent approvals list|show|approve|deny` decides it out-of-band and
+  the decision is consumed once on resume. Approval records now store
+  `arguments_sha256` instead of raw arguments (legacy records still
+  verify).
+- Adds optional **passphrase-encrypted database backups**
+  (`maintenance backup --encrypt`, PBKDF2-HMAC-SHA256 + Fernet,
+  `.db.enc`); verify/restore require the passphrase and re-check
+  plaintext hash/size and SQLite integrity. The passphrase is never
+  stored.
+- New settings `PC_AGENT_SAFETY_HARD_TIMEOUTS`,
+  `PC_AGENT_SAFETY_WORKER_ISOLATION`, `PC_AGENT_SAFETY_MAX_TOOL_SECONDS`
+  and `PC_AGENT_SAFETY_APPROVAL_EXPIRY_MINUTES` (all safety-on by
+  default). Doctor, GUI doctor text, diagnostics (`safety` section) and
+  `release audit` (new `safety_kernel` check, 17 total) expose live
+  safety state.
+- No registered tool (62). The isolated worker is a separate process,
+  not an OS sandbox; in-process abandoned threads cannot be
+  force-killed (their results are discarded). Native Windows
+  GUI/UIA/credential/installer/scheduler acceptance remains pending
+  real Windows evidence.
+
+## 0.63.0 - TRANSFORMATION PHASE 1 Canonical Baseline and Windows Acceptance
+
+- Freezes the delivered Phase 60 tree as the canonical implementation
+  source after reconciliation against audited GitHub Phase 58 commit
+  `89610f3d18f9348b6fe8ead679bab81ee34155df`. Phase 59 Linux systemd-user
+  scheduling and Phase 60 Linux idle/AC sensors are retained.
+- Adds `src/pc_agent/baseline.py` as the single secret-free transformation
+  identity. Doctor, GUI doctor text, diagnostics and `release audit` now
+  expose the same Phase 1 label; release audit also checks the required
+  baseline documents, `.env.example` ignore policy and direct dependency
+  declaration.
+- Repairs stale Phase 44 current-build labels, adopts `.env.local` as an
+  ignored local secret file while keeping `.env.example` tracked, and
+  declares `cryptography` directly for the PDF modules that import it.
+- Adds root architecture, implementation-roadmap, feature-matrix,
+  security, performance and test reports, plus the Transformation Phase 1
+  reconciliation note and a native Windows acceptance pack.
+- Adds no registered tool (62) and no schema migration (v6). Native
+  Windows GUI/UIA/credential/installer/scheduler/live-update acceptance
+  remains pending real Windows evidence; Linux results are not presented
+  as Windows proof.
+
+## 0.62.0 - PHASE 60 Linux Idle and AC Power Sensors
+
+- Implements the Linux user-idle sensor behind the existing Phase 56
+  signed `apply-when-idle` worker. It selects the current UID's
+  interactive systemd-logind sessions, ignores manager/background and
+  closing sessions, returns zero for an explicitly active session, and
+  otherwise uses the minimum valid `IdleSinceHintMonotonic` age.
+- Implements the Linux AC-power sensor from `/sys/class/power_supply`
+  mains/battery state, falling back to logind `OnExternalPower` only when
+  sysfs is absent or inconclusive. Sensor subprocesses are direct,
+  bounded and shell-free.
+- Hardens the shared apply gate so an unknown required idle or AC reading
+  defers on every platform instead of being usable as implicit permission
+  outside Windows. Default `stage-only`, signed HTTPS policy, report
+  format and systemd units are unchanged.
+- Adds no registered tool (62), schema migration (v6), configuration key or
+  Python dependency.
+
+## 0.61.0 - PHASE 59 Linux systemd-user Auto-Upgrade Scheduler
+
+- Implements the reserved Linux scheduler profile behind the existing
+  direct `update auto-install-schedule`, `auto-uninstall-schedule`,
+  `auto-schedule-status` and `auto-status` commands and GUI controls. It
+  installs a managed per-user systemd one-shot service plus a persistent
+  hourly timer that wakes the unchanged signed `auto-run` worker.
+- Linux installation preflights `systemctl --user`, refuses unmanaged
+  same-named units or symlinks, writes units atomically, and restores the
+  prior managed units if daemon-reload/enable fails. Status degrades to
+  `unavailable` when no user manager is reachable; uninstall removes only
+  managed units and this timer's enablement link.
+- Keeps the signed HTTPS, downgrade, staging and report policies exactly
+  as Phase 56. Linux `stage-only` is functional; `apply-when-idle`
+  remains fail-closed on Linux until idle/power sensors are implemented.
+  The macOS LaunchAgent profile remains planned.
+- Adds no registered tool (62), schema migration (v6), configuration key or
+  Python dependency.
+
 ## 0.60.0 - PHASE 58 Windows Auto-Upgrade Lock Hotfix
 
 - Fixes the two real Windows Phase 56 failures in which a second

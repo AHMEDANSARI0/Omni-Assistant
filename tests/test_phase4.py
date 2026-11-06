@@ -717,7 +717,7 @@ def test_corrupt_pdf_skip_reason_without_pypdf_warning_noise(
 
 
 def test_phase4_version_and_web_settings_validation(tmp_path: Path) -> None:
-    assert __version__ == "0.60.0"
+    assert __version__ == "0.81.2"
     settings = Settings.from_env(
         tmp_path,
         environ={

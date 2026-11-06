@@ -1,8 +1,7 @@
 # Secrets / local config
 .env
 .env.local
-.env.example
-
+!.env.example
 
 # Python
 __pycache__/
@@ -29,6 +28,3 @@ workspace/*
 .idea/
 Thumbs.db
 desktop.ini
-hide
-.hide
-/hide

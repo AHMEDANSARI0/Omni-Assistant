@@ -370,7 +370,7 @@ def test_service_clock_rollback_fails_closed(tmp_path: Path) -> None:
 
 def test_license_repository_round_trip(tmp_path: Path) -> None:
     database = Database(tmp_path / "license.db")
-    assert database.initialize() == 6
+    assert database.initialize() == 18
     repository = LicenseRepository(database)
     repository.set_state("example", "one")
     repository.set_state("example", "two")

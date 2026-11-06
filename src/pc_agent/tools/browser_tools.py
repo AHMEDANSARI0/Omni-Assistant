@@ -195,6 +195,108 @@ def _screenshot(arguments: dict[str, Any], context: ToolContext) -> dict[str, An
     }
 
 
+def _wait(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    selector = str(arguments.get("selector") or "").strip()
+    text = str(arguments.get("text") or "").strip()
+    url_contains = str(arguments.get("url_contains") or "").strip()
+    if not (selector or text or url_contains):
+        raise ToolError("browser.wait needs selector, text or url_contains.")
+    timeout_value = arguments.get("timeout_seconds", 10)
+    if isinstance(timeout_value, bool) or not isinstance(timeout_value, int | float):
+        raise ToolError("timeout_seconds must be a number between 1 and 120.")
+    timeout = float(timeout_value)
+    if not 1 <= timeout <= 120:
+        raise ToolError("timeout_seconds must be between 1 and 120.")
+    session = _attach(context, arguments)
+    try:
+        result = session.wait_for(
+            selector=selector, text=text, url_contains=url_contains, timeout_seconds=timeout
+        )
+    finally:
+        session.close()
+    _audit(
+        context,
+        action="wait",
+        target=selector or text or url_contains,
+        status="ok" if result.get("matched") else "partial",
+        detail=f"matched={result.get('matched')}; attempts={result.get('attempts')}",
+    )
+    if not result.get("matched"):
+        raise ToolError(
+            "Timed out after "
+            f"{timeout:g}s waiting for "
+            + (f"selector {selector!r}" if selector else f"text {text!r}" if text else f"url containing {url_contains!r}")
+            + f" (url is {result.get('url')!r})."
+        )
+    return result
+
+
+def _tab_result(result: Any, key: str, target_id: str) -> dict[str, Any]:
+    """Normalise a tab-control reply.
+
+    The Windows CDP backend answers with a mapping, but a stubbed or older
+    backend may answer with a bare bool. Either way the tool must return a
+    declared contract instead of crashing on ``**result``.
+    """
+    if isinstance(result, dict):
+        payload = dict(result)
+        payload.setdefault(key, target_id)
+        return payload
+    return {key: target_id} if result else {}
+
+
+def _tabs(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+    action = str(arguments.get("action") or "list").strip().lower()
+    target_id = str(arguments.get("target_id") or "").strip()
+    client = _client(context)
+    if action == "list":
+        pages = [
+            {
+                "id": str(item.get("id") or ""),
+                "title": str(item.get("title") or "")[:200],
+                "url": str(item.get("url") or "")[:1000],
+            }
+            for item in client.targets()
+            if item.get("type") == "page"
+            and not str(item.get("url") or "").startswith("devtools://")
+        ][:30]
+        return {"action": "list", "pages": pages, "page_count": len(pages)}
+    if action == "activate":
+        payload = _tab_result(client.activate_tab(target_id), "activated", target_id)
+        _audit(context, action="activate_tab", target=target_id, status="ok")
+        return {**payload, "action": "activate"}
+    if action == "close":
+        payload = _tab_result(client.close_tab(target_id), "closed", target_id)
+        _audit(context, action="close_tab", target=target_id, status="ok")
+        return {**payload, "action": "close"}
+    raise ToolError("action must be one of: list, activate, close.")
+
+
+def _audit(
+    context: ToolContext,
+    *,
+    action: str,
+    target: str,
+    status: str,
+    detail: str = "",
+) -> None:
+    recorder = context.automation_recorder
+    if recorder is None:
+        return
+    recorder(
+        {
+            "kind": "browser",
+            "tool_id": "browser." + action.replace("_tab", ""),
+            "action": action,
+            "target": target,
+            "status": status,
+            "detail": detail,
+            "duration_ms": 0,
+            "allowed": status != "refused",
+        }
+    )
+
+
 def _specs() -> list[tuple[ToolSpec, ToolHandler]]:
     target_prop = {"target_id": _TARGET_ID_INPUT}
     return [
@@ -434,6 +536,93 @@ def _specs() -> list[tuple[ToolSpec, ToolHandler]]:
                 timeout_seconds=120.0,
             ),
             _screenshot,
+        ),
+        (
+            ToolSpec(
+                id="browser.wait",
+                name="Browser wait for condition",
+                version="1.0.0",
+                description=(
+                    "Wait until a page condition holds: a CSS selector exists, the body "
+                    "text contains a string, or the URL contains a string. Bounded to 120s "
+                    "and reports the observed match plus attempt count."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "selector": {"type": "string", "maxLength": 500},
+                        "text": {"type": "string", "maxLength": 500},
+                        "url_contains": {"type": "string", "maxLength": 500},
+                        "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 120},
+                        **target_prop,
+                    },
+                    "required": [],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "matched": {"type": "boolean"},
+                        "selector_seen": {"type": ["boolean", "null"]},
+                        "text_seen": {"type": ["boolean", "null"]},
+                        "url_seen": {"type": ["boolean", "null"]},
+                        "url": {"type": "string"},
+                        "title": {"type": "string"},
+                        "ready": {"type": "string"},
+                        "attempts": {"type": "integer"},
+                        "waited_ms": {"type": "integer"},
+                        "target_id": {"type": "string"},
+                    },
+                    "required": ["matched", "url", "attempts"],
+                },
+                permissions=(),
+                timeout_seconds=130.0,
+            ),
+            _wait,
+        ),
+        (
+            ToolSpec(
+                id="browser.tabs",
+                name="Browser tabs",
+                version="1.0.0",
+                description=(
+                    "List open page tabs, activate one by exact id, or close one by exact id. "
+                    "It refuses to close the last remaining page tab."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "activate", "close"]},
+                        "target_id": {"type": "string", "maxLength": 200},
+                    },
+                    "required": [],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string"},
+                        "page_count": {"type": "integer"},
+                        "pages": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "url": {"type": "string"},
+                                },
+                                "required": ["id"],
+                            },
+                        },
+                        "activated": {"type": "string"},
+                        "closed": {"type": "string"},
+                        "pages_remaining": {"type": "integer"},
+                    },
+                    "required": ["action"],
+                },
+                permissions=(),
+                timeout_seconds=30.0,
+            ),
+            _tabs,
         ),
     ]
 

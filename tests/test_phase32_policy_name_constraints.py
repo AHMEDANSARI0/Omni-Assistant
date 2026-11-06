@@ -574,11 +574,11 @@ def test_phase32_direct_cli_gui_scope_docs_and_registry() -> None:
     assert "required_policy_oids=required_policy_oids" in controller_source
     assert "inhibit_policy_mapping=inhibit_policy_mapping" in controller_source
 
-    assert __version__ == "0.60.0"
-    assert LATEST_SCHEMA_VERSION == 6
+    assert __version__ == "0.81.2"
+    assert LATEST_SCHEMA_VERSION == 18
     registry = build_default_registry()
     tools = registry.list_tools()
-    assert len(tools) == 62
+    assert len(tools) == 69
     assert not any(
         "policy" in tool.spec.id or "name_constraint" in tool.spec.id
         for tool in tools

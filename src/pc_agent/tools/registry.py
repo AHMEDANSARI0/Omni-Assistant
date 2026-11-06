@@ -48,12 +48,20 @@ class ToolContext:
     vision_allowed: bool = False
     vision_max_image_bytes: int = 10_000_000
     vision_router_factory: Callable[[], Any] | None = None
+    # Transformation Phase 8: knowledge tools need settings + database,
+    # which the isolated worker cannot reconstruct; like the vision
+    # factory this stays None there and knowledge.* is worker-excluded.
+    knowledge_service_factory: Callable[[], Any] | None = None
     command_allowlist: tuple[str, ...] = ()
     command_timeout_seconds: float = 60.0
     browser_allowed: bool = False
     browser_port: int = 9222
     browser_timeout_seconds: float = 20.0
     browser_client_factory: Callable[[], Any] | None = None
+    # Transformation Phase 11: best-effort audit hook for gated browser,
+    # desktop and vision actions. The worker has no database, so this is
+    # None there; tool_invocations still records every call.
+    automation_recorder: Callable[[dict[str, Any]], None] | None = None
 
     @classmethod
     def for_workspace(
@@ -73,6 +81,7 @@ class ToolContext:
         vision_allowed: bool = False,
         vision_max_image_bytes: int = 10_000_000,
         vision_router_factory: Callable[[], Any] | None = None,
+        knowledge_service_factory: Callable[[], Any] | None = None,
         subprocess_allowed: bool = False,
         command_allowlist: tuple[str, ...] = (),
         command_timeout_seconds: float = 60.0,
@@ -80,6 +89,7 @@ class ToolContext:
         browser_port: int = 9222,
         browser_timeout_seconds: float = 20.0,
         browser_client_factory: Callable[[], Any] | None = None,
+        automation_recorder: Callable[[dict[str, Any]], None] | None = None,
     ) -> ToolContext:
         resolved = workspace_dir.expanduser().resolve()
         roots = tuple(
@@ -117,12 +127,14 @@ class ToolContext:
             vision_allowed=vision_allowed,
             vision_max_image_bytes=vision_max_image_bytes,
             vision_router_factory=vision_router_factory,
+            knowledge_service_factory=knowledge_service_factory,
             command_allowlist=tuple(command_allowlist),
             command_timeout_seconds=command_timeout_seconds,
             browser_allowed=browser_allowed,
             browser_port=browser_port,
             browser_timeout_seconds=browser_timeout_seconds,
             browser_client_factory=browser_client_factory,
+            automation_recorder=automation_recorder,
         )
 
 
@@ -235,7 +247,8 @@ class ToolRegistry:
             if elapsed_ms > selected.spec.timeout_seconds * 1000:
                 return failure(
                     "Tool exceeded its declared timeout; its result was discarded. "
-                    "Hard timeout enforcement requires the isolated worker planned later."
+                    "Orchestrated calls are additionally bounded by the "
+                    "Safety Kernel hard deadline (Transformation Phase 2)."
                 )
             return ToolResult(
                 tool_id=tool_id,

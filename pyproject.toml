@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-healing-pc-agent"
-version = "0.60.0"
-description = "Autonomous self-healing PC AI agent (personal local core + GUI + verification/checkpoints + file/Office operations + verified workflow reuse + multi-step planning + core self-repair + task budgets + portable production releases + direct Anthropic provider + PDF text/page transforms + scanned PDF OCR + PDF table extraction + explicit online signed update downloads + PDF form inspection/filling + direct-only PDF password protection + PDF digital-signature inspection/creation + local PDF trust-chain/CRL validation + RFC 3161 PDF timestamping + opt-in online CRL/OCSP revocation + certificate-policy/name-constraint validation + opt-in system trust-store anchors + incremental multi-signature PDF signing + DocTimeStamp-only incremental revisions + LTV DSS embedding + PAdES Baseline B-B signature profile + Windows installer source packaging + secure .env provider-key cleanup + signed update-feed publishing + POSIX installer source packaging + Linux Secret Service credentials)"
+version = "0.81.2"
+description = "Windows-first, local-first self-healing PC AI agent (Transformation Phase 2 Safety Kernel)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
@@ -16,8 +16,12 @@ license = { text = "Proprietary" }
 # uses Pillow for bounded local image decoding/encoding and transformations.
 # Phase 22 uses pypdfium2/PDFium only to render selected PDF pages for gated OCR.
 # Phase 26 uses pypdf's crypto extra for standards-based AES PDF encryption.
+# Transformation Phase 1 also declares cryptography directly because the PDF
+# trust/signing modules import it themselves; it must not remain only a
+# transitive dependency of pypdf[crypto].
 dependencies = [
     "certifi>=2024.7.4",
+    "cryptography>=42,<51",
     "pypdf[crypto]>=5.0,<7",
     "pypdfium2>=5,<6",
     "Pillow>=10.4,<14",
@@ -31,7 +35,7 @@ dev = [
 ]
 
 [project.scripts]
-pc-agent = "pc_agent.cli:main"
+pc-agent = "pc_agent.entry:main"
 # Minimal bootstrap for repairing core files when the full CLI cannot import.
 pc-agent-self-repair = "pc_agent.self_repair_cli:main"
 # Vendor-only license issuing tool; customer production builds should keep

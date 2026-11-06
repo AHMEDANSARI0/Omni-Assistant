@@ -16,8 +16,13 @@ commands:
 
 The worker is a one-shot command invoked by the operating-system
 scheduler; it does not add a planner tool or a resident Python service.
-Windows Scheduled Task is the implemented scheduler in this phase.
-Linux systemd-user and macOS LaunchAgent profiles are reserved/planned.
+Windows Scheduled Task and the Linux systemd user timer are implemented.
+The macOS LaunchAgent profile remains reserved/planned.  Windows idle and
+AC-power state come from Win32.  Linux idle state comes from the current
+user's interactive systemd-logind sessions, while Linux AC state comes
+from ``/sys/class/power_supply`` with logind's external-power value as a
+fallback.  On every platform, an unknown required idle or power reading
+defers application instead of being treated as permission to apply.
 """
 
 from __future__ import annotations
@@ -28,13 +33,14 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 import urllib.parse
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from datetime import time as datetime_time
@@ -61,13 +67,27 @@ AUTO_UPGRADE_STATE_FILE = "auto-upgrade-state.json"
 AUTO_UPGRADE_LOCK_FILE = "auto-upgrade.lock"
 AUTO_UPGRADE_REPORT_DIR = "auto-upgrade-reports"
 WINDOWS_SCHEDULED_TASK_PROFILE = "windows-scheduled-task"
+LINUX_SYSTEMD_USER_PROFILE = "linux-systemd-user"
+MACOS_LAUNCHD_PROFILE = "macos-launchd"
 DEFAULT_AUTO_UPGRADE_TASK_NAME = "SelfHealingPCAgentAutoUpgrade"
+DEFAULT_LINUX_AUTO_UPGRADE_UNIT_NAME = "self-healing-pc-agent-auto-upgrade"
 
 _MAX_STATE_BYTES = 250_000
 _MAX_REPORT_BYTES = 1_000_000
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUN_ID_RE = re.compile(r"^auto-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$")
 _TASK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,79}$")
+_SYSTEMD_UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+_LINUX_SYSTEMD_MARKER = "X-SelfHealingPCAgent-Managed=auto-upgrade"
+_MAX_SYSTEMD_UNIT_BYTES = 64_000
+_LINUX_POWER_SUPPLY_ROOT = Path("/sys/class/power_supply")
+_LINUX_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_LINUX_INTERACTIVE_SESSION_CLASSES = frozenset(
+    {"lock-screen", "user", "user-early"}
+)
+_MAX_LINUX_SENSOR_OUTPUT_CHARS = 256_000
+_MAX_LINUX_SENSOR_SESSIONS = 32
+_MAX_LINUX_POWER_SUPPLIES = 128
 _MODES = frozenset({"stage-only", "apply-when-idle"})
 _ACTIVE_TASK_STATUSES = ("planning", "running", "verifying", "retrying")
 _CHECK_NAMES = (
@@ -147,14 +167,14 @@ AUTO_UPGRADE_SCHEDULER_PROFILES: tuple[AutoUpgradeSchedulerProfile, ...] = (
         "Hourly/logon one-shot worker for the signed-in Windows user.",
     ),
     AutoUpgradeSchedulerProfile(
-        "linux-systemd-user",
+        LINUX_SYSTEMD_USER_PROFILE,
         "linux",
         "Linux systemd user timer",
-        "planned",
-        "Reserved structure; Linux acceptance is deferred by request.",
+        "implemented",
+        "Per-user systemd service/timer that wakes the one-shot worker after boot/login and hourly.",
     ),
     AutoUpgradeSchedulerProfile(
-        "macos-launchd",
+        MACOS_LAUNCHD_PROFILE,
         "macos",
         "macOS LaunchAgent",
         "planned",
@@ -188,8 +208,7 @@ def _require_windows_scheduler(profile: AutoUpgradeSchedulerProfile) -> None:
     if not profile.implemented:
         raise PcAgentError(
             f"Auto-upgrade scheduler profile {profile.profile_id} is reserved "
-            f"for {profile.platform} but is not implemented in this "
-            "Windows-first phase."
+            f"for {profile.platform} but is not implemented in this build."
         )
 
 
@@ -197,11 +216,11 @@ def _raise_windows_scheduler_unavailable(platform_name: str | None) -> None:
     platform = _client_platform(platform_name)
     if platform == "linux":
         _require_windows_scheduler(
-            get_auto_upgrade_scheduler_profile("linux-systemd-user")
+            get_auto_upgrade_scheduler_profile(LINUX_SYSTEMD_USER_PROFILE)
         )
     if platform == "macos":
         _require_windows_scheduler(
-            get_auto_upgrade_scheduler_profile("macos-launchd")
+            get_auto_upgrade_scheduler_profile(MACOS_LAUNCHD_PROFILE)
         )
     raise PcAgentError(
         "The Windows auto-upgrade scheduler can run only on Windows."
@@ -269,6 +288,10 @@ def _client_platform(raw: str | None = None) -> str:
 
 def _is_windows(platform_name: str | None = None) -> bool:
     return _client_platform(platform_name) == "windows"
+
+
+def _is_linux(platform_name: str | None = None) -> bool:
+    return _client_platform(platform_name) == "linux"
 
 
 def _ensure_auto_root(settings: Settings) -> Path:
@@ -575,9 +598,228 @@ def count_active_tasks(settings: Settings) -> int:
     return int(row[0]) if row is not None else 0
 
 
-def get_idle_seconds(platform_name: str | None = None) -> float | None:
-    """Return Windows user idle time; ``None`` means unavailable."""
+def _default_linux_sensor_runner(
+    argv: Sequence[str], timeout: float
+) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    # loginctl must talk to the canonical system logind instance.  A stray
+    # user-controlled system-bus address must not be able to fabricate an
+    # idle or external-power reading for the background apply gate.
+    env.pop("DBUS_SYSTEM_BUS_ADDRESS", None)
+    return subprocess.run(
+        [str(part) for part in argv],
+        capture_output=True,
+        env=env,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
 
+
+def _run_linux_sensor_command(
+    argv: Sequence[str],
+    *,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None,
+) -> str | None:
+    try:
+        completed = (runner or _default_linux_sensor_runner)(argv, 5.0)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if completed.returncode != 0 or not isinstance(completed.stdout, str):
+        return None
+    if len(completed.stdout) > _MAX_LINUX_SENSOR_OUTPUT_CHARS:
+        return None
+    return completed.stdout
+
+
+def _parse_loginctl_properties(text: str) -> dict[str, str] | None:
+    properties: dict[str, str] = {}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or len(lines) > 128:
+        return None
+    for line in lines:
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if (
+            not separator
+            or not key
+            or len(key) > 64
+            or not key.replace("_", "").isalnum()
+            or key in properties
+        ):
+            return None
+        properties[key] = value.strip()
+    return properties
+
+
+def _parse_nonnegative_int(value: str | None) -> int | None:
+    if value is None or not re.fullmatch(r"[0-9]{1,20}", value.strip()):
+        return None
+    return int(value)
+
+
+def _linux_session_ids_for_uid(
+    text: str, *, uid: int
+) -> list[str] | None:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list) or len(payload) > 512:
+        return None
+    session_ids: list[str] = []
+    seen: set[str] = set()
+    for row in payload:
+        if not isinstance(row, dict):
+            return None
+        row_uid = row.get("uid")
+        row_session = row.get("session")
+        if (
+            isinstance(row_uid, bool)
+            or not isinstance(row_uid, int)
+            or row_uid < 0
+            or not isinstance(row_session, str)
+            or _LINUX_SESSION_ID_RE.fullmatch(row_session) is None
+        ):
+            return None
+        if row_uid != uid:
+            continue
+        if row_session in seen:
+            return None
+        seen.add(row_session)
+        session_ids.append(row_session)
+        if len(session_ids) > _MAX_LINUX_SENSOR_SESSIONS:
+            return None
+    return session_ids
+
+
+def _get_linux_idle_seconds(
+    *,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None,
+    loginctl: str,
+    linux_uid: int | None,
+    monotonic_seconds: float | None,
+) -> float | None:
+    if linux_uid is not None:
+        uid = linux_uid
+    elif hasattr(os, "getuid"):
+        uid = int(os.getuid())  # type: ignore[attr-defined]
+    else:
+        return None
+    if isinstance(uid, bool) or uid < 0:
+        return None
+
+    list_output = _run_linux_sensor_command(
+        [
+            loginctl,
+            "--no-ask-password",
+            "--no-pager",
+            "list-sessions",
+            "--json=short",
+        ],
+        runner=runner,
+    )
+    if list_output is None:
+        return None
+    session_ids = _linux_session_ids_for_uid(list_output, uid=uid)
+    if not session_ids:
+        return None
+
+    now_us = round(
+        (time.monotonic() if monotonic_seconds is None else monotonic_seconds)
+        * 1_000_000
+    )
+    if now_us < 0:
+        return None
+
+    idle_values: list[float] = []
+    for session_id in session_ids:
+        show_output = _run_linux_sensor_command(
+            [
+                loginctl,
+                "--no-ask-password",
+                "--no-pager",
+                "show-session",
+                session_id,
+                "--property=Id",
+                "--property=Class",
+                "--property=State",
+                "--property=IdleHint",
+                "--property=IdleSinceHintMonotonic",
+            ],
+            runner=runner,
+        )
+        if show_output is None:
+            return None
+        properties = _parse_loginctl_properties(show_output)
+        if properties is None or properties.get("Id") != session_id:
+            return None
+        session_class = properties.get("Class", "").strip().lower()
+        if session_class not in _LINUX_INTERACTIVE_SESSION_CLASSES:
+            # User-manager/background sessions do not represent keyboard or
+            # pointer activity.  Unknown classes are deliberately ignored
+            # here, but the function still returns None below unless at
+            # least one real interactive session supplied a valid reading.
+            continue
+        state = properties.get("State", "").strip().lower()
+        if state == "closing":
+            continue
+        if state not in {"active", "online"}:
+            return None
+        idle_hint = properties.get("IdleHint", "").strip().lower()
+        if idle_hint == "no":
+            return 0.0
+        if idle_hint != "yes":
+            return None
+        idle_since_us = _parse_nonnegative_int(
+            properties.get("IdleSinceHintMonotonic")
+        )
+        if idle_since_us is None or idle_since_us <= 0:
+            return None
+        # Allow one second of clock/reporting skew, but never accept a
+        # future or sentinel timestamp as a huge idle interval.
+        if idle_since_us > now_us + 1_000_000:
+            return None
+        idle_values.append(max(0, now_us - idle_since_us) / 1_000_000.0)
+
+    if not idle_values:
+        return None
+    return min(idle_values)
+
+
+def get_idle_seconds(
+    platform_name: str | None = None,
+    *,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
+    loginctl: str = "loginctl",
+    linux_uid: int | None = None,
+    monotonic_seconds: float | None = None,
+) -> float | None:
+    """Return user idle time in seconds; ``None`` means unavailable.
+
+    Windows uses ``GetLastInputInfo``.  Linux uses systemd-logind's
+    per-session idle hint and monotonic timestamp for interactive sessions
+    belonging to the current UID.  Unsupported or ambiguous readings are
+    always ``None`` so the apply gate can fail closed.
+    """
+
+    if _is_linux(platform_name):
+        return _get_linux_idle_seconds(
+            runner=runner,
+            loginctl=loginctl,
+            linux_uid=linux_uid,
+            monotonic_seconds=monotonic_seconds,
+        )
     if not _is_windows(platform_name):
         return None
     try:
@@ -601,9 +843,132 @@ def get_idle_seconds(platform_name: str | None = None) -> float | None:
         return None
 
 
-def get_ac_power(platform_name: str | None = None) -> bool | None:
-    """Return Windows AC-line state; ``None`` means unavailable/unknown."""
+def _read_power_supply_value(path: Path) -> str | None:
+    try:
+        with path.open("r", encoding="ascii") as handle:
+            value = handle.read(129)
+    except (OSError, UnicodeDecodeError):
+        return None
+    if len(value) > 128:
+        return None
+    value = value.strip()
+    return value if value else None
 
+
+def _get_linux_ac_power_from_sysfs(root: Path) -> bool | None:
+    try:
+        entries = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return None
+    if not entries or len(entries) > _MAX_LINUX_POWER_SUPPLIES:
+        return None
+
+    mains_seen = False
+    mains_online = False
+    mains_unknown = False
+    battery_statuses: list[str] = []
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue
+        supply_type = _read_power_supply_value(entry / "type")
+        if supply_type is None:
+            continue
+        supply_type = supply_type.lower()
+        if supply_type == "mains":
+            online = _read_power_supply_value(entry / "online")
+            if online == "1":
+                mains_seen = True
+                mains_online = True
+            elif online == "0":
+                mains_seen = True
+            else:
+                mains_unknown = True
+        elif supply_type == "battery":
+            present = _read_power_supply_value(entry / "present")
+            if present == "0":
+                continue
+            status = _read_power_supply_value(entry / "status")
+            if status is not None:
+                battery_statuses.append(status.lower())
+
+    if mains_online:
+        return True
+    if mains_unknown:
+        return None
+    if mains_seen:
+        return False
+    if not battery_statuses:
+        return None
+    if any(status == "discharging" for status in battery_statuses):
+        return False
+    if all(status in {"charging", "full"} for status in battery_statuses):
+        return True
+    return None
+
+
+def _get_linux_ac_power_from_logind(
+    *,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None,
+    loginctl: str,
+) -> bool | None:
+    output = _run_linux_sensor_command(
+        [
+            loginctl,
+            "--no-ask-password",
+            "--no-pager",
+            "show-session",
+            "--property=OnExternalPower",
+        ],
+        runner=runner,
+    )
+    if output is None:
+        return None
+    properties = _parse_loginctl_properties(output)
+    if properties is None or set(properties) != {"OnExternalPower"}:
+        return None
+    value = properties["OnExternalPower"].strip().lower()
+    if value == "yes":
+        return True
+    if value == "no":
+        return False
+    return None
+
+
+def get_ac_power(
+    platform_name: str | None = None,
+    *,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
+    loginctl: str = "loginctl",
+    power_supply_root: Path | None = None,
+) -> bool | None:
+    """Return AC/external-power state; ``None`` means unknown.
+
+    Windows uses ``GetSystemPowerStatus``.  Linux first reads the kernel
+    power-supply ABI and only then falls back to logind's
+    ``OnExternalPower`` manager property, which also covers desktops and
+    virtual machines that expose no battery or mains supply.
+    """
+
+    if _is_linux(platform_name):
+        sysfs_result = _get_linux_ac_power_from_sysfs(
+            _LINUX_POWER_SUPPLY_ROOT
+            if power_supply_root is None
+            else power_supply_root.expanduser()
+        )
+        if sysfs_result is not None:
+            return sysfs_result
+        return _get_linux_ac_power_from_logind(
+            runner=runner, loginctl=loginctl
+        )
     if not _is_windows(platform_name):
         return None
     try:
@@ -790,6 +1155,15 @@ class AutoUpgradeReportVerification:
 
 
 @dataclass(frozen=True, slots=True)
+class LinuxAutoUpgradeSystemdUnits:
+    unit_name: str
+    service_name: str
+    timer_name: str
+    service_text: str
+    timer_text: str
+
+
+@dataclass(frozen=True, slots=True)
 class AutoUpgradeSchedulerResult:
     profile: str
     platform: str
@@ -916,17 +1290,20 @@ def _apply_gates(
         reasons.append("outside_maintenance_window")
     if active_task_count > 0:
         reasons.append("active_tasks")
+    # ``platform_name`` is retained in the report context, but permission
+    # to apply never depends on a platform-specific exception: whenever a
+    # sensor reading is required, unknown means defer on every platform.
+    del platform_name
     required_idle = int(settings.auto_upgrade_idle_minutes) * 60
     if required_idle > 0:
         if idle_seconds is None:
-            if _is_windows(platform_name):
-                reasons.append("idle_unknown")
+            reasons.append("idle_unknown")
         elif idle_seconds < required_idle:
             reasons.append("user_not_idle")
     if settings.auto_upgrade_require_ac_power:
         if on_ac_power is False:
             reasons.append("on_battery")
-        elif on_ac_power is None and _is_windows(platform_name):
+        elif on_ac_power is None:
             reasons.append("ac_power_unknown")
 
     report.active_task_count = active_task_count
@@ -1509,24 +1886,34 @@ def get_auto_upgrade_status(
     ]
     | None = None,
     platform_name: str | None = None,
+    scheduler_config_home: Path | None = None,
+    scheduler_systemctl: str = "systemctl",
 ) -> AutoUpgradeStatus:
     state = _read_state(settings)
     blockers = tuple(_config_blockers(settings)) if settings.auto_upgrade_enabled else ()
     pending = _pending_staged_update(settings)
+    client_platform = _client_platform(platform_name)
+    scheduler_profile = {
+        "windows": WINDOWS_SCHEDULED_TASK_PROFILE,
+        "linux": LINUX_SYSTEMD_USER_PROFILE,
+        "macos": MACOS_LAUNCHD_PROFILE,
+    }.get(client_platform, "unsupported")
     scheduler = None
-    if include_scheduler and _is_windows(platform_name):
-        scheduler = get_windows_auto_upgrade_schedule(
+    if include_scheduler and client_platform in {"windows", "linux"}:
+        scheduler = get_auto_upgrade_schedule(
             task_name=task_name,
             runner=scheduler_runner,
             platform_name=platform_name,
+            config_home=scheduler_config_home,
+            systemctl=scheduler_systemctl,
         )
     return AutoUpgradeStatus(
         enabled=settings.auto_upgrade_enabled,
         ready=settings.auto_upgrade_enabled and not blockers,
         blockers=blockers,
         mode=settings.auto_upgrade_mode,
-        scheduler_profile=WINDOWS_SCHEDULED_TASK_PROFILE,
-        scheduler_platform="windows",
+        scheduler_profile=scheduler_profile,
+        scheduler_platform=client_platform,
         state_path=auto_upgrade_state_path(settings),
         state=state,
         pending_update_id=pending.update_id if pending else None,
@@ -1715,7 +2102,7 @@ def _resolve_pc_agent_executable(settings: Settings, raw: Path | None) -> Path:
     if discovered:
         return Path(discovered).resolve()
     raise PcAgentError(
-        "Could not find pc-agent.exe in the application .venv; pass --executable."
+        "Could not find pc-agent in the application .venv; pass --executable."
     )
 
 
@@ -1930,6 +2317,632 @@ def get_windows_auto_upgrade_schedule(
     )
 
 
+def _validate_systemd_unit_name(raw: str) -> str:
+    value = raw.strip()
+    if value == DEFAULT_AUTO_UPGRADE_TASK_NAME:
+        return DEFAULT_LINUX_AUTO_UPGRADE_UNIT_NAME
+    if value.endswith((".service", ".timer")):
+        raise PcAgentError(
+            "Linux auto-upgrade unit name must be the base name without "
+            ".service or .timer."
+        )
+    if _SYSTEMD_UNIT_NAME_RE.fullmatch(value) is None:
+        raise PcAgentError(
+            "Linux auto-upgrade unit name must be 1-80 safe characters."
+        )
+    return value
+
+
+def _require_linux_scheduler(platform_name: str | None) -> None:
+    platform = _client_platform(platform_name)
+    if platform == "linux":
+        return
+    if platform == "macos":
+        _require_windows_scheduler(
+            get_auto_upgrade_scheduler_profile(MACOS_LAUNCHD_PROFILE)
+        )
+    raise PcAgentError(
+        "The Linux systemd auto-upgrade scheduler can run only on Linux."
+    )
+
+
+def _systemd_escape(value: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise PcAgentError(
+            "Linux auto-upgrade scheduler paths must not contain control "
+            "characters."
+        )
+    return value.replace("%", "%%")
+
+
+def build_linux_auto_upgrade_systemd_units(
+    settings: Settings,
+    *,
+    unit_name: str = DEFAULT_LINUX_AUTO_UPGRADE_UNIT_NAME,
+    executable: Path | None = None,
+) -> LinuxAutoUpgradeSystemdUnits:
+    """Build the exact per-user systemd service and timer unit texts."""
+
+    clean_unit = _validate_systemd_unit_name(unit_name)
+    root = settings.root_dir.expanduser().resolve()
+    exe = _resolve_pc_agent_executable(settings, executable)
+    service_name = f"{clean_unit}.service"
+    timer_name = f"{clean_unit}.timer"
+    exec_start = _systemd_escape(
+        shlex.join(
+            [str(exe), "--root", str(root), "update", "auto-run"]
+        )
+    )
+    service_text = "\n".join(
+        [
+            "# Managed by Self-Healing PC Agent. Do not add secrets here.",
+            "[Unit]",
+            "Description=Self-Healing PC Agent signed background auto-upgrade check",
+            _LINUX_SYSTEMD_MARKER,
+            "",
+            "[Service]",
+            "Type=oneshot",
+            f"WorkingDirectory={_systemd_escape(str(root))}",
+            f"ExecStart={exec_start}",
+            "TimeoutStartSec=1h",
+            "NoNewPrivileges=true",
+            "PrivateTmp=true",
+            "UMask=0077",
+            "",
+        ]
+    )
+    timer_text = "\n".join(
+        [
+            "# Managed by Self-Healing PC Agent. Do not add secrets here.",
+            "[Unit]",
+            "Description=Hourly Self-Healing PC Agent signed auto-upgrade check",
+            _LINUX_SYSTEMD_MARKER,
+            "",
+            "[Timer]",
+            "OnBootSec=5min",
+            "OnUnitInactiveSec=1h",
+            "RandomizedDelaySec=5min",
+            "AccuracySec=1min",
+            "Persistent=true",
+            f"Unit={service_name}",
+            "",
+            "[Install]",
+            "WantedBy=timers.target",
+            "",
+        ]
+    )
+    return LinuxAutoUpgradeSystemdUnits(
+        unit_name=clean_unit,
+        service_name=service_name,
+        timer_name=timer_name,
+        service_text=service_text,
+        timer_text=timer_text,
+    )
+
+
+def _systemd_user_unit_dir(
+    *,
+    config_home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    if config_home is not None:
+        base = config_home.expanduser()
+    else:
+        env = os.environ if environ is None else environ
+        xdg_value = str(env.get("XDG_CONFIG_HOME", "")).strip()
+        if xdg_value and Path(xdg_value).expanduser().is_absolute():
+            base = Path(xdg_value).expanduser()
+        else:
+            home_value = str(env.get("HOME", "")).strip()
+            home = (
+                Path(home_value).expanduser()
+                if home_value and Path(home_value).expanduser().is_absolute()
+                else Path.home()
+            )
+            base = home / ".config"
+    return base / "systemd" / "user"
+
+
+def _linux_systemd_paths(
+    unit_name: str,
+    *,
+    config_home: Path | None,
+    environ: Mapping[str, str] | None,
+) -> tuple[Path, Path, Path]:
+    unit_dir = _systemd_user_unit_dir(
+        config_home=config_home, environ=environ
+    )
+    return (
+        unit_dir,
+        unit_dir / f"{unit_name}.service",
+        unit_dir / f"{unit_name}.timer",
+    )
+
+
+def _read_managed_systemd_unit(path: Path) -> str | None:
+    if path.is_symlink():
+        raise PcAgentError(
+            f"Linux auto-upgrade unit must not be a symbolic link: {path}."
+        )
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise PcAgentError(f"Linux auto-upgrade unit is not a file: {path}.")
+    if path.stat().st_size > _MAX_SYSTEMD_UNIT_BYTES:
+        raise PcAgentError(f"Linux auto-upgrade unit is too large: {path}.")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PcAgentError(
+            f"Linux auto-upgrade unit is unreadable: {path}."
+        ) from exc
+    if _LINUX_SYSTEMD_MARKER not in text:
+        raise PcAgentError(
+            "Refusing to overwrite or remove an unmanaged systemd unit: "
+            f"{path}."
+        )
+    return text
+
+
+def _systemd_unit_kind(path: Path) -> str:
+    if path.is_symlink():
+        return "unmanaged"
+    if not path.exists():
+        return "missing"
+    if not path.is_file() or path.stat().st_size > _MAX_SYSTEMD_UNIT_BYTES:
+        return "unmanaged"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "unmanaged"
+    return "managed" if _LINUX_SYSTEMD_MARKER in text else "unmanaged"
+
+
+def _atomic_write_systemd_unit(path: Path, text: str) -> None:
+    if path.is_symlink():
+        raise PcAgentError(
+            f"Linux auto-upgrade unit must not be a symbolic link: {path}."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{secrets.token_hex(4)}")
+    try:
+        temporary.write_text(text, encoding="utf-8", newline="\n")
+        temporary.chmod(0o644)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _restore_systemd_unit(path: Path, prior_text: str | None) -> None:
+    if prior_text is None:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        return
+    _atomic_write_systemd_unit(path, prior_text)
+
+
+def _run_systemd_user_command(
+    argv: Sequence[str],
+    *,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None,
+    action: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        completed = (runner or _default_scheduler_runner)(argv, 120.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PcAgentError(
+            f"Linux systemd auto-upgrade scheduler {action} failed: {exc}"
+        ) from exc
+    if completed.returncode != 0:
+        detail = _sanitize_error(completed.stderr or completed.stdout)
+        raise PcAgentError(
+            f"Linux systemd auto-upgrade scheduler {action} failed: {detail}"
+        )
+    return completed
+
+
+def _try_systemd_user_command(
+    argv: Sequence[str],
+    *,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None,
+) -> bool:
+    try:
+        completed = (runner or _default_scheduler_runner)(argv, 120.0)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def install_linux_auto_upgrade_schedule(
+    settings: Settings,
+    *,
+    unit_name: str = DEFAULT_LINUX_AUTO_UPGRADE_UNIT_NAME,
+    executable: Path | None = None,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
+    platform_name: str | None = None,
+    config_home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    systemctl: str = "systemctl",
+) -> AutoUpgradeSchedulerResult:
+    """Install/enable the per-user systemd timer, rolling back on failure."""
+
+    profile = get_auto_upgrade_scheduler_profile(LINUX_SYSTEMD_USER_PROFILE)
+    _require_linux_scheduler(platform_name)
+    clean_unit = _validate_systemd_unit_name(unit_name)
+    exe = _resolve_pc_agent_executable(settings, executable)
+    units = build_linux_auto_upgrade_systemd_units(
+        settings, unit_name=clean_unit, executable=exe
+    )
+    _unit_dir, service_path, timer_path = _linux_systemd_paths(
+        clean_unit, config_home=config_home, environ=environ
+    )
+    prior_service = _read_managed_systemd_unit(service_path)
+    prior_timer = _read_managed_systemd_unit(timer_path)
+
+    _run_systemd_user_command(
+        [systemctl, "--user", "show-environment"],
+        runner=runner,
+        action="preflight",
+    )
+
+    written: list[tuple[Path, str | None]] = []
+    try:
+        _atomic_write_systemd_unit(service_path, units.service_text)
+        written.append((service_path, prior_service))
+        _atomic_write_systemd_unit(timer_path, units.timer_text)
+        written.append((timer_path, prior_timer))
+        _run_systemd_user_command(
+            [systemctl, "--user", "daemon-reload"],
+            runner=runner,
+            action="daemon-reload",
+        )
+        _run_systemd_user_command(
+            [systemctl, "--user", "enable", "--now", units.timer_name],
+            runner=runner,
+            action="enable",
+        )
+    except (OSError, PcAgentError) as exc:
+        rollback_error: Exception | None = None
+        for path, prior_text in reversed(written):
+            try:
+                _restore_systemd_unit(path, prior_text)
+            except (OSError, PcAgentError) as rollback_exc:
+                rollback_error = rollback_exc
+        _try_systemd_user_command(
+            [systemctl, "--user", "daemon-reload"], runner=runner
+        )
+        if rollback_error is not None:
+            raise PcAgentError(
+                "Linux systemd auto-upgrade scheduler install failed and "
+                f"unit rollback also failed: {rollback_error}"
+            ) from exc
+        raise
+
+    return AutoUpgradeSchedulerResult(
+        profile=profile.profile_id,
+        platform=profile.platform,
+        task_name=clean_unit,
+        installed=True,
+        state="enabled",
+        executable=str(exe),
+        detail=(
+            "Linux systemd user timer installed and enabled for boot/login "
+            "plus hourly one-shot wakeups."
+        ),
+    )
+
+
+def uninstall_linux_auto_upgrade_schedule(
+    *,
+    unit_name: str = DEFAULT_LINUX_AUTO_UPGRADE_UNIT_NAME,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
+    platform_name: str | None = None,
+    config_home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    systemctl: str = "systemctl",
+) -> AutoUpgradeSchedulerResult:
+    """Disable/remove only the managed systemd user service and timer."""
+
+    profile = get_auto_upgrade_scheduler_profile(LINUX_SYSTEMD_USER_PROFILE)
+    _require_linux_scheduler(platform_name)
+    clean_unit = _validate_systemd_unit_name(unit_name)
+    service_name = f"{clean_unit}.service"
+    timer_name = f"{clean_unit}.timer"
+    unit_dir, service_path, timer_path = _linux_systemd_paths(
+        clean_unit, config_home=config_home, environ=environ
+    )
+    _read_managed_systemd_unit(service_path)
+    _read_managed_systemd_unit(timer_path)
+
+    disable_succeeded = False
+    if _try_systemd_user_command(
+        [systemctl, "--user", "daemon-reload"], runner=runner
+    ):
+        disable_succeeded = _try_systemd_user_command(
+            [systemctl, "--user", "disable", "--now", timer_name],
+            runner=runner,
+        )
+
+    for path in (timer_path, service_path):
+        if path.is_file() and not path.is_symlink():
+            path.unlink()
+    wants_link = unit_dir / "timers.target.wants" / timer_name
+    if wants_link.is_symlink():
+        target_name = Path(os.readlink(wants_link)).name
+        if target_name == timer_name:
+            wants_link.unlink()
+    _try_systemd_user_command(
+        [systemctl, "--user", "daemon-reload"], runner=runner
+    )
+    _try_systemd_user_command(
+        [systemctl, "--user", "reset-failed", service_name, timer_name],
+        runner=runner,
+    )
+    detail = (
+        "Linux systemd user timer disabled and managed unit files removed."
+        if disable_succeeded
+        else (
+            "Managed Linux systemd unit files removed; the user manager "
+            "could not confirm disable, so enablement state should be "
+            "checked when it is available."
+        )
+    )
+    return AutoUpgradeSchedulerResult(
+        profile=profile.profile_id,
+        platform=profile.platform,
+        task_name=clean_unit,
+        installed=False,
+        state=None,
+        executable=None,
+        detail=detail,
+    )
+
+
+def _safe_systemd_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    clean = value.strip()
+    if not clean or len(clean) > 80:
+        return None
+    if any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/" for character in clean):
+        return None
+    return clean
+
+
+def get_linux_auto_upgrade_schedule(
+    *,
+    unit_name: str = DEFAULT_LINUX_AUTO_UPGRADE_UNIT_NAME,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
+    platform_name: str | None = None,
+    config_home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    systemctl: str = "systemctl",
+) -> AutoUpgradeSchedulerResult:
+    """Read managed systemd timer state without making status fail hard."""
+
+    profile = get_auto_upgrade_scheduler_profile(LINUX_SYSTEMD_USER_PROFILE)
+    _require_linux_scheduler(platform_name)
+    clean_unit = _validate_systemd_unit_name(unit_name)
+    timer_name = f"{clean_unit}.timer"
+    unit_dir, service_path, timer_path = _linux_systemd_paths(
+        clean_unit, config_home=config_home, environ=environ
+    )
+    service_kind = _systemd_unit_kind(service_path)
+    timer_kind = _systemd_unit_kind(timer_path)
+    both_managed = service_kind == timer_kind == "managed"
+    unmanaged = "unmanaged" in {service_kind, timer_kind}
+    wants_link = unit_dir / "timers.target.wants" / timer_name
+    wants_exists = wants_link.is_symlink()
+
+    properties: dict[str, str] = {}
+    manager_error = ""
+    try:
+        completed = _run_systemd_user_command(
+            [
+                systemctl,
+                "--user",
+                "show",
+                timer_name,
+                "--property=LoadState,ActiveState,SubState,UnitFileState",
+            ],
+            runner=runner,
+            action="status",
+        )
+        for line in completed.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                properties[key.strip()] = value.strip()
+    except PcAgentError as exc:
+        manager_error = _sanitize_error(exc)
+
+    if "LoadState" in properties:
+        load_state = _safe_systemd_value(properties.get("LoadState"))
+        active_state = _safe_systemd_value(properties.get("ActiveState"))
+        sub_state = _safe_systemd_value(properties.get("SubState"))
+        unit_file_state = _safe_systemd_value(
+            properties.get("UnitFileState")
+        )
+        installed = bool(
+            both_managed
+            and (
+                unit_file_state in {"enabled", "enabled-runtime"}
+                or active_state == "active"
+            )
+        )
+        state = "/".join(
+            part for part in (active_state, sub_state) if part is not None
+        ) or unit_file_state or load_state
+        detail = (
+            "Linux systemd user timer status: "
+            f"load={load_state}; active={active_state}; "
+            f"sub={sub_state}; unit_file={unit_file_state}; "
+            f"files={service_kind}/{timer_kind}."
+        )
+    else:
+        installed = bool(both_managed and wants_exists)
+        state = "unavailable"
+        detail = (
+            "Linux systemd user manager status is unavailable"
+            + (f": {manager_error}" if manager_error else "")
+            + f"; files={service_kind}/{timer_kind}; "
+            f"enable_link={wants_exists}."
+        )
+    if unmanaged:
+        installed = False
+        detail += (
+            " Existing unit files are not managed by this application and "
+            "will not be overwritten or removed."
+        )
+    return AutoUpgradeSchedulerResult(
+        profile=profile.profile_id,
+        platform=profile.platform,
+        task_name=clean_unit,
+        installed=installed,
+        state=state,
+        executable=None,
+        detail=detail,
+    )
+
+
+def install_auto_upgrade_schedule(
+    settings: Settings,
+    *,
+    task_name: str = DEFAULT_AUTO_UPGRADE_TASK_NAME,
+    executable: Path | None = None,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
+    platform_name: str | None = None,
+    config_home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    systemctl: str = "systemctl",
+) -> AutoUpgradeSchedulerResult:
+    """Install the implemented scheduler for the current platform."""
+
+    platform = _client_platform(platform_name)
+    if platform == "windows":
+        return install_windows_auto_upgrade_schedule(
+            settings,
+            task_name=task_name,
+            executable=executable,
+            runner=runner,
+            platform_name=platform_name,
+        )
+    if platform == "linux":
+        return install_linux_auto_upgrade_schedule(
+            settings,
+            unit_name=task_name,
+            executable=executable,
+            runner=runner,
+            platform_name=platform_name,
+            config_home=config_home,
+            environ=environ,
+            systemctl=systemctl,
+        )
+    if platform == "macos":
+        _require_windows_scheduler(
+            get_auto_upgrade_scheduler_profile(MACOS_LAUNCHD_PROFILE)
+        )
+    raise PcAgentError(
+        "No auto-upgrade scheduler is implemented for this platform."
+    )
+
+
+def uninstall_auto_upgrade_schedule(
+    *,
+    task_name: str = DEFAULT_AUTO_UPGRADE_TASK_NAME,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
+    platform_name: str | None = None,
+    config_home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    systemctl: str = "systemctl",
+) -> AutoUpgradeSchedulerResult:
+    """Remove the implemented scheduler for the current platform."""
+
+    platform = _client_platform(platform_name)
+    if platform == "windows":
+        return uninstall_windows_auto_upgrade_schedule(
+            task_name=task_name,
+            runner=runner,
+            platform_name=platform_name,
+        )
+    if platform == "linux":
+        return uninstall_linux_auto_upgrade_schedule(
+            unit_name=task_name,
+            runner=runner,
+            platform_name=platform_name,
+            config_home=config_home,
+            environ=environ,
+            systemctl=systemctl,
+        )
+    if platform == "macos":
+        _require_windows_scheduler(
+            get_auto_upgrade_scheduler_profile(MACOS_LAUNCHD_PROFILE)
+        )
+    raise PcAgentError(
+        "No auto-upgrade scheduler is implemented for this platform."
+    )
+
+
+def get_auto_upgrade_schedule(
+    *,
+    task_name: str = DEFAULT_AUTO_UPGRADE_TASK_NAME,
+    runner: Callable[
+        [Sequence[str], float], subprocess.CompletedProcess[str]
+    ]
+    | None = None,
+    platform_name: str | None = None,
+    config_home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    systemctl: str = "systemctl",
+) -> AutoUpgradeSchedulerResult:
+    """Read the implemented scheduler state for the current platform."""
+
+    platform = _client_platform(platform_name)
+    if platform == "windows":
+        return get_windows_auto_upgrade_schedule(
+            task_name=task_name,
+            runner=runner,
+            platform_name=platform_name,
+        )
+    if platform == "linux":
+        return get_linux_auto_upgrade_schedule(
+            unit_name=task_name,
+            runner=runner,
+            platform_name=platform_name,
+            config_home=config_home,
+            environ=environ,
+            systemctl=systemctl,
+        )
+    if platform == "macos":
+        _require_windows_scheduler(
+            get_auto_upgrade_scheduler_profile(MACOS_LAUNCHD_PROFILE)
+        )
+    raise PcAgentError(
+        "No auto-upgrade scheduler is implemented for this platform."
+    )
+
+
 __all__ = [
     "AUTO_UPGRADE_FORMAT",
     "AUTO_UPGRADE_LOCK_FILE",
@@ -1937,23 +2950,34 @@ __all__ = [
     "AUTO_UPGRADE_SCHEDULER_PROFILES",
     "AUTO_UPGRADE_STATE_FILE",
     "DEFAULT_AUTO_UPGRADE_TASK_NAME",
+    "DEFAULT_LINUX_AUTO_UPGRADE_UNIT_NAME",
+    "LINUX_SYSTEMD_USER_PROFILE",
+    "MACOS_LAUNCHD_PROFILE",
     "WINDOWS_SCHEDULED_TASK_PROFILE",
     "AutoUpgradeReportVerification",
     "AutoUpgradeRunReport",
     "AutoUpgradeSchedulerProfile",
     "AutoUpgradeSchedulerResult",
     "AutoUpgradeStatus",
+    "LinuxAutoUpgradeSystemdUnits",
     "auto_upgrade_state_path",
+    "build_linux_auto_upgrade_systemd_units",
     "build_windows_auto_upgrade_task_script",
     "count_active_tasks",
     "get_ac_power",
+    "get_auto_upgrade_schedule",
     "get_auto_upgrade_scheduler_profile",
     "get_auto_upgrade_status",
     "get_idle_seconds",
+    "get_linux_auto_upgrade_schedule",
     "get_windows_auto_upgrade_schedule",
+    "install_auto_upgrade_schedule",
+    "install_linux_auto_upgrade_schedule",
     "install_windows_auto_upgrade_schedule",
     "list_auto_upgrade_scheduler_profiles",
     "run_auto_upgrade",
+    "uninstall_auto_upgrade_schedule",
+    "uninstall_linux_auto_upgrade_schedule",
     "uninstall_windows_auto_upgrade_schedule",
     "verify_auto_upgrade_report",
 ]
