@@ -192,3 +192,28 @@ The tree is **release-ready for a local-first, single-user Windows install** wit
 the caveats in section 8. No check is failing, no capability is claimed without
 an implementation behind it, and every number in this report can be reproduced
 with four commands.
+
+## Addendum - 0.82.0 Command Center UI (post-programme)
+
+The audit position on the presentation layer was "functional, not premium": the
+0.67.0 Tkinter/web Command Center worked and was accessible, but it was not the
+interface the programme promised. 0.82.0 closes that gap without moving the
+security or capability boundary:
+
+* the engine, tool registry, safety kernel, approvals, schema (v18) and the
+  ~80 `/v1` routes are unchanged; the Tkinter GUI and `/legacy` remain;
+* the new UI is a same-origin client, so no CORS relaxation, no token in a URL,
+  and the CSP is *stricter* than the old panel's (`script-src 'self'` plus one
+  exact inline hash, instead of `'unsafe-inline'`);
+* `/v1/events/stream` is bounded by the server and refuses garbage query values
+  instead of defaulting to a long-lived socket;
+* release allow-list: **457** files (adds the built bundle and the shipped
+  `frontend/` sources; dependency trees and tool output are excluded), release
+  audit stays READY with 33 checks;
+* verification is executable, not asserted: 17 Python tests plus a 46-check
+  browser run against the real API, with the numbers recorded in
+  `PERFORMANCE_REPORT.md`;
+* the Tauri desktop shell is **scaffolded only** and is not claimed as verified.
+
+Windows status is unchanged: `pending_user_windows_evidence`. Nothing in this
+release was produced or validated on Windows.

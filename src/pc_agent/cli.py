@@ -462,6 +462,35 @@ def _add_desktop_element_selector_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_window_flags(parser: argparse.ArgumentParser) -> None:
+    """Flags shared by `pc-agent ui` and `pc-agent gui` (both open the UI)."""
+
+    parser.add_argument(
+        "--no-browser",
+        "--no-window",
+        dest="no_browser",
+        action="store_true",
+        help="Serve the API but open no window (print the address instead)",
+    )
+    parser.add_argument(
+        "--browser",
+        dest="prefer_browser",
+        action="store_true",
+        help="Open an ordinary browser tab instead of a desktop app window",
+    )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="Print how the UI would be opened, then exit without opening it",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=0.0,
+        help="Stop the server after this many seconds (0 = until Ctrl+C)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pc-agent",
@@ -489,13 +518,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     gui_parser = subparsers.add_parser(
-        "gui", help="Open the local desktop GUI (same services and policy as the CLI)"
+        "gui",
+        help="Open a local interface: the Command Center UI (--web, default) or the Tk panel (--tk)",
     )
     gui_parser.add_argument(
         "--check",
         action="store_true",
         help="Check GUI/controller readiness without opening a window",
     )
+    gui_parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Open the Command Center UI in your browser (served by the local API)",
+    )
+    gui_parser.add_argument(
+        "--tk",
+        action="store_true",
+        help="Open the classic Tkinter desktop panel instead of the browser UI",
+    )
+    _add_window_flags(gui_parser)
+
+    ui_parser = subparsers.add_parser(
+        "ui", help="Start the local API and open the Command Center as a desktop window"
+    )
+    _add_window_flags(ui_parser)
 
     license_parser = subparsers.add_parser(
         "license", help="Show or manage the local offline license (Phase 6)"
@@ -1018,7 +1064,116 @@ def build_parser() -> argparse.ArgumentParser:
         "signing",
         help="Authenticode signing state of this host (tool, certificate, last result)",
     )
+    release_signing_parser.add_argument(
+        "--certificates",
+        action="store_true",
+        help=(
+            "List the code-signing certificates installed for this user "
+            "(subject, thumbprint, validity, private key present)"
+        ),
+    )
+    release_signing_parser.add_argument(
+        "--reputation",
+        action="store_true",
+        help=(
+            "Report the SmartScreen/signing situation on this machine: certificate, "
+            "key storage, last signing run, verified installers"
+        ),
+    )
+    release_signing_parser.add_argument(
+        "--shell", type=Path, default=None, help="Tauri shell directory (for --reputation)"
+    )
     release_signing_parser.add_argument("--json", action="store_true")
+
+    release_installer_parser = release_subparsers.add_parser(
+        "installer",
+        help=(
+            "Check the toolchain, build the desktop installer (npm ci + tauri build) "
+            "and optionally sign it, in one command"
+        ),
+    )
+    release_installer_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Only report the toolchain, the shell definition and the artifacts; run nothing",
+    )
+    release_installer_parser.add_argument(
+        "--build", action="store_true", help="Run npm ci and npm run tauri:build"
+    )
+    release_installer_parser.add_argument(
+        "--sign", action="store_true", help="Sign and verify the installers after the build"
+    )
+    release_installer_parser.add_argument(
+        "--launcher",
+        action="store_true",
+        help=(
+            "Write Omni-Assistant.cmd next to the project: it pins OMNI_PYTHON to the "
+            "interpreter that imports pc_agent, then starts the desktop shell"
+        ),
+    )
+    release_installer_parser.add_argument("--shell", type=Path, default=None)
+    release_installer_parser.add_argument("--thumbprint", default="")
+    release_installer_parser.add_argument("--pfx", type=Path, default=None)
+    release_installer_parser.add_argument("--timestamp-url", default=None)
+    release_installer_parser.add_argument("--timeout", type=int, default=3600)
+    release_installer_parser.add_argument("--json", action="store_true")
+    release_installer_parser.add_argument("--report-dir", type=Path, default=None)
+    release_env_template_parser = release_subparsers.add_parser(
+        "env-template",
+        help=(
+            "Check or restore .env.example, which the installer, POSIX, Debian and "
+            "RPM builders all require"
+        ),
+    )
+    release_env_template_parser.add_argument(
+        "--check", action="store_true", help="Only report whether the template exists"
+    )
+    release_env_template_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Restore the template if it is missing (the default when --check is absent)",
+    )
+    release_env_template_parser.add_argument(
+        "--force", action="store_true", help="Overwrite an existing .env.example"
+    )
+    release_env_template_parser.add_argument("--json", action="store_true")
+    release_sign_bundle_parser = release_subparsers.add_parser(
+        "sign-bundle",
+        help=(
+            "Sign and verify every Windows installer a Tauri build produced "
+            "(NSIS .exe + MSI) with your own certificate"
+        ),
+    )
+    release_sign_bundle_parser.add_argument(
+        "--shell",
+        type=Path,
+        default=None,
+        help="Tauri shell directory (default: frontend/src-tauri in this install)",
+    )
+    release_sign_bundle_parser.add_argument("--thumbprint", default="")
+    release_sign_bundle_parser.add_argument("--pfx", type=Path, default=None)
+    release_sign_bundle_parser.add_argument(
+        "--pfx-password-env", default="PC_AGENT_SIGN_PFX_PASSWORD"
+    )
+    release_sign_bundle_parser.add_argument("--allow-argv-password", action="store_true")
+    release_sign_bundle_parser.add_argument("--timestamp-url", default=None)
+    release_sign_bundle_parser.add_argument("--signtool", type=Path, default=None)
+    release_sign_bundle_parser.add_argument("--timeout", type=float, default=900.0)
+    release_sign_bundle_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Only report what is missing (artifacts, tool, certificate); sign nothing",
+    )
+    release_sign_bundle_parser.add_argument(
+        "--require-hardware",
+        action="store_true",
+        help=(
+            "Refuse a PFX and a software-stored key: for EV / post-2023 OV "
+            "certificates, whose private key must stay on a token"
+        ),
+    )
+    release_sign_bundle_parser.add_argument("--json", action="store_true")
+    release_sign_bundle_parser.add_argument("--report-dir", type=Path, default=None)
     release_sign_parser = release_subparsers.add_parser(
         "sign",
         help=(
@@ -3475,7 +3630,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "doctor":
             return _run_doctor(settings, as_json=bool(getattr(args, "json", False)))
-        if args.command == "gui":
+        if args.command in {"gui", "ui"}:
+            if args.command == "ui":
+                return _open_command_center(
+                    settings,
+                    no_browser=getattr(args, "no_browser", False),
+                    duration=getattr(args, "duration", 0.0) or 0.0,
+                    prefer_browser=getattr(args, "prefer_browser", False),
+                    explain=getattr(args, "explain", False),
+                )
             return _run_gui_command(settings, args)
         if args.command == "license":
             return _run_license_command(settings, args)
@@ -3975,7 +4138,122 @@ def _run_gui_command(settings: Settings, args: argparse.Namespace) -> int:
         ready, text = gui_check(settings)
         print(text)
         return 0 if ready else 1
-    return launch_gui(settings)
+    if getattr(args, "tk", False):
+        return launch_gui(settings)
+    # The brand interface is the Command Center; the Tk panel is now the opt-in
+    # fallback (`pc-agent gui --tk`) rather than what a user sees by default.
+    return _open_command_center(
+        settings,
+        no_browser=bool(getattr(args, "no_browser", False)),
+        duration=float(getattr(args, "duration", 0.0) or 0.0),
+        prefer_browser=bool(getattr(args, "prefer_browser", False)),
+        explain=bool(getattr(args, "explain", False)),
+    )
+
+
+def _open_command_center(
+    settings: Settings,
+    *,
+    no_browser: bool = False,
+    duration: float = 0.0,
+    window: bool = True,
+    prefer_browser: bool = False,
+    explain: bool = False,
+) -> int:
+    """Serve the local API and open the Command Center as PC software.
+
+    The default is a *desktop window*: an OS webview when ``pywebview`` is
+    installed, otherwise an installed Chromium-family browser in ``--app`` mode
+    (Edge ships with Windows), otherwise the default browser. ``--browser``
+    forces a normal browser tab.
+
+    The token is issued by the server into the page's ``meta`` tag, so nothing is
+    put in the URL and the same-origin rules still apply. The server binds
+    loopback only, exactly like ``pc-agent api serve``.
+    """
+
+    from .api_server import LocalApiServer
+    from .desktop_window import launch, plan_desktop_window
+
+    if not settings.api_enabled:
+        print(
+            "The local API is disabled, so the Command Center cannot be served. "
+            "Set PC_AGENT_API_ENABLED=true to enable it.",
+            file=sys.stderr,
+        )
+        return 2
+    # Plan first: `--explain` must not bind a port (that would fight a Command
+    # Center that is already running) and must not open anything.
+    planned_url = f"http://{settings.api_host}:{settings.api_port}/"
+    plan = None
+    if not no_browser:
+        plan = plan_desktop_window(
+            planned_url,
+            profile_dir=settings.data_dir / "ui-window",
+            prefer_browser=prefer_browser or not window,
+        )
+        print(f"Window: {plan.kind} - {plan.reason}")
+        if plan.executable is not None:
+            print(f"Launcher: {plan.executable}")
+    if explain:
+        print(f"Command Center would be served at {planned_url} (loopback only).")
+        print("Plan only (--explain): nothing was opened.")
+        return 0
+
+    server = LocalApiServer(settings)
+    host, port = server.address
+    url = f"http://{host}:{port}/"
+    print(f"Command Center: {url}  (loopback only, Ctrl+C to stop)")
+
+    import threading
+
+    stop_event = threading.Event()
+    worker = threading.Thread(target=server.serve_forever, name="omni-ui", daemon=True)
+    worker.start()
+
+    child = None
+    timer = None
+    try:
+        if plan is not None:
+            if plan.kind == "pywebview":
+                # pywebview's event loop owns the main thread, so the server runs
+                # on the worker above and this call blocks until the window closes.
+                launch(plan, url=url)
+                return 0
+            child = launch(plan, url=url)
+        if duration and duration > 0:
+            timer = threading.Timer(duration, stop_event.set)
+            timer.daemon = True
+            timer.start()
+        while not stop_event.is_set():
+            stop_event.wait(0.25)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if child is not None and child.poll() is None:
+            # The window we opened is its own browser instance (dedicated
+            # --user-data-dir), so ending that process closes exactly our window
+            # and nothing else the user has open.
+            try:
+                child.terminate()
+            except OSError as exc:  # closing a window is best effort
+                print(f"Could not close the app window: {exc}", file=sys.stderr)
+        print("\nCommand Center stopped.", flush=True)
+        server.stop()
+    return 0
+
+
+def _open_in_browser(url: str) -> bool:
+    """Open ``url`` in the user's default browser without a shell."""
+
+    import webbrowser
+
+    try:
+        return bool(webbrowser.open(url, new=2))
+    except Exception:  # noqa: BLE001 - opening a browser is best effort
+        return False
 
 
 def _run_doctor(settings: Settings, *, as_json: bool = False) -> int:
@@ -10128,6 +10406,9 @@ def _print_release_bundle(
 def _print_production_report(report: Any, *, as_json: bool, out: Path | None) -> None:
     if as_json:
         print(json.dumps(report.to_dict(), indent=1, sort_keys=True))
+        # A machine-readable report on stdout must stay parseable, but a failing
+        # chain must never be silent: the reason goes to stderr.
+        _print_production_failures(report)
         return
     print(f"Release chain check: {report.summary()}")
     print(f"Version: {report.version}")
@@ -10142,12 +10423,209 @@ def _print_production_report(report: Any, *, as_json: bool, out: Path | None) ->
         print(f"Work directory kept: {report.workdir}")
     if out is not None:
         print(f"Report written: {out}")
+    _print_production_failures(report)
+
+
+def _print_production_failures(report: Any) -> None:
+    """Name every failing release-chain step on stderr, never only in a report."""
+
+    for line in report.failure_lines():
+        print(f"Release chain step failed -> {line}", file=sys.stderr)
+
+
+def _run_release_env_template(settings: Settings, args: argparse.Namespace) -> int:
+    """Check or restore `.env.example`, a required installer payload file."""
+
+    from .env_template import (
+        ENV_TEMPLATE,
+        ENV_TEMPLATE_NAME,
+        env_template_path,
+        write_env_template,
+    )
+
+    target = env_template_path(settings.root_dir)
+    exists = target.is_file() and not target.is_symlink()
+    changed = False
+    if not args.check:
+        target_written, changed = write_env_template(
+            settings.root_dir, force=bool(args.force)
+        )
+        target = target_written
+        exists = True
+    payload = {
+        "path": str(target),
+        "exists": exists,
+        "restored": changed,
+        "force": bool(args.force),
+        "bytes": len(ENV_TEMPLATE.encode("utf-8")),
+        "contains_secrets": False,
+        "required_by": [
+            "release windows-installer",
+            "release posix-source",
+            "release debian-package",
+            "release rpm-package",
+        ],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0 if (exists or args.check is False) else 1
+    if exists:
+        state = "restored" if changed else "present"
+        print(f"{ENV_TEMPLATE_NAME}: {state}")
+        print(f"  path: {target}")
+        print("  contains secrets: no (it is the sample file)")
+        if not args.check:
+            print("Next: python -m pytest -q tests/test_phase41_posix_package.py")
+        return 0
+    print(f"{ENV_TEMPLATE_NAME}: MISSING at {target}", file=sys.stderr)
+    print(
+        "  This file is a required installer payload; without it the Windows, "
+        "POSIX, Debian and RPM builders refuse to run.",
+        file=sys.stderr,
+    )
+    print("  Restore it with: pc-agent release env-template --write", file=sys.stderr)
+    return 1
+
+
+def _run_release_installer(settings: Settings, args: argparse.Namespace) -> int:
+    """`pc-agent release installer`: check, build, then optionally sign."""
+
+    from .installer_build import run_installer_build
+
+    if args.sign and not (args.thumbprint or args.pfx):
+        print(
+            "Signing needs a certificate: pass --thumbprint (from "
+            "`pc-agent release signing --certificates`) or --pfx.",
+            file=sys.stderr,
+        )
+        return 2
+    report = run_installer_build(
+        root_dir=settings.root_dir,
+        shell_dir=args.shell,
+        build=bool(args.build) and not bool(args.check),
+        sign=bool(args.sign) and not bool(args.check),
+        launcher=bool(getattr(args, "launcher", False)) and not bool(args.check),
+        thumbprint=args.thumbprint or None,
+        pfx=args.pfx,
+        timestamp_url=args.timestamp_url,
+        timeout=int(args.timeout),
+    )
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=1, sort_keys=True))
+    else:
+        print(f"Installer build: {report.summary()}")
+        print(f"Shell: {report.shell_dir}")
+        for step in report.steps:
+            marker = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP", "not-run": "N/R "}.get(
+                step.status, step.status.upper()
+            )
+            print(f"  [{marker}] {step.name}: {step.detail}")
+            for line in step.tail:
+                print(f"          {line}")
+        if report.artifacts:
+            print()
+            print("Installers:")
+            for artifact in report.artifacts:
+                print(f"  {artifact['path']}  ({artifact['size']} bytes)")
+        if report.blockers:
+            from .installer_build import next_steps
+
+            print()
+            print("Blockers:")
+            for blocker in report.blockers:
+                print(f"  - {blocker}")
+            steps = next_steps(report)
+            if steps:
+                print()
+                print("Next, one command at a time (restart the terminal after an install):")
+                for index, command in enumerate(steps, start=1):
+                    print(f"  {index}. {command}")
+        print()
+        print(f"Report written: {settings.data_dir / 'installer-build.json'}")
+        if not args.build and not args.check:
+            print("Nothing was built. Re-run with --build to build, or --check to only inspect.")
+        if getattr(args, "launcher", False):
+            from .installer_build import launcher_path
+
+            print(f"Launcher: {launcher_path(settings.root_dir)}")
+    if args.report_dir is not None:
+        target = Path(args.report_dir).expanduser() / "installer-build.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(report.to_dict(), indent=1, sort_keys=True), encoding="utf-8"
+        )
+    return 0 if report.ok else 1
 
 
 def _run_release_signing(settings: Settings, args: argparse.Namespace) -> int:
     from .release import WINDOWS_SIGNING_REPORT
     from .windows_signing import signtool_status
 
+    if getattr(args, "reputation", False):
+        from .windows_signing import INSTALLER_SIGNING_REPORT, reputation_status
+
+        shell = getattr(args, "shell", None) or (settings.root_dir / "frontend" / "src-tauri")
+        status = reputation_status(
+            report_path=settings.data_dir / INSTALLER_SIGNING_REPORT, shell_dir=shell
+        )
+        if args.json:
+            print(json.dumps(status, indent=2, sort_keys=True))
+        else:
+            print("Signing / SmartScreen status")
+            print(f"  certificates: {status['certificate_store']['detail']}")
+            print(f"  hardware-backed: {status['hardware_backed']}")
+            print(f"  expected first run: {status['expected_first_run']}")
+            print(f"  SmartScreen reputation: {status['smart_screen_reputation']}")
+            print(f"  note: {status['smart_screen_note']}")
+            last = status["last_signing_run"]
+            print(
+                "  last signing run: "
+                + (
+                    f"{last.get('artifacts', 0)} artifact(s), {last.get('signed', 0)} signed"
+                    if last.get("ok") is not None
+                    else str(last.get("status", "unknown"))
+                )
+            )
+            for installer in status["installers"]:
+                print(f"    [{'OK  ' if installer['ok'] else 'FAIL'}] {installer['path']}")
+                print(f"           {installer['detail']}")
+            print("  timestamp authorities: " + ", ".join(status["timestamp_authorities"]))
+            for blocker in status["blockers"]:
+                print(f"  REMAINING: {blocker}")
+            print()
+            print(f"Next: {status['next_command']}")
+        return 0 if not status["blockers"] else 1
+    if getattr(args, "certificates", False):
+        from .windows_signing import list_signing_certificates
+
+        listing = list_signing_certificates()
+        if args.json:
+            print(json.dumps(listing, indent=2, sort_keys=True))
+            return 0 if listing["status"] in {"ok", "empty"} else 1
+        print(f"Code-signing certificates: {listing['status']}")
+        print(f"  {listing['detail']}")
+        for item in listing["certificates"]:
+            print()
+            print(f"  subject:     {item['subject']}")
+            print(f"  issuer:      {item['issuer']}")
+            print(f"  thumbprint:  {item['thumbprint']}")
+            print(f"  valid:       {item['not_before'][:10]} -> {item['not_after'][:10]}")
+            print(f"  private key: {'yes' if item['has_private_key'] else 'NO (cannot sign)'}")
+            print(
+                f"  key storage: {item.get('storage', 'unknown')}"
+                + (f" via {item['provider']}" if item.get("provider") else "")
+            )
+        if listing["certificates"]:
+            print()
+            print("Sign with:")
+            print(
+                f"  $env:PC_AGENT_SIGN_THUMBPRINT = \"{listing['certificates'][0]['thumbprint']}\""
+            )
+            print("  pc-agent release sign-bundle")
+            if listing.get("hardware_backed"):
+                print("  # EV / hardware-backed: add --require-hardware to refuse software keys")
+                print("  pc-agent release sign-bundle --require-hardware")
+        return 0 if listing["status"] in {"ok", "empty"} else 1
     status = signtool_status(getattr(args, "signtool", None))
     report_path = settings.data_dir / WINDOWS_SIGNING_REPORT
     recorded: dict[str, Any] = {}
@@ -10181,6 +10659,90 @@ def _run_release_signing(settings: Settings, args: argparse.Namespace) -> int:
             "enforced; Authenticode applies to the installer EXE"
         )
     return 0
+
+
+def _run_release_sign_bundle(settings: Settings, args: argparse.Namespace) -> int:
+    """Sign + verify every installer a Tauri build produced.
+
+    ``--check`` is the useful first step for a user: it names exactly what is
+    missing (the build, the SDK, the certificate) and touches nothing.
+    """
+
+    from .windows_signing import DEFAULT_TIMESTAMP_URL, plan_signing, sign_bundle
+
+    shell = args.shell or (settings.root_dir / "frontend" / "src-tauri")
+    thumbprint = args.thumbprint or os.environ.get("PC_AGENT_SIGN_THUMBPRINT", "")
+    password = os.environ.get(args.pfx_password_env, "") if args.pfx is not None else ""
+    if args.pfx is not None and not password:
+        print(
+            f"The PFX password must be in the {args.pfx_password_env} environment "
+            "variable; it is never accepted as a command-line argument.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.check:
+        plan = plan_signing(
+            shell,
+            thumbprint=thumbprint,
+            pfx=args.pfx,
+            signtool_path=args.signtool,
+            require_hardware=bool(getattr(args, "require_hardware", False)),
+        )
+        if args.json:
+            print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(f"Installer signing preflight: {shell}")
+            print(f"  installers found: {len(plan.artifacts)}")
+            for artifact in plan.artifacts:
+                print(f"    {artifact}")
+            for note in plan.notes:
+                print(f"  note: {note}")
+            for blocker in plan.blockers:
+                print(f"  BLOCKED: {blocker}")
+            print()
+            print("READY to sign" if plan.ready else "NOT READY - fix the blockers above")
+        return 0 if plan.ready else 1
+
+    if args.pfx is not None and args.allow_argv_password:
+        print(
+            "Refusing --allow-argv-password for a bundle run: argv is readable by "
+            "other processes. Use --thumbprint instead.",
+            file=sys.stderr,
+        )
+        return 2
+
+    result = sign_bundle(
+        shell,
+        thumbprint=thumbprint,
+        pfx=args.pfx,
+        password=password or None,
+        timestamp_url=args.timestamp_url or DEFAULT_TIMESTAMP_URL,
+        signtool_path=args.signtool,
+        timeout=float(args.timeout),
+        require_hardware=bool(getattr(args, "require_hardware", False)),
+    )
+    report_dir = args.report_dir or settings.data_dir
+    report_dir.mkdir(parents=True, exist_ok=True)
+    from .windows_signing import INSTALLER_SIGNING_REPORT
+
+    target = Path(report_dir) / INSTALLER_SIGNING_REPORT
+    target.write_text(json.dumps(result, indent=1, sort_keys=True), encoding="utf-8")
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        for blocker in result["blockers"]:
+            print(f"  BLOCKED: {blocker}")
+        for item in result["results"]:
+            print(f"  {item['status']:>18}  {Path(item['path']).name}")
+            print(f"                      {item['detail'][:160]}")
+        print()
+        print(
+            f"Signed {result['signed']}/{result['artifacts']} installer(s); "
+            f"ok={result['ok']}"
+        )
+        print(f"Report: {target}")
+    return 0 if result["ok"] else 1
 
 
 def _run_release_sign(settings: Settings, args: argparse.Namespace) -> int:
@@ -10399,6 +10961,12 @@ def _run_release_command(settings: Settings, args: argparse.Namespace) -> int:
             )
         _print_production_report(report, as_json=bool(args.json), out=args.out)
         return 0 if report.ok else 1
+    if command == "env-template":
+        return _run_release_env_template(settings, args)
+    if command == "installer":
+        return _run_release_installer(settings, args)
+    if command == "sign-bundle":
+        return _run_release_sign_bundle(settings, args)
     if command == "signing":
         return _run_release_signing(settings, args)
     if command == "sign":

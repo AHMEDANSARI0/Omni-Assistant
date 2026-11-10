@@ -81,3 +81,27 @@ Remaining external items are unchanged and listed in `AUDIT_REPORT.md` section 8
 the Windows acceptance run, the first real CI run, and a user-supplied
 code-signing certificate.
 
+
+## Post-programme addendum - 0.82.0 Command Center UI
+
+The 18-phase programme is closed. 0.82.0 was added afterwards at the user's
+request and is delivered:
+
+| Item | State |
+|---|---|
+| React/TypeScript Command Center served by the local API | done (0.82.0) |
+| 17 destinations, all wired to real routes | done |
+| Holographic AI core with engine-derived states | done |
+| Live NDJSON event stream + reconnect/backoff | done |
+| Dark and light themes with measured WCAG AA | done |
+| Widget layout persistence, palette, shortcuts, reduced motion | done |
+| Browser verification harness (46 checks) + 17 Python tests | done |
+| Desktop shell (Tauri 2) | scaffolded, **not built or verified** |
+| RTL mirroring of the React shell | open |
+| Widget resize/remove (beyond reordering) | open |
+| Embedded visual flow canvas | open (JSON import only) |
+
+Remaining before a Windows sign-off, unchanged in shape from the programme:
+run the suite and `pc-agent release evidence` on the user's machine, then record
+the result; Authenticode signing needs the user's certificate; macOS/Linux
+packaging and any SaaS surface remain out of scope.

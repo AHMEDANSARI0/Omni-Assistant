@@ -18,16 +18,20 @@ the orchestrator, the Safety Kernel, and the Approval Center.
 
 from __future__ import annotations
 
+import errno
 import hmac
 import json
 import logging
 import secrets
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Self
 from urllib.parse import parse_qs, urlparse
 
+from . import webui
 from .config import Settings
 from .errors import ConfigError, PcAgentError, StorageError
 from .profiles import (
@@ -44,6 +48,21 @@ from .web_ui import INDEX_HTML
 __all__ = ["LocalApiServer", "load_or_create_api_token"]
 
 _LOG = logging.getLogger("pc_agent.api")
+
+#: Served at ``/`` when no Command Center build is present. It says what is
+#: missing and how to fix it - it never pretends to be the product UI.
+_MISSING_BUILD_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><title>Omni-Assistant - UI not built</title>
+<style>body{margin:0;background:#050b16;color:#dbeafe;font:15px/1.6 system-ui,sans-serif;padding:48px}
+code{background:#0d1b2e;padding:2px 6px;border-radius:4px;color:#7dd3fc}a{color:#67e8f9}</style></head>
+<body><h1 style="font-size:20px;letter-spacing:.18em">OMNI-ASSISTANT</h1>
+<p>The API is running, but this install has no built Command Center.</p>
+<p>Build it once with Node 20+:</p>
+<pre><code>cd frontend
+npm ci
+npm run build</code></pre>
+<p>Then reload this page. The API itself is available at <code>/v1/health</code>,
+and the legacy panel is at <a href="/legacy">/legacy</a>.</p></body></html>"""
 _MAX_BODY_BYTES = 256 * 1024
 _TOKEN_FILENAME = "api-token"
 
@@ -70,6 +89,49 @@ def load_or_create_api_token(settings: Settings) -> str:
     return token
 
 
+# A browser closing a stream is normal, and the *same* event is reported
+# differently per platform: POSIX raises BrokenPipeError/ConnectionResetError,
+# Windows raises ConnectionAbortedError (WinError 10053). 0.82.9 and earlier
+# only caught the POSIX pair, so every Command Center stream end on Windows
+# logged an ERROR with a full traceback and then tried to answer with a 500 on
+# a socket that no longer existed - the second traceback in the report.
+_CLIENT_GONE: tuple[type[BaseException], ...] = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+)
+# Some platforms raise a bare OSError carrying the Winsock/POSIX code instead of
+# the specialised subclass, so match on the code as well.
+_DISCONNECT_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "WSAECONNABORTED", None),
+        getattr(errno, "WSAECONNRESET", None),
+        getattr(errno, "ENOTCONN", None),
+        getattr(errno, "ESHUTDOWN", None),
+    )
+    if code is not None
+)
+
+
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """A threaded local server that does not shout when a client hangs up."""
+
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, _CLIENT_GONE) or (
+            isinstance(exc, OSError) and exc.errno in _DISCONNECT_ERRNOS
+        ):
+            _LOG.debug("client %s disconnected mid-response", client_address)
+            return
+        super().handle_error(request, client_address)
+
+
 class LocalApiServer:
     """Owns the HTTP server + LocalService lifecycle."""
 
@@ -80,11 +142,17 @@ class LocalApiServer:
         self._service = service or LocalService(settings)
         self._token = load_or_create_api_token(settings)
         handler = _make_handler(self._service, self._token)
-        self._httpd = ThreadingHTTPServer((settings.api_host, settings.api_port), handler)
-        self._httpd.daemon_threads = True
+        self._httpd = _QuietThreadingHTTPServer(
+            (settings.api_host, settings.api_port), handler
+        )
         self._thread: threading.Thread | None = None
         self._scheduler_thread: threading.Thread | None = None
         self._scheduler_stop = threading.Event()
+        # True while *some* thread is inside ``serve_forever`` - including a
+        # caller-owned one (``pc-agent api serve`` runs it on the main thread).
+        # Closing the socket without shutting that loop down first is a Windows
+        # error (10038 on a closed selector), so stop() has to know about it.
+        self._serving = threading.Event()
 
     @property
     def address(self) -> tuple[str, int]:
@@ -125,7 +193,15 @@ class LocalApiServer:
             source="api",
             summary=f"Local API listening on {self.address[0]}:{self.address[1]}.",
         )
-        self._httpd.serve_forever(poll_interval=0.25)
+        self._serving.set()
+        try:
+            self._httpd.serve_forever(poll_interval=0.25)
+        except OSError as exc:  # pragma: no cover - Windows shutdown race
+            # A real socket error must end the loop, not kill the caller's
+            # thread with an unhandled exception (that was WinError 10038).
+            _LOG.debug("Local API loop ended with a socket error: %s", exc)
+        finally:
+            self._serving.clear()
 
     def _start_scheduler(self) -> None:
         interval = self._settings.scheduler_interval_seconds
@@ -160,6 +236,11 @@ class LocalApiServer:
             self._httpd.shutdown()
             self._thread.join(timeout=5)
             self._thread = None
+        elif self._serving.is_set():
+            # ``serve_forever`` is running on a thread we do not own: ask the
+            # loop to end *before* the socket is closed, otherwise the loop
+            # wakes up selecting on a closed socket (WinError 10038).
+            self._httpd.shutdown()
         self._httpd.server_close()
         self._service.close()
 
@@ -222,6 +303,119 @@ def _make_handler(service: LocalService, token: str):
             if self.command != "HEAD":
                 self.wfile.write(body)
 
+        def _send_asset(self, target: Any) -> None:
+            """Serve one built Command Center file with a fixed MIME map.
+
+            No directory listing, no range requests, no CORS: the SPA is served
+            from the same loopback origin as ``/v1``, and anything outside the
+            asset root is refused by :func:`pc_agent.webui.static_path`.
+            """
+
+            data = target.read_bytes()
+            suffix = target.suffix.lower()
+            mime = {
+                ".html": "text/html; charset=utf-8",
+                ".js": "text/javascript; charset=utf-8",
+                ".mjs": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+                ".json": "application/json; charset=utf-8",
+                ".svg": "image/svg+xml",
+                ".png": "image/png",
+                ".webp": "image/webp",
+                ".woff2": "font/woff2",
+                ".ico": "image/x-icon",
+                ".map": "application/json; charset=utf-8",
+            }.get(suffix, "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # Assets are content-hashed by Vite; the shell must never be cached.
+            cache = "no-store" if suffix == ".html" else "public, max-age=31536000, immutable"
+            self.send_header("Cache-Control", cache)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+
+        def _serve_command_center(self) -> bool:
+            """Serve the built SPA shell, or report honestly that it is absent."""
+
+            html = webui.read_index(token)
+            if not html:
+                self._send_html(_MISSING_BUILD_HTML)
+                return False
+            body = html.encode("utf-8")
+            # Only the shell's own inline bootstrap is allowed, by exact hash.
+            script_src = " ".join(["'self'", *webui.inline_script_hashes(html)])
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header(
+                "Content-Security-Policy",
+                f"default-src 'self'; script-src {script_src}; style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; "
+                "connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'; "
+                "base-uri 'none'; form-action 'none'",
+            )
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+            return True
+
+        def _stream_events(self, query: dict[str, str]) -> None:
+            """Live application events as NDJSON, with heartbeats (0.82.0).
+
+            The Command Center subscribes here instead of polling. Bounded on
+            purpose: the stream ends after ``duration`` seconds (default 120) or
+            when the client goes away, and the browser reconnects - a local
+            server must not accumulate idle sockets.
+            """
+
+            since = _int(query.get("since_id"), 0)
+            # Strict parse on purpose: a typo must fail loudly instead of opening
+            # a two-minute socket on the default duration.
+            duration = min(max(_strict_float(query.get("duration"), 120.0), 5.0), 900.0)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            deadline = time.monotonic() + duration
+            last_beat = 0.0
+            try:
+                self.wfile.write(
+                    json.dumps({"type": "stream.ready", "since_id": since}).encode("utf-8")
+                    + b"\n"
+                )
+                self.wfile.flush()
+                while time.monotonic() < deadline:
+                    payload = service.list_events(since_id=since, limit=100)
+                    events = list(payload.get("events") or [])
+                    if events:
+                        for event in events:
+                            self.wfile.write(
+                                json.dumps(event, ensure_ascii=True).encode("utf-8") + b"\n"
+                            )
+                            since = max(since, int(event.get("id") or 0))
+                        self.wfile.flush()
+                        last_beat = time.monotonic()
+                    elif time.monotonic() - last_beat >= 10.0:
+                        self.wfile.write(b'{"type":"stream.heartbeat"}\n')
+                        self.wfile.flush()
+                        last_beat = time.monotonic()
+                    time.sleep(0.75)
+            except OSError as exc:
+                # Every OSError here means the reader is gone (Windows 10053,
+                # POSIX EPIPE/ECONNRESET, or a closed socket). The stream is
+                # bounded anyway, so ending it quietly is the whole handling.
+                _LOG.debug("event stream client disconnected: %s", exc)
+
         def _stream_ndjson(self, events: Any) -> None:
             """Write JSON-lines events until the iterable ends (Phase 7).
 
@@ -241,8 +435,8 @@ def _make_handler(service: LocalService, token: str):
                         json.dumps(event, ensure_ascii=True).encode("utf-8") + b"\n"
                     )
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                _LOG.debug("NDJSON stream client disconnected", exc_info=True)
+            except OSError as exc:
+                _LOG.debug("NDJSON stream client disconnected: %s", exc)
 
         def _error(self, status: int, code: str, message: str) -> None:
             self._send_json(status, {"ok": False, "error": {"code": code, "message": message}})
@@ -275,7 +469,24 @@ def _make_handler(service: LocalService, token: str):
             query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
             try:
                 if method == "GET" and path in {"/", "/index.html"}:
+                    self._serve_command_center()
+                    return
+                if method == "GET" and path in {"/legacy", "/legacy/"}:
                     self._send_html(INDEX_HTML)
+                    return
+                if method == "GET" and path.startswith("/assets/"):
+                    asset = webui.static_path(path)
+                    if asset is None:
+                        self._error(404, "not_found", "No such asset.")
+                        return
+                    self._send_asset(asset)
+                    return
+                if method == "GET" and path == "/favicon.ico":
+                    icon = webui.static_path("favicon.svg")
+                    if icon is not None:
+                        self._send_asset(icon)
+                    else:
+                        self._error(404, "not_found", "No icon.")
                     return
                 if method == "GET" and path == "/v1/health":
                     self._ok(service.health())
@@ -289,11 +500,16 @@ def _make_handler(service: LocalService, token: str):
                 self._error(_status_for_error(exc), type(exc).__name__, str(exc))
             except (ValueError, KeyError) as exc:
                 self._error(400, "bad_request", str(exc))
-            except BrokenPipeError:
-                pass
+            except _CLIENT_GONE as exc:
+                # The browser closed the tab/stream mid-request. Nothing to
+                # report and nothing left to answer *to*.
+                _LOG.debug("client went away during %s %s: %s", method, path, exc)
             except Exception:  # Never leak stack traces to the client.  # noqa: BLE001
                 _LOG.exception("Local API %s %s failed", method, path)
-                self._error(500, "internal_error", "The local API hit an unexpected error.")
+                try:
+                    self._error(500, "internal_error", "The local API hit an unexpected error.")
+                except OSError as exc:  # the client left while we were failing
+                    _LOG.debug("could not report the 500: %s", exc)
 
         def _route(
             self, method: str, path: str, query: dict[str, str], body: dict[str, Any]
@@ -448,6 +664,8 @@ def _make_handler(service: LocalService, token: str):
                 self._ok(service.safety_stop(reason=reason, engaged_by="api"))
             elif method == "POST" and path == "/v1/safety/resume":
                 self._ok(service.safety_resume(released_by="api"))
+            elif method == "GET" and path == "/v1/events/stream":
+                self._stream_events(query)
             elif method == "GET" and path == "/v1/events":
                 self._ok(
                     service.list_events(
@@ -1018,6 +1236,24 @@ def _create_schedule(service: LocalService, body: dict[str, Any]) -> dict[str, A
         interval_seconds=int(interval) if interval is not None else None,
         use_ai=bool(body.get("use_ai")),
     )
+
+
+def _float(raw: str | None, default: float) -> float:
+    try:
+        return float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _strict_float(raw: str | None, default: float) -> float:
+    """Float query parameter that refuses garbage instead of silently defaulting."""
+
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise PcAgentError(f"Expected a number, got '{raw}'.") from exc
 
 
 def _int(raw: str | None, default: int) -> int:

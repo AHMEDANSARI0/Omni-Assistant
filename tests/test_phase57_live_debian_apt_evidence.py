@@ -464,7 +464,7 @@ def test_phase57_cli_requires_confirmation_and_verifies_report(
 
 
 def test_phase57_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(build_default_registry().list_tools()) == 69
 

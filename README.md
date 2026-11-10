@@ -5,7 +5,10 @@ secure, lightweight, extensible agent that plans and executes user tasks with
 explicit permissions, verifies results deterministically, and reports honestly
 what it did.
 
-## Current status: TRANSFORMATION PHASE 12 - Visual Workflow Builder (this build)
+## Current status: 0.82.12 - the certificate truth: what to buy from Pakistan, and what EV no longer buys (this build)
+
+`python scripts\verify_windows.py` runs every Windows gate in one command and
+writes `data\windows-verification.json` (see `INSTALLATION_GUIDE.md` §12.2b).
 
 | Status | Capability |
 |---|---|
@@ -106,23 +109,83 @@ network, shell or desktop permission. Phase 6 licensing is offline and local:
 there is no payment processing, online activation/subscription-billing
 server, or cloud account yet.
 
+## Command Center UI (0.82.x, default entry point since 0.82.2)
+
+The interface is now a React/TypeScript Command Center served by the local API at
+`http://127.0.0.1:8765` - the same process, the same ~80 `/v1` routes, the same
+safety kernel. Nothing in the Python engine was rewritten to make it work.
+
+**Run it**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pc-agent ui
+```
+
+That starts the local API and opens the Command Center in your browser. The
+entry points are:
+
+| Command | Opens |
+|---|---|
+| `pc-agent ui` | Command Center **as a desktop window** (starts the API too) |
+| `pc-agent gui` | the same Command Center window - the default since 0.82.2 |
+| `pc-agent gui --tk` | the classic Tkinter panel (rollback path) |
+| `pc-agent api serve` | API only, no browser - open the address it prints |
+| `http://127.0.0.1:8765/legacy` | the pre-0.82 web panel (rollback path) |
+
+**It is PC software, not just a tab.** `pc-agent ui` opens a window with no
+address bar and no tabs: an OS webview if you install the optional
+`desktop` extra (`pip install -e ".[desktop]"` → WebView2 on Windows), otherwise
+an installed Edge/Chrome app window, otherwise your default browser. Add
+`--browser` if you want a normal tab, or `--explain` to see which one it would
+pick on your machine. The Tauri shell in `frontend/src-tauri/` is the
+installer-grade option and needs a Rust toolchain to build.
+
+The shell mirrors for right-to-left locales: Settings → Display → *Text direction*
+(`auto` follows the locale the engine reports, or force `ltr`/`rtl`). The built UI ships inside the release
+bundle; you only need Node 20+ if you want to change it:
+
+```powershell
+cd D:\omni-assistant\frontend
+npm ci
+npm run build          # cleans stale hashed assets, typechecks, bundles into src/pc_agent/webui
+npm run check          # WCAG contrast audit + typecheck
+```
+
+**What it contains** - left navigation with 17 destinations, a holographic AI core
+whose state is derived from real engine signals, a right-hand intelligence panel
+(activity, approvals, alerts, insights from measured values), seven configurable
+widgets, and a bottom command bar wired to `POST /v1/run`, the real microphone
+capture session and the real emergency stop. Dark **and** light themes, both
+contrast-checked; keyboard palette (`Ctrl+K`), sidebar toggle (`Ctrl+B`), reduced
+motion honoured from the OS.
+
+**How it is verified** - `frontend/scripts/ui-verify.js` drives real Chromium
+against the running API: 46 checks covering every route, both themes' measured
+contrast, the live NDJSON stream, persistence, resizing, reduced motion, console
+errors and resource use. `docs/command_center_ui.md` documents the design system,
+the interaction contract and the limits (including that the Tauri desktop shell is
+scaffolded but not built here).
+
+
 ## Setup / upgrade (Windows PowerShell)
 
-For an existing install, use the latest cumulative patcher. The 0.81.0 patcher
+For an existing install, use the latest cumulative patcher. The 0.82.0 patcher
 upgrades any earlier install - including the audited GitHub Phase 58 tree and the
-delivered Phase 60 tree - to the same canonical 0.81.2 files (every earlier
-phase, including the 0.79.1 Windows hotfix and the 0.80.1 sandbox fix, is
-included; nothing else is required):
+delivered Phase 60 tree - to the same canonical 0.82.0 files (every earlier
+phase, including 0.81.x, the 0.79.1 Windows hotfix and the 0.80.1 sandbox fix,
+is included; nothing else is required):
 
 ```powershell
 cd D:\omni-assistant   # your project folder
-node TRANSFORMATION_PHASE_19_VOICE_SIGNING.mjs
+node TRANSFORMATION_PHASE_20_COMMAND_CENTER.mjs
 
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
 python -m pytest -q
 python -m ruff check
 pc-agent --version
+pc-agent api serve
 pc-agent doctor
 pc-agent demo pdf
 pc-agent run "Merge PDFs from Folder A and Folder B then extract pages 1-2"
@@ -163,7 +226,8 @@ emergency stop, tool-schema pollution) and 9 measured performance checks with
 budgets written into `PERFORMANCE_REPORT.md`. The four documents the programme
 still owed now exist: `AUDIT_REPORT.md`, `DEVELOPER_GUIDE.md`,
 `INSTALLATION_GUIDE.md` and `PLUGIN_DEVELOPMENT_GUIDE.md`. Schema stays **v18**,
-70 built-in tools, **33** release checks, **20** GUI tabs, **1130** tests.
+70 built-in tools, **34** release checks, **20** GUI tabs, **1327** tests,
+**479** allow-listed release files.
 
 The last open item has an executable path instead of a promise:
 `pc-agent release evidence` runs the acceptance gates on the Windows machine
@@ -179,7 +243,7 @@ Transformation Phase 17 adds **accessibility and multilingual UI**
 (`pc-agent i18n status|list|strings|set`, `pc-agent a11y status|check|contrast`,
 `pc-agent perf bench`, `/v1/i18n/*`, `/v1/a11y/status`, `/v1/perf/bench`, the 19th
 GUI tab **Accessibility** (now followed by Production), a web Accessibility panel; schema **v18**, still 69
-built-in tools, **33** release checks). Four interface languages ship with real
+built-in tools, **34** release checks). Four interface languages ship with real
 translations - English, Spanish, Urdu and Arabic - and Urdu/Arabic are marked
 right-to-left, which mirrors the web layout and the desktop header. Text size
 (80-200%), high contrast and reduced motion are persisted in `data/ui.json` and

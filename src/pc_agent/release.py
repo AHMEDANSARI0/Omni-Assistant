@@ -57,7 +57,22 @@ _ROOT_FILES = (
     "TEST_REPORT.md",
     "pyproject.toml",
 )
-_INCLUDE_DIRS = ("src", "tests", "docs", "examples", "scripts")
+# ``frontend`` carries the Command Center sources so a release bundle can rebuild
+# the UI without a network round-trip to this repository. Its dependency and
+# tool output directories are excluded below by name.
+# ``.github`` is included because the production-hardening audit treats a missing
+# CI workflow as a finding and the suite asserts the workflow exists: a patched
+# install that lacks it is not the same product as the repository, and it used to
+# fail nine of its own tests. Workflows contain no secrets (they are read-only).
+_INCLUDE_DIRS = (
+    ".github",
+    "src",
+    "tests",
+    "docs",
+    "examples",
+    "scripts",
+    "frontend",
+)
 _EXCLUDED_PARTS = {
     ".git",
     ".venv",
@@ -68,6 +83,12 @@ _EXCLUDED_PARTS = {
     ".patcher-backups",
     "data",
     "workspace",
+    # Frontend tool output / dependency trees are never shipped.
+    "node_modules",
+    "dist",
+    ".vite",
+    "test-results",
+    "playwright-report",
 }
 _FORBIDDEN_SUFFIXES = {
     ".pyc",
@@ -668,6 +689,44 @@ def audit_install(settings: Settings) -> ReleaseAudit:
             ),
         )
     )
+
+    # Required installer payload files. This is the check that would have caught
+    # the incident this release fixes: one missing template (`.env.example`) made
+    # four package builders and nineteen tests fail, and nothing in `release audit`
+    # mentioned it. Reported as a fact, with the one command that restores it.
+    from .env_template import ENV_TEMPLATE_NAME
+    from .posix_package import _REQUIRED_PAYLOAD_FILES as _POSIX_REQUIRED
+    from .windows_installer import _REQUIRED_PAYLOAD_FILES as _WINDOWS_REQUIRED
+
+    required = sorted(_POSIX_REQUIRED | _WINDOWS_REQUIRED)
+    missing_payload = [
+        name for name in required if not (settings.root_dir / name).is_file()
+    ]
+    present_payload = len(required) - len(missing_payload)
+    if not missing_payload:
+        payload_status = "pass"
+        payload_detail = (
+            f"all {len(required)} required installer payload files are present"
+        )
+    elif present_payload * 2 < len(required):
+        # A deliberately minimal tree (tests build 10-file fake roots) is not an
+        # install that ships packages, and failing the audit there would be noise.
+        # A *real* install missing one file is exactly the fault this check exists
+        # to catch, so the distinction is "mostly present" vs "not an install".
+        payload_status = "info"
+        payload_detail = (
+            f"this tree is not a full install ({present_payload}/{len(required)} "
+            "installer payload files present); the payload check does not apply"
+        )
+    else:
+        payload_status = "fail"
+        payload_detail = (
+            "missing required installer payload file(s): "
+            + ", ".join(missing_payload)
+            + " - restore them by re-running the installer patcher "
+            f"(`pc-agent release env-template --write` restores {ENV_TEMPLATE_NAME})"
+        )
+    checks.append(AuditCheck("installer_payload", payload_status, payload_detail))
 
     baseline = baseline_status(settings.root_dir)
     checks.append(

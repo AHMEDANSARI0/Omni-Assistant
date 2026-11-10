@@ -1,5 +1,770 @@
 # Changelog
 
+## 0.82.12 - the certificate truth: a purchase guide, and a claim this project got wrong
+
+The BARA item is a certificate, and a certificate cannot be generated here - it is
+an identity document issued by a certificate authority to a verified person. So
+this release does the two things that *can* be done: it tells you exactly which
+product to buy from Pakistan, and it fixes a claim this project was making that
+stopped being true.
+
+**The correction.** `pc-agent release signing --reputation` said:
+
+```
+expected first run: EV: typically trusted immediately
+```
+
+and `docs/smartscreen_reputation.md` said EV "buys you reputation from day one".
+**Microsoft removed the EV SmartScreen bypass in 2024.** EV- and OV-signed files
+now build reputation the same way, so that line was telling a user to spend
+2-3x more for a benefit that no longer exists. Both the code and the document now
+say what is true: a certificate shows your publisher name and starts a reputation
+history; nothing bypasses the warning dialog any more. `hardware_backed` is
+described as what it is - post-June-2023 CA/Browser Forum compliance, true of EV
+*and* OV - instead of as "the EV signal".
+
+**The guide.** `docs/certificate_purchase_guide.md`:
+
+* Azure Artifact Signing (~$9.99/month, no USB token) is **not available** from
+  Pakistan: public-trust certificates cover organisations in the USA, Canada, the
+  EU and the UK, and individuals only in the USA and Canada. Saying so saves a
+  wasted afternoon.
+* The realistic path is an **individual/OV certificate** ($150-300/year, cloud HSM
+  or USB token, 1-7 business days), with the CA's actual document list (passport
+  or CNIC, proof of address, a callable number, DUNS for OV) prepared beforehand.
+* Why EV is no longer the smart upgrade, and when it still is (kernel-mode
+  drivers, enterprise contracts).
+* Why a **timestamp** keeps the signature valid after the certificate expires.
+* What to do on the day the token arrives, using the commands this product already
+  implements, ending with `signtool verify /pa /all` as the independent check.
+* An explicit "if you decide not to buy one yet" section: everything works
+  unsigned, and `--reputation` will keep saying so.
+
+**Tests.** Two new tests pin the correction (`windows_signing.py` may not contain
+"trusted immediately"; the document may not contain "Typically trusted
+immediately") and check the guide: it must mention the 2024 change, the
+US/Canada-only restriction, Pakistan, the "does not buy" section, and the three
+product commands - with **no angle-bracket placeholders** in any copyable command.
+
+## 0.82.11 - the installer build path: one command, and it cannot cost you the UI
+
+This is the window-to-installer step. The window already works (`pc-agent gui`),
+but shipping a `.exe` needs Node, Rust and WebView2, and the build has a
+destructive edge that was not handled.
+
+**The hazard this release removes.** `npm run build` deletes
+`src/pc_agent/webui/assets` and `index.html` *before* it compiles, and
+`tauri:build` runs that same command. A type error, a missing `node_modules`, a
+Ctrl+C, or a Rust compile error therefore left the Python package with **no
+Command Center at all**: the server stayed up and served a 404 where the app
+should have been. It bit this project once already. `pc-agent release installer
+--build` now snapshots that bundle first and puts it back when the build fails,
+reporting `ui_bundle_restored`, and it deletes the snapshot after a good build.
+`webui/__init__.py` is never touched.
+
+**The runtime got an honest answer.** The Tauri window is only a window: it runs
+`python -m pc_agent api serve` (honouring `OMNI_PYTHON`) and waits for the
+loopback origin. On a PC with several interpreters, `python` is a coin flip, so
+`--launcher` writes `Omni-Assistant.cmd` that pins `OMNI_PYTHON` to the
+interpreter that actually imports this package, then starts the built `.exe` if
+it exists and otherwise falls back to the built-in window. The `runtime` step in
+the report states this instead of implying the exe is self-contained. It writes
+no credentials, and it is CRLF because cmd.exe wants that.
+
+**The command now tells you what to type.** Blockers were already facts, not
+advice; now `--check` ends with the ordered, deduplicated fixes
+(`winget install --id Rustlang.Rustup ...`, then `--check`, then
+`--build --launcher`), with a single line for Rust even though `cargo` and
+`rustc` are two separate blockers.
+
+**Also:** `npm ci` is used when `frontend/package-lock.json` exists and
+`npm install` otherwise (a tree without a lockfile used to fail with npm's own
+cryptic message), and `npm` failing now skips the Tauri build instead of running
+it anyway.
+
+**Tests.** `tests/test_installer_build_path.py` (18) - lockfile choice, restore
+after a failed build, no restore after a good one, no snapshot when there is no
+bundle, `npm` failure skipping Tauri, launcher content (pin, exe branch,
+fallback, CRLF, spaces in path, no credentials), the runtime step, and the
+ordered fix commands. `--check` on this Linux machine still honestly reports
+`FAIL toolchain: missing cargo, rustc` - this release does not claim a Rust build
+happened anywhere.
+
+## 0.82.10 - a closed Command Center window was reported as a server error
+
+Found by simply running the app: `pc-agent gui` opened the window, then the
+console filled with this every couple of minutes.
+
+```
+ERROR | pc_agent.api | Local API GET /v1/events/stream failed
+ConnectionAbortedError: [WinError 10053] An established connection was aborted
+  ... api_server.py:363 in _stream_events  self.wfile.write(b'{"type":"stream.heartbeat"}\n')
+Exception occurred during processing of request from ('127.0.0.1', 51413)
+```
+
+**Cause.** `_stream_events` and `_dispatch` caught `BrokenPipeError` and
+`ConnectionResetError` - the two errors POSIX raises when a reader disappears.
+Windows raises `ConnectionAbortedError` (WinError 10053) instead, plus a bare
+`OSError` on some Winsock paths. So a perfectly normal event - the browser
+dropping the stream: the two-minute bounded stream ending, a reload, the window
+closing, or `EventSource` reconnecting - fell through to the generic
+`except Exception`, which logged at ERROR **and tried to send a 500 on the dead
+socket**. That second write is the "Exception occurred during processing of
+request" traceback; `socketserver` printed it because nothing swallowed it.
+
+This is a Windows-only bug by construction: on Linux the same abort raises
+`BrokenPipeError`, which was handled, so no test ever saw it.
+
+**Fix.**
+
+* `_CLIENT_GONE` = `BrokenPipeError, ConnectionResetError, ConnectionAbortedError`
+  and `_DISCONNECT_ERRNOS` (EPIPE, ECONNRESET, ECONNABORTED, WSAECONNABORTED,
+  WSAECONNRESET, ENOTCONN, ESHUTDOWN) cover the specialised classes and the bare
+  `OSError` variants. Both stream writers now end quietly on any `OSError`.
+* `_dispatch` treats a client hang-up as a debug line, and the 500 reply is
+  itself guarded, so a failing request can no longer produce two tracebacks.
+* New `_QuietThreadingHTTPServer` overrides `handle_error`: a hang-up is a debug
+  line, anything else still goes to `socketserver`'s normal traceback. The local
+  server no longer shouts at a user who closes a window, but it still reports
+  real faults.
+
+**Tests.** `tests/test_event_disconnect_is_quiet.py` (9) pins the four error
+shapes Windows/POSIX raise, asserts the stream and dispatch paths stay silent,
+asserts a genuine `RuntimeError` still yields a 500 **and** an ERROR log, and
+that the server's `handle_error` override only silences disconnects. Against
+0.82.9 exactly three of them fail with the reported traceback, which is how the
+regression test was written.
+
+**Not changed.** The stream stays bounded (120 s default, 900 s max), heartbeats
+stay at 10 s, and nothing is retried server-side: reconnection is the browser's
+job and `EventSource` already does it.
+
+## 0.82.9 - one missing template file was breaking four installers
+
+This release exists because a real Windows run failed 29 tests, and 27 of them
+were the same file.
+
+**What happened.** `.env.example` was not in `D:\omni-assistant`. That file is not
+documentation: the Windows installer, the POSIX package, and therefore the Debian
+and RPM packages, all require it as a payload file, because a package has to ship
+the template the user copies to `.env`. With it gone:
+
+* 27 tests failed across phases 24, 38, 41, 46, 47, 48, 50, 51, 52 and 57 - every
+  one with "missing required files: .env.example", none saying what to do;
+* `pc-agent release audit` still reported **READY**, so the one command a user
+  runs to check their install said everything was fine.
+
+That is a bad failure mode: a single 8 KB sample file, one error message repeated
+twenty-seven times, and no stated fix.
+
+**The fix, in three parts.**
+
+1. **The template now lives in code.** `pc_agent/env_template.py` holds the exact
+   shipped text as `ENV_TEMPLATE`, and both payload resolvers restore a missing
+   `.env.example` before they complain about anything else - with a warning naming
+   the path. Restoring it can never leak anything: it is the sample file, and the
+   suite asserts every `*_KEY=` / `*_TOKEN=` line in it is empty.
+2. **It is checkable on demand.** `pc-agent release env-template --check` reports
+   present/missing and exits `1` when missing; `--write` restores it; `--json` is
+   machine-readable. A file that four builders depend on should not be invisible.
+3. **It is now actually audited.** `pc-agent release audit` gained check 34,
+   `installer_payload`: all 19 required payload files, by name, and the command
+   that restores the template. `scripts/verify_windows.py` gained a `payload` gate
+   that runs before the four-minute suite, so this class of breakage is one line in
+   the verification report instead of nineteen puzzle pieces in pytest output.
+
+Self-healing is deliberately narrow: only `.env.example` is restored. A missing
+`scripts/install_posix.sh` still fails - but the message now ends with how to
+recover ("re-run the installer patcher", plus the `env-template --write` command),
+and a test pins that wording so it cannot rot.
+
+**The other two failures in that run were the older, already-fixed ones:**
+`WinError 10038` from the API server shutdown race and the POSIX-literal argv
+assertion both come from a tree that does not contain 0.82.6, which is why the
+same run also produced the old `assert '\\opt\\chrome' == '/opt/chrome'`. The
+version numbers matched because that tree is internally consistent - it is simply
+older than the fixes. `python -c "import pc_agent; print(pc_agent.__version__)"`
+answers that question in one second, and `scripts\\verify_windows.py` answers it
+with the import origin.
+
+**Numbers.** Suite **1298 passed, 2 skipped** on Linux; `ruff` clean; release
+audit READY (**34** checks); allow-list **490** files.
+
+## 0.82.8 - signing for EV / hardware keys, timestamps that survive, and SmartScreen told honestly
+
+The last BARA item. Three parts, and the third is the one that matters most,
+because it refuses to sell an outcome.
+
+**EV / post-2023 OV certificates: the key must stay on hardware.**
+
+Since June 2023 a publicly-trusted code-signing key has to live in a token, an HSM
+or a TPM-backed container. That makes "export to PFX" not just risky but
+forbidden - and it makes the "which certificate do I even have" question
+decisive. So:
+
+* `pc-agent release signing --certificates` now also reports **where each key
+  lives** (`hardware-token` / `software-store` / `unknown`), the provider name,
+  and the key type, and it counts the hardware-backed ones;
+* `pc-agent release sign-bundle --require-hardware` enforces the rule: a PFX is
+  **refused** with the reason (it is an exportable copy of a key you may not
+  copy), a hardware-backed certificate is accepted with the provider named, and a
+  software-stored key is **blocked** with "check the token is plugged in and its
+  middleware is running";
+* when the metadata cannot be read - a custom CNG/KSP provider, an HSM that does
+  not expose the legacy CSP fields, or any non-Windows host - the result is a
+  **note**, not a pass. Claiming "hardware confirmed" for something this product
+  cannot inspect would be a guess about someone's signing identity.
+
+Nothing in that path exports, reads or unlocks a private key: it reads the
+provider name and the `HardwareDevice` flag, both public metadata.
+
+**Timestamps: the difference between a signature and a signature that expires.**
+
+Every signature was already `sha256` + RFC 3161, but a timestamp *authority* can
+be down, rate-limited or unreachable - and an untimestamped signature dies with
+the certificate, at which point every installer ever shipped starts warning
+again. A failed request is now retried in order:
+`timestamp.digicert.com` -> `timestamp.sectigo.com` ->
+`timestamp.globalsign.com/tsa/r6advanced1`. The report names the authority that
+worked, keeps the exit code and last line of every attempt, and a run where all
+three fail is a **failure** whose message lists what was tried - not a signature
+that quietly has no timestamp.
+
+**SmartScreen: reported, never promised.**
+
+`pc-agent release signing --reputation` prints the policy next to the real state
+of the machine: which certificates exist, whether their keys are hardware-backed,
+the last recorded signing run from `data/installer-signing.json`, and each
+installer's verification result. It states the expectation that follows from the
+certificate - *unsigned: "Unknown publisher"*, *OV: name shown, SmartScreen may
+still warn until reputation accrues*, *EV: typically trusted immediately* - and it
+reports reputation itself as `not-measurable-here`, because Microsoft decides it
+from downloads, publisher identity and malware reports, and this product can
+neither measure nor buy it.
+
+The full runbook, including the checklist order and what a signature does not buy,
+is `docs/smartscreen_reputation.md`.
+
+**Numbers.** Suite **1282 passed, 2 skipped** on Linux; `ruff` clean; release
+audit READY (33 checks); allow-list **488** files. Still not claimed: no
+certificate exists on this machine, so every signing command here reports
+`not-run` / `NOT READY` with the real reasons. The code is tested against fake
+`signtool`, fake PowerShell and fake timestamps; the Win32 trust path and a real
+token remain the user's step, by construction.
+
+## 0.82.7 - the installer becomes a command, and the widget grid becomes touchable
+
+Two MEDIUM items from the open list, both of which used to be "read the docs and
+do it by hand".
+
+**`pc-agent release installer` - check, build, sign.**
+
+The desktop installer needed Node, Rust and WebView2, so the only way to find out
+whether a machine could build it was to try and read the error. Now:
+
+* `--check` runs nothing that installs or compiles. It reports `node`, `npm`,
+  `cargo` and `rustc` **with their version strings**, whether the WebView2
+  runtime is present, whether `tauri.conf.json`'s `frontendDist` actually resolves
+  to a built UI with an `index.html`, and whether an installer already exists in
+  `bundle/nsis` or `bundle/msi`. Missing pieces are named as blockers with the
+  fix, and the exit code is `1`.
+* `--build` runs `npm ci` then `npm run tauri:build` - argv lists, never a shell -
+  with a timeout and the **tail of each output kept**. A failed `npm ci` does not
+  start the ten-minute Rust compile; it is recorded and the build step is marked
+  skipped.
+* `--sign` reuses the Authenticode runbook, so both the NSIS `.exe` and the MSI
+  are signed and verified; without a certificate the command refuses with exit
+  `2` before touching anything.
+* every run writes `data/installer-build.json`: steps, durations, output tails,
+  artifacts with sizes, blockers, signing results.
+
+Measured here: `pc-agent release installer --check` on Linux reports
+`missing: cargo, rustc`, marks WebView2 `not-run` (off Windows), passes the shell
+definition (the `frontendDist` path resolves to a real `index.html`), and exits
+`1` with both blockers listed. That is the honest answer for this machine, and it
+is the same answer the user will get until they install Rust.
+
+**Arrange mode in the Command Center.**
+
+Resize/hide/move lived in a hover toolbar, which is a mouse-only affordance: no
+hover means no controls on a touch screen, and the same for a keyboard-only user.
+One **Arrange** button now pins every widget control open at a **32 px** target
+and reports itself via `aria-pressed`; **Done** puts it back, and the choice is
+remembered across reloads (in its own key - arranging is a mode, not part of the
+layout, so `Reset layout` never turns it on or off).
+
+The browser harness now measures it instead of trusting it: 57/57 checks, of
+which three are new - controls visible at `opacity 0 → 1` without hover, target
+height `15px → 32px`, and the mode surviving a full page reload. Contrast still
+passes in both themes.
+
+**Numbers.** Suite **1252 passed, 2 skipped** on Linux; `ruff` clean; release
+audit READY (33 checks); allow-list **485** files. Windows is still not claimed:
+nothing here needs a Windows machine to be true, and nothing claiming Windows
+(installer build, code signing, SmartScreen) is marked as verified.
+
+## 0.82.6 - the Windows run of the suite is green, and the three reasons it was not
+
+The 0.82.5 suite failed six tests on the target Windows machine and passed the
+same six on Linux. Two were real product bugs, one was a test that asserted a
+POSIX path, and three were a mixed install tree. All of it is fixed, and every
+fix has a test that fails without it
+(`tests/test_windows_platform_regressions.py`, 14 tests).
+
+**Real bug 1 - the API server could not be stopped from the `api serve` path.**
+`LocalApiServer.stop()` only called `shutdown()` when the server had been started
+on *its own* thread. `pc-agent api serve` runs `serve_forever()` on the caller's
+thread, so `stop()` skipped the shutdown and went straight to `server_close()`.
+On Windows the loop then woke up selecting on a closed socket:
+`OSError [WinError 10038] An operation was attempted on something that is not a
+socket`, thrown out of the thread as an unhandled exception. The server now
+tracks whether *any* thread is inside `serve_forever`, shuts that loop down
+before closing the socket, and survives a socket error inside the loop instead of
+killing the thread.
+
+**Real bug 2 - a failing release chain was silent in `--json` mode.**
+`pc-agent release production-check --json` printed a report, exited `1`, and put
+the reason inside the JSON. A user (and the test that caught it) saw only
+`assert 1 == 0`. Every failing step is now named on stderr -
+`Release chain step failed -> apply: ...` - while stdout stays valid JSON. On top
+of that, the two file operations in the chain (`copy2` per file, one read per
+file in the tree hash) are retried when Windows reports a transient sharing
+violation (WinError 5/32/33), which is what an indexer or antivirus holding a
+freshly written file looks like. A real permission error is still raised.
+
+**Test bug - a POSIX literal was asserted on every platform.**
+`test_app_window_argv_has_no_chrome_and_its_own_profile` expected
+`argv[0] == "/opt/chrome"`, but `str(Path("/opt/chrome"))` is `\opt\chrome` on
+Windows: a `Path` carries host path semantics, so the *code* was right and the
+assertion was wrong. It now asserts the platform-correct representation
+(`os.fspath`), and a new test pins the contract that actually matters: an
+executable passed as a **string** - e.g.
+`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe` - reaches
+`CreateProcess` byte for byte, never re-normalised. To make that true the code
+stopped round-tripping strings through `Path`.
+
+**The mixed tree - and the patcher no longer allows one.**
+Three failures were version skew, not features: `pyproject.toml` said 0.82.4
+while `import pc_agent` reported 0.82.3 and `README.md` still said 0.82.3. That
+is a patched install that is not one release. Two changes:
+
+* the patcher now **reads every shipped file back** after writing and compares it
+  with the manifest: `created=… updated=… skipped=… verified=480/480`. Any
+  mismatch is printed as `[MISMATCH] <path>`, the exit code becomes `1`, and the
+  run says what to do next. A patcher that claims success over a mixed tree is
+  worse than one that fails loudly.
+* the post-install steps print
+  `python -c "import pc_agent; print(pc_agent.__version__, pc_agent.__file__)"`
+  with the expected answer, because a stale copy in `site-packages` can shadow an
+  editable install and produce exactly this "impossible" version mismatch.
+
+**Also in this build:** the release-chain work directory uses a short temp prefix
+(`pcprod-` instead of `pc-agent-production-`), because 480 release paths up to 58
+characters deep sit inside it and Windows MAX_PATH is 260; a test asserts the
+longest shipped path stays under 120 characters.
+
+**One command for the confirmation itself.** "Run the tests and paste the output"
+is not a verification story, so `scripts/verify_windows.py` runs every gate in
+order - interpreter and version, *which* `pc_agent` was imported and from where,
+`ruff`, `doctor`, `release audit`, the desktop-shell preflight, the full
+`pytest -q` suite, `release production-check` - keeps each exit code and the tail
+of each output, and writes `data\windows-verification.json`. It prints
+`WINDOWS VERIFICATION: PASS` or `FAIL (suite)` with the failing tail on screen,
+exits `1` on any failure, and never quietly skips: the installer-signing check is
+listed as `N/R` with its reason and the exact next command. The import gate is the
+one that matters most - it fails when `pc_agent` resolves to a stale
+`site-packages` copy instead of this tree, which is exactly the trap behind the
+phantom version mismatch.
+
+**Where this leaves the numbers.** Suite **1216 passed, 2 skipped** on Linux;
+`ruff` clean; release audit READY (33 checks); allow-list **480** files. The
+Windows run of 0.82.5 measured 1161 passed / 9 skipped / 6 failed - those six
+are the ones above. The Windows suite has **not** been re-run against this build
+from here (no Windows machine on this side); the assertions that failed are now
+platform-correct or covered by tests that do not depend on the host, so a re-run
+is the confirmation step, not a hope.
+
+## 0.82.5 - the installers can now be signed for real, and the Command Center stops pretending
+
+Two gaps closed, both of them things a user could see from the outside.
+
+**Signing the thing you actually download.** 0.82.4 made the desktop build
+verifiable but left the last mile as advice: the installer comes out unsigned,
+so Windows SmartScreen shows "unknown publisher". Signing an *update bundle* was
+already supported (Phase 21), but nobody downloads an update bundle. This release
+adds the installer path end to end:
+
+* `pc-agent release signing --certificates` reads `Cert:\CurrentUser\My`, prints
+  every code-signing certificate with its **thumbprint, validity window and
+  whether a private key is present**, then prints the two lines to paste. A
+  certificate without a private key can verify but cannot sign, and this is where
+  you find that out - not at signing time.
+* `pc-agent release sign-bundle --check` signs nothing and reports `READY` /
+  `NOT READY` with every blocker named: no installer found (build first), no
+  `signtool.exe` (install the Windows SDK, or pass `--signtool`), no certificate,
+  a thumbprint shorter than 40 hex characters, a missing PFX. Exit `1` when not
+  ready, so a release script can gate on it.
+* `pc-agent release sign-bundle` signs **both** the NSIS `.exe` and the `.msi`
+  with `sha256` plus an RFC 3161 timestamp, then verifies each one through the
+  Win32 trust API, not `signtool`'s exit code. Only a bundle where every file is
+  signed *and* verifies reports `ok`; the report lands in
+  `data/installer-signing.json` and the command exits `1` otherwise.
+* The PFX password is read **only** from `PC_AGENT_SIGN_PFX_PASSWORD`. There is
+  no flag that accepts the secret itself (command lines are visible to other
+  users and land in shell history), and `--allow-argv-password` - which exists
+  for throwaway VMs - is refused by the bundle command. Nothing here writes,
+  exports or logs key material.
+
+The full runbook, including what this deliberately does *not* do (obtain a
+certificate, sign from CI, handle your key), is `docs/authenticode_signing.md`.
+
+**The Command Center's widget grid is now actually configurable.** Drag-to-reorder
+and two arrow buttons existed; width and visibility did not, so a dashboard full
+of nine panels was fixed at whatever size the layout gave it. Now:
+
+* **⤢** resizes a widget between half and full width (measured: 325px -> 660px in
+  the verification harness, and it survives a reload because it is stored in
+  `omni.ui.v1`);
+* **✕** hides a widget, and the **Widgets (8/9)** menu restores it - a hidden
+  widget keeps its position, so unhiding does not reshuffle the board;
+* emptying the grid on purpose is allowed, and the empty state offers one button
+  to bring the default layout back, which is also what **Reset layout** does.
+
+Then the details that make it honest rather than decorative: the toolbar is a
+hover/focus affordance so it never covers content at rest, every control has an
+`aria-label` that names the widget, and the keyboard path (the arrow buttons)
+does the same job as dragging. The UI verification harness grew three checks for
+exactly this - width toggle, hide-and-survive-reload, reset - and now runs
+**54/54**, with the measured contrast check still passing in both themes.
+
+**Numbers for this build.** Suite **1202 passed, 1 skipped** (the Tk-only test,
+no display here); `ruff` clean; release audit READY (33 checks); release
+allow-list **479** files (the signing runbook doc and its test suite are new);
+`scripts/check_desktop_shell.py` still prints `DESKTOP SHELL: READY`; the patched
+install - apply the patcher into a clean folder, `pip install -e ".[dev]"`, run
+the suite from inside it - is green with the same count.
+
+**Still honest about what is not done.** No Windows installer was built or signed
+on this machine: there is no Rust toolchain, no WebView2 and no certificate here,
+so `release sign-bundle --check` prints `NOT READY` with three real blockers and
+`release signing --certificates` prints `not-run` on Linux. The signing path is
+implemented, unit-tested against fake `signtool`/certificate output, and
+unverified against real Windows trust APIs - that remains the user's step, with
+their own certificate. Widget resize should also be reachable without hovering
+(touch targets), which is still on the list.
+
+## 0.82.4 - the installer build is preflighted, and one real config bug is gone
+
+The desktop installer was the last item nobody could check: `npm run tauri:build`
+needs Rust and WebView2, which this machine does not have. So instead of
+promising an installer, this release makes everything *around* the build
+verifiable everywhere - and in doing so found a bug that would have failed the
+first real build.
+
+**The bug**
+
+`tauri.conf.json` had `"frontendDist": "../src/pc_agent/webui"`. That path is
+resolved **relative to `frontend/src-tauri/`**, so it pointed at
+`frontend/src/pc_agent/webui`, a directory that does not exist. `tauri build`
+would have failed at context generation, after the toolchain install and the Rust
+compile. It now reads `../../src/pc_agent/webui`, and
+`build.beforeBuildCommand` is set to `npm --prefix .. run build` so the bundle
+can never be built from a stale SPA.
+
+**New: `scripts/check_desktop_shell.py`**
+
+Runs in about a second on any machine with Python, and validates each thing that
+actually breaks a Tauri build:
+
+| Check | Why |
+|---|---|
+| `frontendDist` resolves to a directory containing `index.html` | the exact bug above |
+| `beforeBuildCommand` rebuilds the UI | no stale assets in the installer |
+| window URL is a loopback origin, min size >= 1024x700, label `main` | the window is the local app, and capabilities target that label |
+| every `bundle.icon` exists with real PNG/ICO/ICNS magic bytes | Tauri fails at the very end otherwise |
+| `tauri.conf.json` and `Cargo.toml` versions equal `pc_agent.__version__` | About box and engine cannot disagree |
+| capabilities are exactly `["core:default"]`, scoped to `main` | no shell/fs/http power reaches the webview |
+| no `tauri-plugin-shell/fs/http`; single-instance wired; `lto`+`strip` set | the security and size posture the release claims |
+| toolchain presence (`cargo`, `node`) | reported as a warning, never faked |
+
+It fails a broken tree loudly (`DESKTOP SHELL: NOT READY` + the reason) instead
+of crashing on a missing file - which is itself covered by a test.
+
+**New: Windows CI job** (`.github/workflows/desktop-windows.yml`)
+
+`workflow_dispatch` or a `v*` tag: preflight -> `npm ci` -> `npm run build` ->
+Rust -> `tauri build` -> list the artefacts -> upload NSIS/MSI. It performs **no
+code signing** (a test asserts no `signtool`, no `secrets.`, no signing env vars
+in that workflow): Authenticode needs the user's certificate and stays a manual,
+documented step.
+
+**Also fixed: a patched install was not a green tree**
+
+Applying the patcher into an empty folder and running the suite there failed
+**9 tests** - every one of them because `.github/workflows/` was not part of the
+release allow-list, while the production-hardening audit and
+`tests/test_transformation_phase18_hardening.py` both treat a missing CI workflow
+as a finding. A patched install was therefore not the same product as the
+repository. `.github` is now in `_INCLUDE_DIRS` (workflows contain no secrets and
+are read-only jobs), so a patch install equals the tree it was built from.
+Verified by running the entire suite *inside* a freshly patched folder:
+**1184 passed, 1 skipped**, `ruff` clean - see `TEST_REPORT.md`.
+
+**Verified**
+
+* 9 new tests in `tests/test_desktop_shell_preflight.py`, including two negative
+  cases (broken `frontendDist`, remote window URL) and a check that CI does not
+  sign.
+* `python scripts/check_desktop_shell.py` -> `DESKTOP SHELL: READY` (18 checks,
+  1 honest warning: `cargo` absent on this machine).
+* Full suite and `ruff` results are recorded in `TEST_REPORT.md`; the Tauri
+  binary itself remains **unbuilt here** - unchanged claim.
+
+## 0.82.3 - the Command Center runs as PC software, not only in a browser tab
+
+Fair question after 0.82.2: the new UI opened in a browser, so is it desktop
+software at all? Yes - and now it opens as a **window without browser chrome** by
+default, with no Rust toolchain required.
+
+`pc-agent ui` (and `pc-agent gui`) pick the best window this machine can give:
+
+| Order | Window | Needs |
+|---|---|---|
+| 1 | **pywebview** - a real OS webview (WebView2 on Windows, WebKit/WKWebView elsewhere) | `pip install -e ".[desktop]"` (optional extra) |
+| 2 | **Installed Chromium-family browser in `--app` mode** - borderless app window, no address bar, no tabs | nothing: Edge ships with Windows; Chrome/Brave also detected |
+| 3 | **Default browser tab** | nothing |
+
+New module `desktop_window.py`:
+
+* loopback-only: a non-loopback URL is refused with `ConfigError`, so the app
+  window can never be pointed at a remote page and passed off as the product;
+* argv list, `shell=False` - no shell strings, no quoting games;
+* `--app=<url> --window-size=1560,980 --user-data-dir=<data>/ui-window` - a
+  dedicated profile, so it is a separate instance and never merges with (or
+  inherits extensions from) the user's own browser session;
+* the process we spawn is ours: stopping the server (`Ctrl+C` or `--duration`)
+  closes exactly that window;
+* `--explain` prints the plan (kind, launcher, reason) and exits without binding
+  a port or opening anything - useful when diagnosing a machine;
+* the token still never appears in a URL: the server injects it into the page's
+  `meta` tag as before.
+
+`pywebview` stays **optional** (`[desktop]` extra) so `pip install -e ".[dev]"`
+is unchanged and nothing new is needed to run the assistant.
+
+**Verified**
+
+* Linux: **1175 passed, 1 skipped**; `ruff` clean; `release audit` READY (33 checks).
+* 21 new tests in `tests/test_desktop_app_window.py`: loopback acceptance/refusal,
+  argv contract (`--app`, own profile, no shell metacharacters), the three
+  fallback orders, `--explain` constructing no server, and a real child process
+  that the test starts and terminates.
+* `pc-agent ui --explain` prints the plan on a machine with no Chromium installed
+  ("browser - no Chromium-family browser found") instead of pretending.
+* Tauri remains the fourth option and is still **scaffolded, not built here** -
+  the app-window path is what ships today.
+
+## 0.82.2 - the Command Center becomes the default entry point, and it mirrors
+
+Two things the 0.82.0 Windows run made obvious, fixed together.
+
+**1. `pc-agent gui` opened the old Tkinter panel**
+
+The new interface shipped, but the command a user has been typing since Phase 1
+still opened the classic Tk window - so that is the UI they saw. The default is
+now the Command Center:
+
+| Command | Opens |
+|---|---|
+| `pc-agent ui` | the Command Center at `http://127.0.0.1:8765` (API started for you) |
+| `pc-agent gui` | the same Command Center (**new default**) |
+| `pc-agent gui --tk` | the classic Tkinter panel, unchanged, for rollback |
+| `pc-agent gui --check` | readiness check, unchanged |
+| `pc-agent api serve` | the API alone (no browser), unchanged |
+
+`--no-browser` and `--duration N` are available on `ui`/`gui --web`. The launcher
+binds loopback only, prints the origin (never a token in a URL), and stops the
+server on Ctrl+C or when the duration expires. The Tk GUI, `/legacy` and every
+`/v1` route are untouched - this is a default, not a removal.
+
+**2. The shell did not mirror for right-to-left languages**
+
+Phase 17 shipped RTL for the Tk panel and the engine reports `direction: rtl` for
+a right-to-left locale, but the React shell had no direction handling at all, and
+a dozen physical utilities (`ml-*`, `pr-*`, `border-l`, `text-left`, `left-0`)
+would have kept pointing the wrong way even with `dir="rtl"` set.
+
+* Every layout utility now uses the logical form (`ms/me`, `ps/pe`,
+  `border-s/border-e`, `text-start/text-end`, `start/end`) - enforced by a test
+  that fails on any physical one reappearing;
+* `omni.ui.v1` gains `direction: "auto" | "ltr" | "rtl"` with a control in
+  Settings → Display. `auto` follows the engine's locale report
+  (`/v1/a11y/status`), never the browser guess;
+* an explicit choice is applied by the pre-paint boot script, so RTL is the first
+  frame rather than a flip after load;
+* technical values are bidi-isolated, so numbers, ports and ids keep their own
+  direction inside an RTL sentence.
+
+**Desktop shell: real icons instead of a promise**
+
+`scripts/make_app_icons.py` draws the product mark with Pillow at 8x
+supersampling and writes the full set - `32x32.png`, `128x128.png`,
+`128x128@2x.png`, `icon.png`, a multi-size `icon.ico` and `icon.icns` - into
+`frontend/src-tauri/icons/`. They are reproducible from source and are now
+committed, so `npm run tauri:build` on a build machine has everything it needs
+except the Rust toolchain and WebView2, which this machine does not have. The
+Tauri shell itself is still **scaffolded, not built here** - that claim does not
+change.
+
+**Verified**
+
+* Linux: **1154 passed, 1 skipped** (real-Tk-window oracle); `ruff` clean;
+  `release audit` READY (33 checks).
+* Browser harness **51/51**, including four new RTL checks: `dir` switches, the
+  sidebar mirrors to the right edge, content stays opposite it, no horizontal
+  overflow, and `auto` matches the direction the engine reports.
+* `pc-agent ui --no-browser --duration 8` served `/` with HTTP 200 and stopped on
+  its own.
+
+## 0.82.1 - voice acceptance stops passing a backend it cannot use
+
+The 0.82.0 Windows run of the full suite failed exactly one test, and the test was
+right to fail: on that machine the voice acceptance harness reported **every one
+of its seven gates as passed**, including `push_to_talk`, on a host where the
+gate had only proved that a capture *backend* (`winmm`) was importable.
+
+**The defect (source, not test)**
+
+`voice/acceptance.py` marked `push_to_talk` as `pass` whenever
+`status.microphone.backend` was anything other than `none`. winmm, ALSA and the
+`sounddevice` module all exist on machines with no input device at all, so a
+microphone-less PC could print `PASSED` for a voice subsystem it cannot use -
+a false acceptance pass, which is the one thing this programme does not ship.
+
+Now the gate needs a real backend **and** at least one enumerated input device.
+With a backend but no device it is `not-run` with the scan reason, and the pass
+detail says what was proved: `backend winmm with 1 input device(s) enumerated
+(presence only - no audio was recorded by this gate)`.
+
+**The test (platform-correct instead of Linux-CI-correct)**
+
+`test_voice_acceptance_is_sealed_and_honest_about_the_host` no longer assumes a
+headless host. It reads the live service status and asserts the verdict matches
+the hardware: `not-run` exactly for the gates whose hardware this host lacks, and
+`passed` only when the report also carries the backend and input-device count it
+measured. Every gate must state the evidence behind its verdict.
+
+A new regression test, `test_voice_acceptance_does_not_pass_a_backend_without_a_device`,
+pins the hardening: backend present + zero devices must stay `not-run`.
+
+**Verified**
+
+* Linux (this build machine, no audio hardware): `INCOMPLETE; passed=4;
+  not-run=push_to_talk,stt_engine,tts_engine` - unchanged, honest.
+* Simulated Windows host (winmm + 1 device + SAPI on both engines):
+  `PASSED; gates=7; passed=7; failures=0`, host block records
+  `microphone_backend=winmm`, `input_devices=1`.
+* Linux full suite **1148 passed, 1 skipped** (the real-Tk-window oracle);
+  `ruff` clean; `release audit` READY with 33 checks. On Windows the same suite
+  has eight further documented skips (symlink privilege, POSIX shell, live
+  systemd/logind, non-Windows-only assertions), so the expected Windows line is
+  **1148 passed, 9 skipped** - that re-run is still the user's.
+
+Version moves to **0.82.1** (`PREVIOUS_TRANSFORMATION_VERSION = "0.82.0"`);
+patched installs get it from the same `TRANSFORMATION_PHASE_20_COMMAND_CENTER.mjs`
+patcher, rebuilt below.
+
+## 0.82.0 - Command Center UI redesign (the engine is unchanged)
+
+The programme's last user-visible debt was the interface. 0.67.0 shipped a
+Tkinter Command Center and a hand-written web panel; both worked, neither looked
+like the product this assistant is meant to be. 0.82.0 replaces the presentation
+with a React/TypeScript Command Center served by the local API - **and touches no
+engine code**: the same ~80 `/v1` routes, the same safety kernel, the same
+approvals, the same tools.
+
+**New surface**
+
+- `src/pc_agent/webui/` - the built bundle (23 files, 450 kB) plus
+  `read_index()` (token injection), `static_path()` (traversal-safe resolution),
+  `inline_script_hashes()` (CSP hashes) and `smoke()` (honest build status).
+- `GET /` serves the built SPA; if it is missing, the response is a page that
+  says so and prints the build command - never a blank 200 and never a mock
+  dashboard. `GET /legacy` keeps the pre-0.82 panel as the rollback path.
+- `GET /assets/*` with correct MIME types, `immutable` caching and `nosniff`;
+  traversal attempts and missing files are 404.
+- `GET /v1/events/stream?since_id=&duration=` - real NDJSON: a `stream.ready`
+  frame, then events the service actually wrote, 10 s heartbeats, and a hard
+  server-side bound of 5-900 s so a client cannot pin an idle socket. Garbage
+  query values are now a **400** instead of silently falling back to a
+  two-minute default.
+- CSP stays strict: `script-src 'self' 'sha256-...'`. The pre-paint theme script
+  is allowed by its exact hash, computed from the shell per response - no
+  `'unsafe-inline'`, no nonce plumbing, no `'unsafe-eval'`.
+
+**Frontend (`frontend/`)**
+
+- React 18 + TypeScript + Tailwind + Framer Motion. No state library: a
+  resource store with per-key subscriptions, explicit intervals, one in-flight
+  request per resource, polling paused when the tab is hidden.
+- 17 destinations: Command Center, AI Core, Agents, Missions, Tasks, Calendar,
+  Memory, Conversations, Knowledge Base, Tools & Skills, Workflows, Model
+  Center, Voice Assistant, Security Center, System Monitor, Analytics, Settings.
+  All but the dashboard are code-split (3-7 kB each).
+- The holographic AI core is a canvas-2D particle shell with real 3D rotation and
+  depth sorting. States (`idle/thinking/executing/listening/speaking/error/
+  offline`) are derived only from engine signals; nothing is simulated. Three.js
+  was evaluated and **removed**: it would add ~600 kB and a WebGL failure mode
+  for no visual gain over this shell.
+- Dark **and** light themes as token sets, contrast-checked by
+  `scripts/check_contrast.py` and by the Python suite.
+- Widgets reorder by drag-and-drop or keyboard, and the order persists; sidebar
+  state, theme and motion preference persist; `system` motion follows the OS.
+
+**Verification (not "it compiles")**
+
+- `frontend/scripts/ui-verify.js` drives real Chromium against the real API:
+  **46/46 checks** - every route renders real content, both themes measured for
+  contrast, palette opens/navigates, the live stream updates from a new task,
+  collapse persists, widgets reorder, no horizontal overflow at 1280/1024,
+  reduced motion honoured, no console error, no failed request, no cross-origin
+  request, DOM bounded (1011 nodes), FCP 194 ms, 82 KB transferred, 9.5 MB heap.
+- `tests/test_transformation_phase19_command_center_ui.py` - 17 tests inside the
+  normal suite: shell + headers, hash-CSP, asset MIME/cache/traversal, honest
+  missing-build page, `/legacy` rollback, NDJSON stream (ready frame, real event,
+  auth, duration bound, 400 on garbage), bundle self-containment, both themes,
+  and an anti-fake-data guard over the view sources.
+- Full suite **1147 passed, 1 skipped** on Linux (UTC, Asia/Karachi,
+  America/New_York); `ruff` clean; `release audit` READY (33 checks).
+- Release allow-list **477 files** (adds the built bundle, the shipped
+  `frontend/` sources; `node_modules`, `dist`, `data`, caches excluded).
+  Patcher: `TRANSFORMATION_PHASE_20_COMMAND_CENTER.mjs`, rebuilt for 0.82.2 with
+  473 embedded files, applied to an empty root and byte-verified against the
+  tree, re-run reports `skipped=473`.
+
+**Reference-layout fidelity pass**
+
+- New widgets, all reading real endpoints: **AI core overview** (one row per
+  subsystem - health, memory notes, voice, agents, LLM route, task counts) and
+  **workflows & queue**; the roster now has 9 configurable widgets.
+- **System monitor** switched from flat tiles to radial SVG gauges (CPU / RAM /
+  disk / GPU) drawn from the measured snapshot; GPU and disk render `n/a` with the
+  reason when the host cannot measure them.
+- **Voice & attention** gained a real push-to-talk control (enable mic → start
+  capture → stop and transcribe) and a "put in command bar" hand-off, which is
+  the same `POST /v1/voice/*` path the command bar uses.
+- **Model status** lists each configured provider with reachability and model
+  count, and states plainly when only the offline mock engine is available.
+- Saved widget layouts are migrated: unknown ids are dropped and widgets added by
+  this release are appended instead of being hidden by an old layout.
+- Both themes re-verified after the pass: light body text minimum **4.73:1**,
+  dark **5.99:1** over 286 sampled elements; 46/46 browser checks still pass.
+
+**Deliberately not done**: the Tauri 2 desktop shell is scaffolded
+(`frontend/src-tauri/`) but not built or claimed as verified here - this build
+machine has no Rust toolchain or WebView2. The shell maps the shell window onto
+the loopback origin so the shipped path stays `pc-agent api serve` + browser.
+
 ## 0.81.2 - console-script bootstrap (broken-environment UX)
 
 The Windows machine ran `pc-agent gui` and got a bare

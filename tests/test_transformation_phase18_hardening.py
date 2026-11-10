@@ -70,7 +70,7 @@ def chain_report(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 def test_phase18_identity_is_wired_through_the_product() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert TRANSFORMATION_PHASE == 18
     assert "Production" in TRANSFORMATION_LABEL
     assert LATEST_SCHEMA_VERSION == 18  # hardening adds no migration
@@ -216,7 +216,7 @@ def test_an_unreadable_stored_report_is_not_treated_as_a_pass(tmp_path: Path) ->
 def test_audit_reports_32_checks_and_no_failures(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     audit = audit_install(settings)
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     assert audit.failures == 0
     assert "production_hardening" in {check.name for check in audit.checks}
 
@@ -368,7 +368,7 @@ def test_hardening_docs_are_present_and_reference_real_commands() -> None:
 def test_readme_documents_the_hardening_entry_points() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     assert "production-check" in readme
-    assert "0.81.2" in readme
+    assert "0.82.12" in readme
 
 
 def test_no_workflow_or_script_shells_out_to_a_hardcoded_user_path() -> None:

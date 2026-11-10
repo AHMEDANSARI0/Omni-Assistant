@@ -47,7 +47,7 @@ from pc_agent.update_feed_publisher import (
 from pc_agent.updates import b64url_encode
 
 ROOT = Path(__file__).resolve().parents[1]
-_FUTURE = "0.82.0"
+_FUTURE = "0.83.0"
 _BASE_URL = "https://updates.example.com/self-healing-pc-agent"
 _PUBLISHED_AT = "2026-11-02T12:00:00Z"
 _KEY_ID = "release-test"
@@ -779,7 +779,7 @@ def test_phase55_release_admin_and_main_cli_round_trip(
 
 
 def test_phase55_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(build_default_registry().list_tools()) == 69
 

@@ -61,7 +61,7 @@ class _CapturingRouter:
 def test_phase9_identity():
     assert TRANSFORMATION_PHASE == 18
     assert TRANSFORMATION_LABEL == "TRANSFORMATION PHASE 18 Production Hardening"
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert LATEST_SCHEMA_VERSION == 18
 
 
@@ -455,7 +455,7 @@ def test_diagnostics_release_and_gui_agents(tmp_path):
 
     audit = audit_install(settings)
     checks = {check.name: check for check in audit.checks}
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     assert checks["agent_studio"].status == "pass"
 
     controller = GuiController(settings, database=database)

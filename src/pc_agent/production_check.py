@@ -55,6 +55,10 @@ from .updates import (
     stage_update,
 )
 
+#: Kept short on purpose: the work directory is ``<temp>/<this>/install/<file>``
+#: and a long prefix pushes deep release paths towards the Windows MAX_PATH limit.
+_TEMP_PREFIX = "pcprod-"
+
 __all__ = [
     "PRODUCTION_REPORT_NAME",
     "ProductionReport",
@@ -124,6 +128,22 @@ class ProductionReport:
                 return step
         return None
 
+    @property
+    def first_failure(self) -> ProductionStep | None:
+        for step in self.steps:
+            if step.status == "fail":
+                return step
+        return None
+
+    def failure_lines(self) -> list[str]:
+        """One line per failing step - what the CLI prints to stderr."""
+
+        return [
+            f"{step.name}: {step.detail}"
+            for step in self.steps
+            if step.status == "fail"
+        ]
+
     def summary(self) -> str:
         state = "READY" if self.ok else "ATTENTION"
         passed = sum(1 for step in self.steps if step.status == "pass")
@@ -169,6 +189,34 @@ def stored_production_report(settings: Settings) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else {"ok": False, "failures": -1}
 
 
+#: Windows keeps a handle on a file for a moment after another process wrote it
+#: (indexer, antivirus). These are the errors that means, and they are transient.
+_TRANSIENT_WINDOWS_ERRORS = {5, 32, 33}
+
+
+def _retry_file_op(op: Any, *, attempts: int = 6, delay: float = 0.05) -> Any:
+    """Run a file operation again if Windows says the handle is momentarily busy.
+
+    Only ``PermissionError`` / ``OSError`` with a known sharing-violation code is
+    retried - a genuine permission problem is re-raised after the last attempt
+    instead of being hidden.
+    """
+
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return op()
+        except (PermissionError, OSError) as exc:
+            winerror = getattr(exc, "winerror", None)
+            if not isinstance(exc, PermissionError) and winerror not in _TRANSIENT_WINDOWS_ERRORS:
+                raise
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay * (attempt + 1))
+    assert last is not None
+    raise last
+
+
 def _tree_hash(root: Path, relatives: tuple[Path, ...]) -> str:
     """A content hash of a project tree limited to the release allow-list."""
 
@@ -178,7 +226,7 @@ def _tree_hash(root: Path, relatives: tuple[Path, ...]) -> str:
         digest.update(relative.as_posix().encode("utf-8"))
         digest.update(b"\0")
         if path.is_file():
-            digest.update(path.read_bytes())
+            digest.update(_retry_file_op(path.read_bytes))
         digest.update(b"\0\0")
     return digest.hexdigest()
 
@@ -187,7 +235,10 @@ def _copy_tree(source: Path, destination: Path, relatives: tuple[Path, ...]) -> 
     for relative in relatives:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source / relative, target)
+        source_file = source / relative
+        _retry_file_op(
+            lambda src=source_file, dst=target: shutil.copy2(src, dst)
+        )
 
 
 def _tampered_copy(bundle: Path, destination: Path) -> Path:
@@ -252,7 +303,7 @@ def run_production_check(
     started = time.perf_counter()
     created_workdir = workdir is None
     base = Path(workdir) if workdir is not None else Path(
-        tempfile.mkdtemp(prefix="pc-agent-production-")
+        tempfile.mkdtemp(prefix=_TEMP_PREFIX)
     )
     base.mkdir(parents=True, exist_ok=True)
     install_root = base / "install"

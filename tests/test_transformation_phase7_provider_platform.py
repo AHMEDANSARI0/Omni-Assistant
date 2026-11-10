@@ -313,7 +313,7 @@ def test_diagnostics_release_gui_platform(tmp_path):
 
     audit = audit_install(settings)
     checks = {check.name: check for check in audit.checks}
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     assert checks["provider_platform"].status == "pass"
 
     controller = GuiController(settings, database=database)

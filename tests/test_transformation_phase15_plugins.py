@@ -190,14 +190,14 @@ def _installed(tmp_path: Path, **overrides: str) -> tuple[PluginService, Setting
 def test_phase15_identity_is_wired_through_the_product(tmp_path: Path) -> None:
     from pc_agent.gui.app import NOTEBOOK_TAB_COUNT
 
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert TRANSFORMATION_PHASE == 18
     assert TRANSFORMATION_LABEL == "TRANSFORMATION PHASE 18 Production Hardening"
     assert LATEST_SCHEMA_VERSION == 18
     assert NOTEBOOK_TAB_COUNT == 20
     settings = Settings.from_env(tmp_path, environ={}, load_dotenv=False)
     settings.ensure_directories()
-    assert len(audit_install(settings).checks) == 33
+    assert len(audit_install(settings).checks) == 34
 
 
 def test_schema_v17_creates_the_plugin_tables(tmp_path: Path) -> None:
@@ -657,7 +657,7 @@ def test_diagnostics_and_release_cover_plugins(tmp_path: Path) -> None:
     line = plugins_summary_line(settings, _db(settings))
     assert "sandbox=" in line
     audit = audit_install(settings)
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     check = next(item for item in audit.checks if item.name == "plugin_ecosystem")
     assert check.status in {"pass", "warn"}
     assert "schema v18" in check.detail

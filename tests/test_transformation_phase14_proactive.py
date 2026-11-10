@@ -66,7 +66,7 @@ def _at(hour: int, minute: int = 0, day_offset: int = 0) -> datetime:
 
 
 def test_phase14_identity_is_wired_through_the_product() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert TRANSFORMATION_PHASE == 18
     assert "Production" in TRANSFORMATION_LABEL
     assert LATEST_SCHEMA_VERSION == 18
@@ -552,7 +552,7 @@ def test_diagnostics_and_release_cover_proactive(tmp_path: Path) -> None:
     assert "proactive_intelligence" in checks
     assert checks["proactive_intelligence"].status == "pass"
     assert "quiet hours" in checks["proactive_intelligence"].detail
-    assert len(checks) == 33
+    assert len(checks) == 34
 
 
 def test_ledgers_stay_bounded(tmp_path: Path) -> None:

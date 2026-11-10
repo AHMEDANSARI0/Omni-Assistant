@@ -345,3 +345,66 @@ Runs the seven voice gates against this install and returns the sealed report
 report is available offline from the CLI as `pc-agent voice acceptance`, and can be
 re-verified with `pc-agent voice acceptance-verify <path>`.
 
+
+## Command Center UI surface (0.82.0)
+
+These routes serve the interface itself and its live feed. All of them are
+same-origin and loopback-only; the shell routes need no bearer token, the stream
+route does.
+
+### `GET /`
+
+Returns the built SPA shell (`Content-Type: text/html`), with the API token
+injected as `<meta name="pc-agent-token" content="...">` and this CSP:
+
+```
+default-src 'self'; script-src 'self' 'sha256-<hash of the inline bootstrap>';
+style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:;
+worker-src 'self' blob:; connect-src 'self'; media-src 'self' blob:;
+frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+```
+
+If the bundle is absent, the response is a 200 page that says the UI is not
+built and prints `cd frontend; npm ci; npm run build`. It never serves a stub
+dashboard.
+
+### `GET /assets/<path>`
+
+Static bundle files. Hashed names get `Cache-Control: public, max-age=31536000,
+immutable`; `X-Content-Type-Options: nosniff` is always set. Path traversal,
+symlinks that escape the package and missing files are `404`.
+
+### `GET /favicon.ico`
+
+The inlined favicon the shell references (`204` when no file is present).
+
+### `GET /legacy`
+
+The pre-0.82 Command Center panel, unchanged, including its own CSP. Rollback
+path for anyone who needs the old surface.
+
+### `GET /v1/events/stream`
+
+Live application events as NDJSON (`application/x-ndjson`).
+
+| Query | Meaning |
+|---|---|
+| `since_id` | integer cursor; events with a greater id are streamed (default `0`) |
+| `duration` | seconds, clamped to **5-900** (default `120`) |
+
+Frames, one JSON object per line:
+
+```
+{"type":"stream.ready","since_id":0}
+{"id":42,"event_type":"task.created","source":"api","task_id":"...","summary":"...","payload":{},"created_at":"..."}
+{"type":"stream.heartbeat"}
+```
+
+Guarantees: the first line is always `stream.ready`; a heartbeat is written after
+10 s of silence so proxies and browsers keep the socket; the server closes the
+response itself when `duration` elapses; `Connection: close` and `no-store` are
+sent. A non-numeric `since_id` or `duration` is a **400** (`Expected an integer`
+/ `Expected a number`) rather than a silent default, because on this route a
+default means an unexpectedly long-lived socket.
+
+Errors use the standard envelope: `{"ok": false, "error": {"code", "message"}}`.

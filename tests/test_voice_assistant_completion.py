@@ -337,23 +337,110 @@ def test_loop_survives_a_capture_error() -> None:
 # -------------------------------------------------------------- acceptance ---
 
 
-def test_voice_acceptance_is_sealed_and_honest_on_a_headless_host(tmp_path: Path) -> None:
+def test_voice_acceptance_is_sealed_and_honest_about_the_host(tmp_path: Path) -> None:
+    """The verdict must follow the measured host, not the platform name.
+
+    On a host with no audio hardware the hardware gates are ``not-run`` and the
+    report is ``incomplete``. On a host that really has a microphone backend with
+    an enumerated input device and both engines, every gate may pass - and then
+    the report has to carry the hardware it measured. What is never allowed is a
+    pass for hardware that is not there, which is what the per-gate checks below
+    pin down on both kinds of host.
+    """
+
     from pc_agent.voice import VoiceService
 
     settings = _settings(tmp_path)
     database = Database(settings.database_path)
     database.initialize()
-    report = run_voice_acceptance(VoiceService(settings, database), version=__version__)
+    service = VoiceService(settings, database)
+    report = run_voice_acceptance(service, version=__version__)
 
     payload = report.to_dict()
     assert payload["body_sha256"]
     assert [gate["name"] for gate in payload["gates"]] == list(REQUIRED_VOICE_GATES)
     assert report.failures == 0
-    # No microphone and no speech engine in CI: the gates say so instead of passing.
-    assert report.not_run, "a headless host must not report every gate as passed"
-    assert report.status == "incomplete"
-    # The harness must not leave the microphone enabled.
+    # Every verdict has to name the evidence it was based on.
+    assert all(gate["detail"] for gate in payload["gates"])
+
+    host = service.status()
+    backend = host.microphone.get("backend")
+    has_microphone = backend not in {None, "", "none"} and bool(
+        host.input_devices.get("count")
+    )
+    has_stt = bool(host.stt.get("available"))
+    has_tts = bool(host.tts.get("available"))
+    expected_not_run = {
+        name
+        for name, present in (
+            ("push_to_talk", has_microphone),
+            ("stt_engine", has_stt),
+            ("tts_engine", has_tts),
+        )
+        if not present
+    }
+
+    assert set(report.not_run) == expected_not_run, (
+        "gates must be not-run exactly for the hardware this host lacks: "
+        f"missing={sorted(expected_not_run)} reported={sorted(report.not_run)}"
+    )
+    assert report.status == ("passed" if not expected_not_run else "incomplete")
+
+    gates = {gate["name"]: gate for gate in payload["gates"]}
+    if has_microphone:
+        # A pass here is only honest if the report names the device it found.
+        assert payload["host"]["input_devices"]
+        assert payload["host"]["microphone_backend"] == backend
+        assert "input device" in gates["push_to_talk"]["detail"]
+    else:
+        assert gates["push_to_talk"]["status"] == "not-run"
+
+    # The harness must not leave the microphone enabled, whichever branch ran.
     assert VoiceService(settings, database).status().microphone["enabled"] is False
+
+
+def test_voice_acceptance_does_not_pass_a_backend_without_a_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A capture backend that exists is not a microphone.
+
+    winmm/ALSA/the sounddevice module are present on machines with no input
+    device at all, so the push-to-talk gate has to stay ``not-run`` there. This
+    is the exact false-pass the 0.82.0 Windows run exposed.
+    """
+
+    from pc_agent.voice import VoiceService
+
+    settings = _settings(tmp_path)
+    database = Database(settings.database_path)
+    database.initialize()
+    service = VoiceService(settings, database)
+
+    real_status = VoiceService.status
+
+    def backend_without_device(self: Any) -> Any:
+        import dataclasses
+
+        status = real_status(self)
+        return dataclasses.replace(
+            status,
+            microphone={**status.microphone, "backend": "winmm", "backend_reason": ""},
+            input_devices={
+                "count": 0,
+                "method": "winmm",
+                "reason": "winmm enumerated no input device",
+                "devices": [],
+            },
+        )
+
+    monkeypatch.setattr(VoiceService, "status", backend_without_device)
+    report = run_voice_acceptance(service, version=__version__)
+
+    gates = {gate.name: gate for gate in report.gates}
+    assert gates["push_to_talk"].status == "not-run"
+    assert "no input device" in gates["push_to_talk"].detail
+    assert "push_to_talk" in report.not_run
+    assert report.status == "incomplete"
 
 
 def test_voice_acceptance_report_verifies_and_detects_edits(tmp_path: Path) -> None:

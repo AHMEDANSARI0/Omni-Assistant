@@ -350,7 +350,7 @@ def test_phase59_systemd_analyze_verifies_generated_units(
 
 
 def test_phase59_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(build_default_registry().list_tools()) == 69
     profiles = {

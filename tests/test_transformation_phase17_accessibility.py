@@ -396,7 +396,7 @@ def test_diagnostics_and_release_cover_accessibility(base: Settings) -> None:
     assert section["known_limitations"] >= 3
 
     audit = audit_install(base)
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     check = next(item for item in audit.checks if item.name == "accessibility")
     assert check.status == "pass"
     assert "WCAG 2.1 AA" in check.detail
@@ -600,7 +600,7 @@ def test_gui_source_really_contains_the_accessibility_controls(base: Settings) -
 
 
 def test_identity_is_current() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert TRANSFORMATION_PHASE == 18
     assert TRANSFORMATION_LABEL == "TRANSFORMATION PHASE 18 Production Hardening"
     assert LATEST_SCHEMA_VERSION == 18  # interface settings live in data/ui.json

@@ -287,7 +287,7 @@ def test_diagnostics_release_gui_mission_surfaces(settings):
 
     audit = audit_install(settings)
     checks = {check.name: check for check in audit.checks}
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     assert checks["mission_center"].status == "pass"
 
     controller = GuiController(settings)

@@ -61,7 +61,7 @@ def test_local_service_task_lifecycle_and_events(settings):
     with LocalService(settings) as service:
         health = service.health()
         assert health["schema_version"] == 18
-        assert health["version"] == "0.81.2"
+        assert health["version"] == "0.82.12"
         created = service.create_task("an instruction no planner supports xyz")
         assert created["status"] == "queued"
         accepted = service.start_task(created["id"])
@@ -272,7 +272,7 @@ def test_diagnostics_and_release_include_service(settings):
 
     audit = audit_install(settings)
     checks = {check.name: check for check in audit.checks}
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     assert checks["local_service"].status == "pass"
     assert "api=enabled" in checks["local_service"].detail
 

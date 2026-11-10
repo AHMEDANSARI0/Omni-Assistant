@@ -68,7 +68,13 @@ def test_web_ui_served_with_security_headers(settings):
             csp = response.headers.get("Content-Security-Policy") or ""
             assert "frame-ancestors 'none'" in csp
             assert response.headers.get("X-Frame-Options") == "DENY"
-        assert "COMMAND CENTER" in body
+        # 0.82.0 replaced this page as the default surface with the built SPA at
+        # `/`; the pre-redesign panel is still served, unchanged, at `/legacy`
+        # (that is the rollback path and it is asserted in
+        # test_transformation_phase19_command_center_ui.py). This test keeps its
+        # original intent - the Command Center page is served and is identified
+        # as the Command Center - by checking whichever surface owns `/`.
+        assert "COMMAND CENTER" in body or "Command Center" in body
         # The page is served without a token, data endpoints still are not.
         with pytest.raises(urllib.error.HTTPError) as error:
             urllib.request.urlopen(f"http://{host}:{port}/v1/overview", timeout=15)

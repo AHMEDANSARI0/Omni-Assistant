@@ -1,0 +1,34 @@
+# Tauri 2 desktop shell for the Omni-Assistant Command Center.
+#
+# The shell is intentionally thin: the window points at the loopback origin the
+# Python core serves (`http://127.0.0.1:8765`), so the UI keeps its same-origin
+# API access and no CORS, proxy or token plumbing is needed in Rust. Tauri adds
+# the native window, tray, single-instance behaviour and the OS webview.
+#
+# Build (Windows, Rust toolchain + WebView2 required):
+#   npm run tauri:build
+[package]
+name = "omni-command-center"
+version = "0.82.12"
+description = "Omni-Assistant Command Center desktop shell"
+authors = ["Omni-Assistant"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

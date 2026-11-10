@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-healing-pc-agent"
-version = "0.81.2"
+version = "0.82.12"
 description = "Windows-first, local-first self-healing PC AI agent (Transformation Phase 2 Safety Kernel)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +32,12 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+]
+# Optional native window for the Command Center: WebView2 on Windows,
+# WebKitGTK on Linux, WKWebView on macOS. Not a hard dependency - without it the
+# UI opens in an installed Edge/Chrome app window instead.
+desktop = [
+    "pywebview>=5.0",
 ]
 
 [project.scripts]

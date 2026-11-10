@@ -106,7 +106,7 @@ def test_phase41_builds_deterministic_executable_posix_package(
     first_info = verify_posix_package(first)
     second_info = verify_posix_package(second)
 
-    assert first_info.version == __version__ == "0.81.2"
+    assert first_info.version == __version__ == "0.82.12"
     assert first_info.file_count == first_info.payload_file_count + 4
     assert (
         first_info.manifest_sha256,

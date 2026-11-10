@@ -206,11 +206,33 @@ def run_voice_acceptance(service: Any, *, version: str) -> VoiceAcceptanceReport
         except VoiceError:  # pragma: no cover - restore is best effort
             pass
 
+    # A capture backend being importable is not the same as a machine having a
+    # microphone: winmm/ALSA exist on hosts with no input device at all, so the
+    # gate needs an enumerated device before it may claim a pass. Even then it is
+    # deliberately worded as "backend + device present" - this harness does not
+    # record audio, and the report must not imply that it did.
     backend = status.microphone.get("backend", "none")
-    if backend and backend != "none":
+    input_devices = status.input_devices or {}
+    input_count = input_devices.get("count")
+    if backend and backend != "none" and input_count:
         gates.append(
             VoiceAcceptanceGate(
-                "push_to_talk", "pass", f"capture backend available: {backend}"
+                "push_to_talk",
+                "pass",
+                f"capture backend {backend} with {input_count} input device(s) "
+                "enumerated (presence only - no audio was recorded by this gate)",
+            )
+        )
+    elif backend and backend != "none":
+        gates.append(
+            VoiceAcceptanceGate(
+                "push_to_talk",
+                "not-run",
+                f"capture backend {backend} found no input device: "
+                + (
+                    input_devices.get("reason")
+                    or "the device scan enumerated none"
+                ),
             )
         )
     else:

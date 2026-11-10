@@ -23,7 +23,7 @@ GITHUB_AUDIT_BRANCH = "main"
 GITHUB_AUDIT_COMMIT = "89610f3d18f9348b6fe8ead679bab81ee34155df"
 GITHUB_AUDIT_VERSION = "0.60.0"
 PRE_TRANSFORMATION_VERSION = "0.62.0"
-PREVIOUS_TRANSFORMATION_VERSION = "0.81.1"
+PREVIOUS_TRANSFORMATION_VERSION = "0.82.11"
 WINDOWS_ACCEPTANCE_STATUS = "pending_user_windows_evidence"
 #: Recorded Windows evidence lives here, relative to the data directory. Its
 #: presence is the *only* thing that can change the acceptance status: the

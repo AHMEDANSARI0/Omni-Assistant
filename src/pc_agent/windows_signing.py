@@ -40,12 +40,21 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "BUNDLE_GLOBS",
     "DEFAULT_TIMESTAMP_URL",
+    "INSTALLER_SIGNING_REPORT",
+    "TIMESTAMP_FALLBACK_URLS",
+    "SigningPlan",
     "SigningReport",
     "authenticode_status",
     "build_sign_argv",
+    "discover_installer_artifacts",
     "find_signtool",
+    "list_signing_certificates",
+    "plan_signing",
+    "reputation_status",
     "sanitize_tool_output",
+    "sign_bundle",
     "sign_installer",
     "signtool_status",
     "verify_authenticode",
@@ -56,6 +65,20 @@ _IS_WINDOWS = sys.platform.startswith("win")
 #: RFC 3161 timestamp authority used by default. A timestamp is what keeps a
 #: signature valid after the signing certificate itself expires.
 DEFAULT_TIMESTAMP_URL = "http://timestamp.digicert.com"
+
+#: Where a bundle signing run records its outcome (inside the data directory).
+INSTALLER_SIGNING_REPORT = "installer-signing.json"
+
+#: RFC 3161 authorities tried in order when a timestamp request fails. A timestamp
+#: failure is the most common way a *successful* signature still ends up invalid
+#: later: without one, the signature dies the moment the certificate expires. So a
+#: failed ``/tr`` is retried against the next authority instead of being reported as
+#: a signed installer.
+TIMESTAMP_FALLBACK_URLS: tuple[str, ...] = (
+    "http://timestamp.digicert.com",
+    "http://timestamp.sectigo.com",
+    "http://timestamp.globalsign.com/tsa/r6advanced1",
+)
 _MAX_OUTPUT = 20_000
 
 # WinVerifyTrust results we care about (winerror.h).
@@ -85,6 +108,8 @@ class SigningReport:
     path: str = ""
     signer: str = ""
     timestamped: bool = False
+    timestamp_url: str = ""
+    timestamp_attempts: tuple[dict[str, Any], ...] = ()
     duration_ms: int = 0
     command: tuple[str, ...] = ()
 
@@ -96,6 +121,8 @@ class SigningReport:
             "path": self.path,
             "signer": self.signer,
             "timestamped": self.timestamped,
+            "timestamp_url": self.timestamp_url,
+            "timestamp_attempts": [dict(item) for item in self.timestamp_attempts],
             "duration_ms": self.duration_ms,
             "command": list(self.command),
         }
@@ -419,26 +446,68 @@ def sign_installer(
     except ValueError as exc:
         return SigningReport(ok=False, status="refused", detail=str(exc), path=str(target))
     redacted = ["[redacted]" if password and item == password else item for item in argv]
-    try:
-        completed = (runner or _run)(argv, timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as exc:
+    # A timestamp authority can be down, rate-limited or unreachable. Retrying the
+    # next one is what turns "signed but expires with the certificate" into a
+    # properly timestamped signature; the URL that worked is reported.
+    attempts: list[dict[str, Any]] = []
+    urls = [timestamp_url] if timestamp_url else []
+    if timestamp_url:
+        urls += [url for url in TIMESTAMP_FALLBACK_URLS if url != timestamp_url]
+    completed = None
+    used_url = timestamp_url
+    for candidate_url in urls:
+        attempt_argv = [candidate_url if item == timestamp_url else item for item in argv]
+        redacted_attempt = [
+            "[redacted]" if password and item == password else item for item in attempt_argv
+        ]
+        try:
+            completed = (runner or _run)(attempt_argv, timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return SigningReport(
+                ok=False,
+                status="error",
+                detail=f"{exc.__class__.__name__}: {exc}",
+                path=str(target),
+                command=tuple(redacted_attempt),
+            )
+        attempt_output = sanitize_tool_output(
+            (completed.stdout or "") + (completed.stderr or ""), secrets=[password or ""]
+        )
+        attempts.append(
+            {
+                "timestamp_url": candidate_url,
+                "exit_code": completed.returncode,
+                "tail": (attempt_output.strip().splitlines() or [""])[-1][:200],
+            }
+        )
+        redacted = redacted_attempt
+        if completed.returncode == 0:
+            used_url = candidate_url
+            break
+    if completed is None:  # pragma: no cover - only if no URL was given
         return SigningReport(
             ok=False,
-            status="error",
-            detail=f"{exc.__class__.__name__}: {exc}",
+            status="refused",
+            detail="no timestamp authority was supplied",
             path=str(target),
-            command=tuple(redacted),
         )
     output = sanitize_tool_output(
         (completed.stdout or "") + (completed.stderr or ""), secrets=[password or ""]
     )
     if completed.returncode != 0:
         tail = output.strip().splitlines()[-1][:300] if output.strip() else "no output"
+        # Keep every timestamp attempt: "the authority was down" and "the
+        # certificate was rejected" are different problems, and the person
+        # reading this needs to tell them apart.
+        tried = [item["timestamp_url"] for item in attempts]
         return SigningReport(
             ok=False,
             status="failed",
-            detail=f"signtool exited {completed.returncode}: {tail}",
+            detail=f"signtool exited {completed.returncode}: {tail}"
+            + (f" (timestamp authorities tried: {', '.join(tried)})" if len(tried) > 1 else ""),
             path=str(target),
+            timestamp_url="",
+            timestamp_attempts=tuple(attempts),
             duration_ms=int((time.perf_counter() - started) * 1000),
             command=tuple(redacted),
         )
@@ -453,10 +522,103 @@ def sign_installer(
             f"{verified.detail}"
         ),
         path=str(target),
-        timestamped=bool(timestamp_url),
+        timestamped=bool(used_url),
+        timestamp_url=used_url,
+        timestamp_attempts=tuple(attempts),
         duration_ms=int((time.perf_counter() - started) * 1000),
         command=tuple(redacted),
     )
+
+
+def reputation_status(
+    *,
+    report_path: Path | str | None = None,
+    shell_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Where this machine actually stands on signing - facts, no promises.
+
+    Combines three separate readings, each of which can independently be
+    ``not-run``:
+
+    * the certificate store (which certificate, is its key on hardware);
+    * the last recorded signing run (``data/installer-signing.json``);
+    * the installers currently on disk, verified if a Windows tool is available.
+
+    SmartScreen reputation itself is Microsoft's and is not measurable from here,
+    so nothing in the result pretends otherwise.
+    """
+
+    import json
+
+    listing = list_signing_certificates()
+    certificates = listing.get("certificates", [])
+    hardware = [cert for cert in certificates if cert.get("hardware")]
+    recorded: dict[str, Any] = {}
+    if report_path is not None:
+        path = Path(report_path).expanduser()
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                recorded = {"status": "unreadable", "detail": str(path)}
+            else:
+                recorded = loaded if isinstance(loaded, dict) else {"status": "invalid"}
+        else:
+            recorded = {"status": "not-recorded", "detail": f"no report at {path}"}
+    artifacts = discover_installer_artifacts(shell_dir)
+    verified: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        report = verify_authenticode(artifact)
+        verified.append(
+            {
+                "path": str(artifact),
+                "status": report.status,
+                "ok": report.ok,
+                "detail": report.detail,
+            }
+        )
+    blockers: list[str] = []
+    if listing.get("status") == "not-run":
+        blockers.append(
+            "no certificate store on this host: signing must be done on Windows "
+            "(run `pc-agent release signing --certificates` there)"
+        )
+    elif listing.get("status") == "empty":
+        blockers.append(
+            "no code-signing certificate installed: an OV/EV certificate is bought "
+            "from a certificate authority, never generated by this product"
+        )
+    if not any(item.get("ok") for item in verified):
+        blockers.append(
+            "no verified installer found: run `pc-agent release sign-bundle` after a build"
+        )
+    return {
+        "smart_screen_reputation": "not-measurable-here",
+        "smart_screen_note": (
+            "Microsoft decides SmartScreen reputation from downloads, publisher "
+            "identity and malware reports; this product cannot measure, submit or "
+            "purchase it. See docs/smartscreen_reputation.md"
+        ),
+        "certificate_store": listing,
+        "certificate_count": len(certificates),
+        "hardware_backed": len(hardware),
+        # Corrected in 0.82.12: an EV certificate no longer bypasses SmartScreen.
+        # Microsoft removed that behaviour in 2024 - EV- and OV-signed files now
+        # build reputation the same way (see docs/smartscreen_reputation.md).
+        # The honest expectation therefore depends on *whether* there is a
+        # certificate, not on how expensive it was.
+        "expected_first_run": (
+            "signed: your publisher name is shown; SmartScreen warnings fade as "
+            "reputation accrues (EV no longer bypasses this since 2024)"
+            if certificates
+            else "unsigned: 'Unknown publisher' warning"
+        ),
+        "last_signing_run": recorded,
+        "installers": verified,
+        "blockers": blockers,
+        "timestamp_authorities": list(TIMESTAMP_FALLBACK_URLS),
+        "next_command": "pc-agent release sign-bundle --check",
+    }
 
 
 def authenticode_status(path: Path | str | None) -> dict[str, Any]:
@@ -471,3 +633,422 @@ def authenticode_status(path: Path | str | None) -> dict[str, Any]:
         }
     report = verify_authenticode(path)
     return {**tool, "status": report.status, "detail": report.detail, "path": report.path}
+
+
+# ------------------------------------------------- installer bundle signing ---
+
+#: Where a Tauri build writes its Windows installers, relative to the shell dir.
+BUNDLE_GLOBS = (
+    "target/release/bundle/nsis/*.exe",
+    "target/release/bundle/msi/*.msi",
+)
+
+#: Certificate EKUs that are allowed to sign code. Subject strings are not enough:
+#: an email certificate with the same subject signs nothing Windows trusts.
+_CODE_SIGNING_EKU = "1.3.6.1.5.5.7.3.3"
+
+
+def discover_installer_artifacts(shell_dir: Path | str | None = None) -> list[Path]:
+    """Return the installer files a Tauri build produced, newest first.
+
+    Only ``.exe``/``.msi`` files inside the known bundle folders are considered -
+    never an arbitrary file from the user's disk.
+    """
+
+    if shell_dir is None:
+        return []
+    base = Path(shell_dir).expanduser()
+    found: list[Path] = []
+    for pattern in BUNDLE_GLOBS:
+        found.extend(path for path in base.glob(pattern) if path.is_file())
+    unique = {path.resolve(): path for path in found}
+    return sorted(unique.values(), key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def list_signing_certificates(*, timeout: float = 60.0, runner: Any = None) -> dict[str, Any]:
+    """List code-signing certificates in the current user's store.
+
+    This answers the one question that blocks signing for most people: *which
+    thumbprint do I pass?* Only non-secret fields are read (subject, thumbprint,
+    validity, whether the certificate is valid for code signing at all). Private
+    keys are never exported and never touched - signing happens inside
+    ``signtool``, which talks to the certificate store itself.
+
+    Off Windows the answer is ``not-run``, not an empty list pretending there are
+    no certificates.
+    """
+
+    if not _IS_WINDOWS:
+        return {
+            "supported": False,
+            "status": "not-run",
+            "detail": "the certificate store only exists on Windows",
+            "certificates": [],
+        }
+    # The extra fields matter for EV certificates: a publicly-trusted code-signing
+    # key must live in hardware since June 2023, so "where is the key" decides
+    # whether a certificate can be used at all on this machine. These are all
+    # public, non-secret properties; the key itself is never exported or read.
+    script = (
+        "$ErrorObject = $null;"
+        "$certs = Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert -ErrorAction SilentlyContinue |"
+        " ForEach-Object {"
+        " $provider = ''; $hardware = $false; $keyType = '';"
+        " try {"
+        "  $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($_);"
+        "  if ($rsa) { $keyType = 'RSA'; try { $hardware = [bool]$rsa.Key.CspKeyContainerInfo.HardwareDevice } catch {}"
+        "   try { $provider = [string]$rsa.Key.CspKeyContainerInfo.ProviderName } catch {} }"
+        " } catch {}"
+        " if (-not $keyType) { try {"
+        "  $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($_);"
+        "  if ($ecdsa) { $keyType = 'ECDSA' } } catch {} }"
+        " [pscustomobject]@{"
+        " Subject=$_.Subject; Thumbprint=$_.Thumbprint; NotBefore=$_.NotBefore.ToString('o');"
+        " NotAfter=$_.NotAfter.ToString('o'); HasPrivateKey=$_.HasPrivateKey;"
+        " Issuer=$_.Issuer; HasEkuCodeSigning=$true; KeyType=$keyType;"
+        " ProviderName=$provider; HardwareDevice=$hardware;"
+        " PublicKeyLength=$(try { $_.PublicKey.Key.KeySize } catch { 0 }) } };"
+        "$certs | ConvertTo-Json -Compress -Depth 3"
+    )
+    argv = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
+    try:
+        completed = (runner or _run)(argv, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "supported": True,
+            "status": "error",
+            "detail": f"{exc.__class__.__name__}: {exc}",
+            "certificates": [],
+        }
+    if completed.returncode != 0:
+        tail = ((completed.stdout or "") + (completed.stderr or "")).strip()[-300:]
+        return {
+            "supported": True,
+            "status": "error",
+            "detail": f"powershell exited {completed.returncode}: {tail or 'no output'}",
+            "certificates": [],
+        }
+    raw = (completed.stdout or "").strip()
+    if not raw:
+        return {
+            "supported": True,
+            "status": "empty",
+            "detail": "no code-signing certificate is installed for this user",
+            "certificates": [],
+        }
+    import json
+
+    try:
+        loaded = json.loads(raw)
+    except ValueError:
+        return {
+            "supported": True,
+            "status": "error",
+            "detail": "could not parse the certificate list",
+            "certificates": [],
+        }
+    entries = loaded if isinstance(loaded, list) else [loaded]
+    certificates = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("ProviderName", "") or "")[:120]
+        hardware = bool(entry.get("HardwareDevice"))
+        certificates.append(
+            {
+                "subject": str(entry.get("Subject", ""))[:200],
+                "issuer": str(entry.get("Issuer", ""))[:200],
+                "thumbprint": str(entry.get("Thumbprint", "")).upper(),
+                "not_before": str(entry.get("NotBefore", "")),
+                "not_after": str(entry.get("NotAfter", "")),
+                "has_private_key": bool(entry.get("HasPrivateKey")),
+                "key_type": str(entry.get("KeyType", "") or ""),
+                "provider": provider,
+                "hardware": hardware,
+                # A hardware-backed key is what an EV / 2023-onward OV certificate
+                # looks like. It is reported as a fact, not a promise: this says
+                # "the key is not in a software container", nothing more.
+                "storage": "hardware-token" if hardware else ("software-store" if provider else "unknown"),
+            }
+        )
+    usable = [item for item in certificates if item["has_private_key"]]
+    hardware = [item for item in usable if item["hardware"]]
+    return {
+        "supported": True,
+        "status": "ok" if certificates else "empty",
+        "detail": (
+            f"{len(certificates)} code-signing certificate(s), {len(usable)} with a private key, "
+            f"{len(hardware)} hardware-backed"
+            if certificates
+            else "no code-signing certificate is installed for this user"
+        ),
+        "certificates": certificates,
+        "usable": len(usable),
+        "hardware_backed": len(hardware),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class SigningPlan:
+    """What *would* happen, and what is missing - without touching a file."""
+
+    ready: bool
+    artifacts: tuple[str, ...]
+    blockers: tuple[str, ...]
+    notes: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ready": self.ready,
+            "artifacts": list(self.artifacts),
+            "blockers": list(self.blockers),
+            "notes": list(self.notes),
+        }
+
+
+def certificate_storage(thumbprint: str, *, runner: Any = None, timeout: float = 60.0) -> dict[str, Any]:
+    """Where does this certificate's private key live?
+
+    Answers ``hardware-token`` / ``software-store`` / ``unknown`` plus a short
+    human detail. The private key is never exported, read or unlocked: this reads
+    the *provider name* and the ``HardwareDevice`` flag of the key container,
+    which are public metadata.
+
+    ``unknown`` is an honest answer: a custom CNG/KSP provider may not expose
+    these fields (HSM-backed certificates often do not), and inventing
+    "hardware" from a provider name would be a guess.
+    """
+
+    clean = re.sub(r"[^0-9A-Fa-f]", "", thumbprint or "")
+    if not clean:
+        return {"storage": "unknown", "detail": "no thumbprint given"}
+    if not _IS_WINDOWS:
+        return {"storage": "unknown", "detail": "the certificate store only exists on Windows"}
+    script = (
+        "$cert = Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert |"
+        f" Where-Object {{ $_.Thumbprint -eq '{clean}' }} | Select-Object -First 1;"
+        "if (-not $cert) { 'not-found'; exit 0 };"
+        "$out = [pscustomobject]@{ Provider=''; Hardware=$false; KeyType='' };"
+        "try {"
+        " $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert);"
+        " if ($rsa) { $out.KeyType='RSA';"
+        "  try { $out.Hardware = [bool]$rsa.Key.CspKeyContainerInfo.HardwareDevice } catch {}"
+        "  try { $out.Provider = [string]$rsa.Key.CspKeyContainerInfo.ProviderName } catch {} }"
+        "} catch {};"
+        "$out | ConvertTo-Json -Compress"
+    )
+    argv = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]
+    try:
+        completed = (runner or _run)(argv, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"storage": "unknown", "detail": f"{exc.__class__.__name__}: {exc}"}
+    raw = (completed.stdout or "").strip()
+    if completed.returncode != 0:
+        return {"storage": "unknown", "detail": f"powershell exited {completed.returncode}"}
+    if raw.strip().lower() == "not-found":
+        return {"storage": "unknown", "detail": f"{clean.upper()} is not in this user's store"}
+    import json
+
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {"storage": "unknown", "detail": "could not parse the key metadata"}
+    provider = str(payload.get("Provider", "") or "")
+    hardware = bool(payload.get("Hardware"))
+    key_type = str(payload.get("KeyType", "") or "")
+    if hardware:
+        return {
+            "storage": "hardware-token",
+            "detail": f"{key_type or 'key'} in '{provider or 'token provider'}' reports a hardware device",
+        }
+    if provider:
+        return {
+            "storage": "software-store",
+            "detail": f"{key_type or 'key'} in '{provider}' (no hardware device reported)",
+        }
+    return {"storage": "unknown", "detail": "the key provider did not report its storage"}
+
+
+def plan_signing(
+    shell_dir: Path | str | None,
+    *,
+    thumbprint: str = "",
+    pfx: Path | str | None = None,
+    signtool_path: Path | str | None = None,
+    require_hardware: bool = False,
+) -> SigningPlan:
+    """Check every prerequisite *before* a signing run.
+
+    Returns blockers (things that make signing impossible right now) and notes
+    (things that matter but do not stop it). Nothing here writes, signs or opens
+    a network connection.
+
+    ``require_hardware`` is for EV / post-2023 OV certificates, whose private key
+    must live on a token (or in a TPM-backed container) rather than in an
+    exportable PFX. With it on, a PFX is refused outright and a certificate-store
+    thumbprint is only accepted if its key is hardware-backed - which is checked
+    by *reading the certificate's own metadata*, and reported as
+    ``not-verified`` when that metadata cannot be read, never assumed.
+    """
+
+    blockers: list[str] = []
+    notes: list[str] = []
+
+    artifacts = [str(path) for path in discover_installer_artifacts(shell_dir)]
+    if not artifacts:
+        blockers.append(
+            "no installer found - build one first: "
+            "cd frontend && npm run tauri:build (writes target/release/bundle/)"
+        )
+
+    tool = find_signtool(signtool_path)
+    if tool is None:
+        blockers.append(
+            "signtool.exe not found - install the Windows SDK or pass --signtool <path>"
+        )
+    else:
+        notes.append(f"signtool: {tool}")
+
+    clean = re.sub(r"[^0-9A-Fa-f]", "", thumbprint or "")
+    if clean:
+        if len(clean) < 20:
+            blockers.append("--thumbprint is too short to be a certificate thumbprint")
+        else:
+            notes.append(f"certificate thumbprint: {clean.upper()}")
+    elif pfx:
+        path = Path(pfx).expanduser()
+        if not path.is_file():
+            blockers.append(f"PFX file not found: {path}")
+        else:
+            notes.append(f"PFX: {path}")
+    else:
+        blockers.append(
+            "no certificate selected - pass --thumbprint (recommended) or --pfx; "
+            "run `pc-agent release signing --certificates` to list what this user has"
+        )
+
+    if not _IS_WINDOWS:
+        notes.append(
+            "not on Windows: signtool and WinVerifyTrust cannot run here, so signing "
+            "must be done on the build machine"
+        )
+
+    if require_hardware:
+        if pfx and not clean:
+            blockers.append(
+                "--require-hardware refuses a PFX: an EV / post-2023 OV key must stay "
+                "on the token, and a PFX is an exportable copy of that key. Use the "
+                "certificate-store thumbprint instead."
+            )
+        elif clean:
+            storage = certificate_storage(clean)
+            if storage["storage"] == "hardware-token":
+                notes.append(
+                    f"hardware-backed key confirmed for {clean.upper()} "
+                    f"({storage['detail']})"
+                )
+            elif storage["storage"] == "software-store":
+                blockers.append(
+                    f"--require-hardware: the private key for {clean.upper()} is a "
+                    f"software key ({storage['detail']}), not a hardware token. An EV "
+                    "certificate cannot be exported this way; check that the token is "
+                    "plugged in and its middleware is running."
+                )
+            else:
+                notes.append(
+                    f"--require-hardware: could not read the key storage for "
+                    f"{clean.upper()} ({storage['detail']}); signtool will still be the "
+                    "judge, and the signature result is verified afterwards"
+                )
+        notes.append("hardware key required (EV / post-2023 OV policy)")
+
+    notes.append(f"timestamp authority: {DEFAULT_TIMESTAMP_URL}")
+    return SigningPlan(
+        ready=not blockers,
+        artifacts=tuple(artifacts),
+        blockers=tuple(blockers),
+        notes=tuple(notes),
+    )
+
+
+def sign_bundle(
+    shell_dir: Path | str | None,
+    *,
+    thumbprint: str = "",
+    pfx: Path | str | None = None,
+    password: str | None = None,
+    timestamp_url: str = DEFAULT_TIMESTAMP_URL,
+    allow_argv_password: bool = False,
+    signtool_path: Path | str | None = None,
+    timeout: float = 900.0,
+    runner: Any = None,
+    require_hardware: bool = False,
+) -> dict[str, Any]:
+    """Sign and verify every installer in a Tauri bundle, one by one.
+
+    Signing only the ``.exe`` is a common mistake: the MSI installs the same
+    payload and SmartScreen looks at the file the user actually downloads. Both
+    are signed, and each result is verified independently, so a report cannot say
+    "signed" for a file that Windows would still call untrusted.
+    """
+
+    plan = plan_signing(
+        shell_dir,
+        thumbprint=thumbprint,
+        pfx=pfx,
+        signtool_path=signtool_path,
+        require_hardware=require_hardware,
+    )
+    results: list[dict[str, Any]] = []
+    if not plan.ready:
+        # Preflight already said this cannot work (no build, no signtool, no
+        # certificate). Attempting anyway would only produce "refused" noise and
+        # could half-sign a bundle.
+        return {
+            "ok": False,
+            "ready": False,
+            "blockers": list(plan.blockers),
+            "notes": list(plan.notes),
+            "artifacts": len(plan.artifacts),
+            "signed": 0,
+            "results": [],
+        }
+    for artifact in plan.artifacts:
+        report = sign_installer(
+            artifact,
+            thumbprint=thumbprint,
+            pfx=pfx,
+            password=password,
+            timestamp_url=timestamp_url,
+            allow_argv_password=allow_argv_password,
+            signtool_path=signtool_path,
+            timeout=timeout,
+            runner=runner,
+        )
+        results.append(report.to_dict())
+    signed = [item for item in results if item["ok"]]
+    return {
+        "ok": plan.ready and bool(results) and len(signed) == len(results),
+        "ready": plan.ready,
+        "blockers": list(plan.blockers),
+        "notes": list(plan.notes),
+        "artifacts": len(plan.artifacts),
+        "signed": len(signed),
+        "results": results,
+    }

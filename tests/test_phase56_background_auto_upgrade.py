@@ -641,7 +641,7 @@ def test_phase56_cli_gui_report_verification_and_scope(
     assert run.status == "disabled"
     assert "Background auto-upgrade:" in format_auto_upgrade_run(run)
 
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert len(build_default_registry().list_tools()) == 69
     assert database.schema_version() == 18
 

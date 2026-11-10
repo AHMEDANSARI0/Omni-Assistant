@@ -50,8 +50,15 @@ INCOMPLETE; gates=7; passed=4; failures=0; not-run=push_to_talk,stt_engine,tts_e
 ```
 
 That is the intended output: the four gates that do not need hardware passed, and
-the three that do were reported as skipped rather than passed. On a Windows
-machine with a microphone and SAPI the same command should print `PASSED`.
+the three that do were reported as skipped rather than passed.
+
+On a Windows machine with a microphone and SAPI the same command prints `PASSED`.
+Since 0.82.1 that pass is only granted when the gate found a capture backend **and**
+at least one enumerated input device - a host whose backend module exists but whose
+device scan returns nothing is reported as `not-run` with the scan reason. The
+`push_to_talk` detail states what was actually proved (`presence only - no audio was
+recorded by this gate`), so nothing in the report implies a recording that did not
+happen.
 
 ## 5. Honest limitations
 

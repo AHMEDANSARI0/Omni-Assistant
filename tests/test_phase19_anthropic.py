@@ -303,7 +303,7 @@ def test_anthropic_cli_and_gui_visibility(
         },
     )
     summary = GuiController(settings).doctor_summary()
-    assert summary.version == __version__ == "0.81.2"
+    assert summary.version == __version__ == "0.82.12"
     assert summary.vision_enabled is True
     assert summary.vision_providers == "anthropic"
     assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
@@ -316,7 +316,7 @@ def test_phase19_scope_and_release_candidates() -> None:
         path.as_posix() for path in release_candidate_files(project_root)
     }
 
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert len(build_default_registry().list_tools()) == 69
     assert "src/pc_agent/providers/anthropic.py" in candidates
     assert "docs/phase19.md" in candidates

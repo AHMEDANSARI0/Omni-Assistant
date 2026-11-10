@@ -274,3 +274,354 @@ If the venv is genuinely missing a dependency, repair it with:
 python -m pip install -e ".[dev]"
 ```
 
+
+## 12. Command Center UI (0.82.0)
+
+The new interface ships **pre-built** inside the package: `src/pc_agent/webui/`
+contains `index.html` and 21 asset files. You do not need Node.js to use it.
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pc-agent ui
+```
+
+That starts the local API and opens the Command Center. If the browser does not
+open by itself, use `pc-agent api serve` and visit `http://127.0.0.1:8765`. `/legacy` still opens the pre-0.82 panel if you
+prefer it or need to roll back; `pc-agent gui` still opens the desktop Tkinter GUI.
+
+If the page says the UI is not built, the bundle is missing from your install
+(an older tree or a partial copy). Fix it from the sources that ship alongside:
+
+```powershell
+cd D:\omni-assistant\frontend
+npm ci
+npm run build
+```
+
+Node 20 or newer is required for that step only. After it finishes, reload
+`http://127.0.0.1:8765`.
+
+Common points:
+
+* **Blank page / 404 on `/assets/...`** - the build did not finish. Re-run
+  `npm run build`; it cleans stale hashed files before bundling.
+* **"Not authorised" panels** - you opened a saved copy of the page or used a
+  different port. Reload from `pc-agent api serve`; the token is injected per
+  page load and is not stored in a URL.
+* **A panel says "unavailable"** - that is the measured truth (no GPU, no speech
+  engine, connector gate closed, no provider key). The panel prints the reason and
+  the install step; it is not a broken UI.
+* **Tauri desktop shell** - `frontend/src-tauri/` is a scaffold. Building it
+  requires the Rust toolchain, WebView2 and an icon set, and is not covered by
+  this release's verification. Use the browser path above.
+
+### 12.1 Which command opens which interface (0.82.3)
+
+| You type | You get |
+|---|---|
+| `pc-agent ui` | Command Center as a **desktop window** (API started for you) |
+| `pc-agent gui` | the same window - this is the default |
+| `pc-agent ui --browser` | the same UI in an ordinary browser tab |
+| `pc-agent ui --explain` | tells you which window it would use, opens nothing |
+| `pc-agent gui --tk` | the classic Tkinter panel (kept for rollback) |
+| `pc-agent api serve` | the API only; open the printed address yourself |
+| `http://127.0.0.1:8765/legacy` | the pre-0.82 web panel |
+
+**How the window is chosen** (first one available wins):
+
+1. **pywebview** - install it once with `python -m pip install -e ".[desktop]"`.
+   On Windows this uses the WebView2 runtime that Windows already has, so the
+   window is a real application window, not a browser.
+2. **Edge / Chrome / Brave / Chromium in app mode** - nothing to install; Edge
+   is part of Windows. The window has no address bar and no tabs, and it runs in
+   its own profile (`data\\ui-window`), so your normal browser session is
+   untouched and closing the Command Center does not close your other tabs.
+3. **Your default browser** - only if neither of the above exists.
+
+`Ctrl+C` in the terminal (or closing the window after `--duration`) stops the
+server and closes the window it opened.
+
+If you ever want the old window back, `pc-agent gui --tk` is the whole rollback -
+nothing was deleted.
+
+### 12.2 Right-to-left layout
+
+Settings → Display → **Text direction**: `auto` (follows the locale the engine
+reports), `ltr`, or `rtl`. The choice is stored in your browser and applied
+before the first frame. The UI's own wording stays English; the direction only
+mirrors the layout.
+
+### 12.2a If the packaging tests fail with "missing required files: .env.example"
+
+`.env.example` is a **required installer payload file** - the Windows, POSIX,
+Debian and RPM builders all ship it. If it is missing from your install, a dozen
+packaging tests fail with the same message. Check and restore it:
+
+```powershell
+pc-agent release env-template --check
+```
+
+```powershell
+pc-agent release env-template --write
+```
+
+Since 0.82.9 the builders restore it by themselves and `pc-agent release audit`
+reports it as check 34 (`installer_payload`), so this should be self-healing. The
+command exists for the case where you want to see and control it.
+
+### 12.2a1 "ConnectionAbortedError / 10053" or "Exception occurred during processing of request" in the console
+
+Before 0.82.10, closing the Command Center window (or the two-minute event
+stream ending, or a reload) printed this on Windows:
+
+```
+ERROR | pc_agent.api | Local API GET /v1/events/stream failed
+ConnectionAbortedError: [WinError 10053] An established connection was aborted
+Exception occurred during processing of request from ('127.0.0.1', 51413)
+```
+
+It was cosmetic - the app kept working - but it was noise from a normal event.
+Windows reports a dropped connection as `ConnectionAbortedError` while POSIX uses
+`BrokenPipeError`, and only the POSIX pair was handled. 0.82.10 handles all of
+them, and `_QuietThreadingHTTPServer` stops `socketserver` printing a second
+traceback, while real faults still produce a 500 and an ERROR line.
+
+If you still see an **ERROR** with a traceback on 0.82.10 or later, it is a real
+one - send the line together with `data/windows-verification.json`.
+
+### 12.2b One-command verification on Windows
+
+Instead of running five commands and reading five outputs, run this from the
+install root:
+
+```powershell
+python scripts\verify_windows.py
+```
+
+It runs, in this order: the interpreter and version, **which** `pc_agent` was
+imported (and from where), `ruff`, `doctor`, `release audit`,
+`scripts/check_desktop_shell.py`, the full `pytest -q` suite, and
+`release production-check`. Each gate keeps its exit code and the tail of its
+output, and the result is written to `data\windows-verification.json`.
+
+It prints `WINDOWS VERIFICATION: PASS` or `FAIL (suite)` and, on failure, the
+tail of the failing gate - so the reason is on screen instead of buried.
+
+| Flag | Effect |
+|---|---|
+| `--only doctor,audit` | run just those gates |
+| `--skip-suite` | everything except the full suite (fast) |
+| `--json` | machine-readable report on stdout |
+| `--report-dir D:\somewhere` | write the report elsewhere |
+| `--no-report` | do not write a file |
+
+Nothing is silently skipped: the installer-signing check appears as `N/R` with
+the reason and the exact next command, and a gate that cannot start is a
+failure, not a note.
+
+### 12.2c Building the installer with one command
+
+`pc-agent release installer` does the three things the manual steps did, and
+writes down what it did.
+
+Check first - this runs nothing that installs or compiles:
+
+```powershell
+pc-agent release installer --check
+```
+
+It reports, with versions, whether `node`, `npm`, `cargo` and `rustc` were found,
+whether the WebView2 runtime is installed, whether `tauri.conf.json` points at a
+built UI, and whether an installer already exists in `bundle\nsis` /
+`bundle\msi`. Anything missing is listed as a blocker with the fix, and the exit
+code is `1`.
+
+Anything missing is now followed by the exact commands, in order, deduplicated
+(`cargo` and `rustc` come from one rustup install, so you get one line):
+
+```
+Next, one command at a time (restart the terminal after an install):
+  1. winget install --id Rustlang.Rustup --accept-source-agreements
+  2. winget install --id OpenJS.NodeJS.LTS --accept-source-agreements
+  3. pc-agent release installer --check
+  4. pc-agent release installer --build --launcher
+```
+
+Build (and write the launcher in the same run):
+
+```powershell
+pc-agent release installer --build --launcher
+```
+
+That runs `npm ci` (or `npm install` when the tree has no
+`frontend\package-lock.json`), then `npm run tauri:build`, as argv lists (no
+shell), keeps the tail of each output, and lists the installers it found.
+
+**Your UI is protected during the build.** `npm run build` deletes
+`src\pc_agent\webui\assets` and `index.html` *before* it compiles, and the Tauri
+build runs it. Before 0.82.11 a type error, a missing `node_modules` or a Rust
+error left the package with no Command Center at all - a 404 in the window. Now
+`--build` snapshots the bundle first, puts it back if the build fails (reported
+as `ui_bundle_restored`), and clears the snapshot after a good build.
+`webui\__init__.py` is never part of the snapshot.
+
+**The launcher, and why it exists.** The installed `.exe` is a *window*: it runs
+`python -m pc_agent api serve` and waits for `http://127.0.0.1:8765`. It honours
+`OMNI_PYTHON`, and on a PC with more than one interpreter `python` is a coin
+flip - so `--launcher` writes `Omni-Assistant.cmd` in the project root with:
+
+```cmd
+set "OMNI_PYTHON=C:\omni-assistant\.venv\Scripts\python.exe"
+set "OMNI_ASSISTANT_ROOT=C:\omni-assistant"
+if exist "<built exe>" ( start "" "<built exe>" %* & exit /b 0 )
+"C:\omni-assistant\.venv\Scripts\python.exe" -m pc_agent gui %*
+```
+
+Pin it to the interpreter that imports `pc_agent` (the venv you installed into),
+start the exe when it exists, and fall back to the built-in window when it does
+not - so the shortcut keeps working even if the installer is uninstalled. It
+writes no credentials. Re-run `--launcher` after moving or rebuilding the venv.
+
+The report now also carries a `runtime` step that states this plainly: the exe is
+not a self-contained Python runtime, and the machine must have this package
+installed (`pip install -e .`) for the window to show anything.
+
+Build and sign in one step:
+
+```powershell
+pc-agent release installer --build --sign --thumbprint <your-thumbprint>
+```
+
+Signing requires a certificate (`--thumbprint` from
+`pc-agent release signing --certificates`, or `--pfx`); without one the command
+refuses with exit `2` before doing anything. With one, it signs and verifies both
+the NSIS `.exe` and the MSI, exactly like `release sign-bundle`.
+
+Every run appends its outcome to `data\installer-build.json` (steps, timings, the
+output tails, artifacts, blockers and signing results). `--json` prints the same
+report, `--report-dir` writes it elsewhere, `--timeout` bounds each npm step.
+
+### 12.2d Signing, and what a signature does not buy you
+
+Signing the installer is necessary, not sufficient. Read
+[`docs/smartscreen_reputation.md`](docs/smartscreen_reputation.md) once, because
+it is the difference between *signed* and *SmartScreen stops warning*:
+
+* **no certificate** - "Windows protected your PC", *Unknown publisher*;
+* **OV** - your publisher name is shown, but SmartScreen may still warn until
+  reputation accrues over downloads;
+* **EV** (hardware key) - typically trusted immediately.
+
+Ask this machine where it stands:
+
+```powershell
+pc-agent release signing --reputation
+```
+
+It prints the certificates found, whether each key is hardware-backed, the last
+recorded signing run, each installer's verification result, the timestamp
+authorities that will be tried, and everything still blocking a trustworthy
+release. SmartScreen reputation is reported as `not-measurable-here`, because it
+is Microsoft's system and buying or faking it is not on the table.
+
+Every signature is `sha256` **with an RFC 3161 timestamp**, and if the first
+authority fails the next one is tried (`digicert` -> `sectigo` -> `globalsign`),
+with each attempt recorded. Without a timestamp a signature dies with the
+certificate, and every installer you shipped starts warning again.
+
+### 12.3 Building the desktop installer (optional, own machine)
+
+`pc-agent ui` gives you a desktop *window* today. A real installer (Start-menu
+entry, own icon, no Python visible) is the Tauri bundle in
+`frontend/src-tauri/`. It is **not built or verified by this release** - the
+development machine had no Rust toolchain or WebView2 - so build it yourself:
+
+Prerequisites: **Node 20+**, **Rust (stable, MSVC toolchain)**, **WebView2**
+(already present on current Windows 10/11), and the *Visual Studio C++ build
+tools* that rustup offers to install.
+
+First check the shell definition (uses only Python, runs in a second):
+
+```powershell
+cd D:\omni-assistant
+```
+
+```powershell
+python scripts\check_desktop_shell.py
+```
+
+It must print `DESKTOP SHELL: READY` and list every icon it validated. If it
+prints `NOT READY`, it names the exact problem (wrong `frontendDist`, missing
+icon, remote URL, version mismatch) - fix that before spending ten minutes on a
+Rust compile.
+
+Then build:
+
+```powershell
+cd D:\omni-assistant\frontend
+```
+
+```powershell
+npm ci
+```
+
+```powershell
+npm run tauri:build
+```
+
+Output lands in `frontend\src-tauri\target\release\bundle\`:
+
+| Folder | File |
+|---|---|
+| `nsis\` | `Omni-Assistant Command Center_0.82.x_x64-setup.exe` |
+| `msi\` | `Omni-Assistant Command Center_0.82.x_x64_en-US.msi` |
+
+The installer is **unsigned** when it leaves the build. Signing it needs your
+own certificate: this project never generates, stores or transmits a signing
+key, and no signing secret exists in CI.
+
+The whole runbook is in [`docs/authenticode_signing.md`](docs/authenticode_signing.md).
+In short, from the repository root:
+
+```powershell
+pc-agent release signing --certificates
+```
+
+That lists the code-signing certificates in `Cert:\CurrentUser\My` with their
+thumbprint and whether a private key is present, then prints the two lines to
+paste. Set the thumbprint it printed:
+
+```powershell
+$env:PC_AGENT_SIGN_THUMBPRINT = "<the thumbprint it printed>"
+```
+
+Check every prerequisite without signing anything:
+
+```powershell
+pc-agent release sign-bundle --check
+```
+
+It must print `READY`; otherwise it names the exact blocker (no installer, no
+`signtool.exe`, no certificate) and exits `1`. Then sign **and verify** both
+installers - the `.exe` and the `.msi`:
+
+```powershell
+pc-agent release sign-bundle
+```
+
+Each file is signed with `sha256` plus an RFC 3161 timestamp and then verified
+through the Windows trust API, so "signed" in the report means Windows would
+actually trust it. The report is written to `data\installer-signing.json`; the
+command exits `1` if any installer is unsigned or does not verify.
+
+A PFX works too (`--pfx`), but its password is read **only** from
+`PC_AGENT_SIGN_PFX_PASSWORD` - never from the command line.
+
+To confirm afterwards, by hand:
+
+```powershell
+Get-AuthenticodeSignature .\frontend\src-tauri\target\release\bundle\nsis\*.exe | Format-List
+```
+
+Uninstall is the normal Windows entry; your `data\` and `workspace\` folders are
+not part of the bundle and survive an uninstall.

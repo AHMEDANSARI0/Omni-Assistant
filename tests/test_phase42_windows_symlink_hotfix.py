@@ -40,7 +40,7 @@ def test_phase42_symlink_creation_is_privilege_guarded_and_isolated() -> None:
 
 
 def test_phase42_scope_inventory_and_counts() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert len(build_default_registry().list_tools()) == 69
     assert LATEST_SCHEMA_VERSION == 18
 

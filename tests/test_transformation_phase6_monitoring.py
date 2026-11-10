@@ -233,7 +233,7 @@ def test_diagnostics_release_gui_system_surfaces(tmp_path):
 
     audit = audit_install(settings)
     checks = {check.name: check for check in audit.checks}
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     assert checks["system_monitor"].status == "pass"
 
     controller = GuiController(settings, database=database)

@@ -492,7 +492,7 @@ def test_diagnostics_and_release_audit_expose_safety(tmp_path: Path) -> None:
 
     checks = {check.name: check for check in audit_install(settings).checks}
     assert checks["safety_kernel"].status == "pass"
-    assert len(checks) == 33
+    assert len(checks) == 34
 
     relaxed, *_rest = _setup(
         tmp_path / "relaxed", environ={"PC_AGENT_SAFETY_HARD_TIMEOUTS": "0"}
@@ -502,7 +502,7 @@ def test_diagnostics_and_release_audit_expose_safety(tmp_path: Path) -> None:
 
 
 def test_transformation_phase2_scope_and_documentation() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert LATEST_SCHEMA_VERSION == 18  # phase 3 added app_events
     assert len(build_default_registry().list_tools()) == 69
 
@@ -522,7 +522,7 @@ def test_transformation_phase2_scope_and_documentation() -> None:
         assert phrase in phase_doc
     readme = (_ROOT / "README.md").read_text(encoding="utf-8")
     assert "TRANSFORMATION PHASE 2" in readme
-    assert "TRANSFORMATION_PHASE_19_VOICE_SIGNING.mjs" in readme
+    assert "TRANSFORMATION_PHASE_20_COMMAND_CENTER.mjs" in readme
     changelog = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert "## 0.64.0 - TRANSFORMATION PHASE 2 Safety Kernel" in changelog
     safety_source = (_ROOT / "src" / "pc_agent" / "safety.py").read_text(

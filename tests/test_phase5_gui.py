@@ -57,8 +57,8 @@ def test_gui_controller_doctor_summary(tmp_path: Path) -> None:
 
     summary = controller.doctor_summary()
 
-    assert __version__ == "0.81.2"
-    assert summary.version == "0.81.2"
+    assert __version__ == "0.82.12"
+    assert summary.version == "0.82.12"
     assert summary.schema_version == 18
     assert summary.provider_route == ("mock",)
     assert summary.builtin_tools == 69
@@ -253,7 +253,7 @@ def test_cli_gui_check_and_doctor(
 
     assert main(["--root", str(tmp_path), "gui", "--check"]) == expected
     check_output = capsys.readouterr().out
-    assert "Self-Healing PC Agent GUI 0.81.2" in check_output
+    assert "Self-Healing PC Agent GUI 0.82.12" in check_output
     assert "schema v18" in check_output
     assert "License: state=unconfigured, enforcement=off" in check_output
 

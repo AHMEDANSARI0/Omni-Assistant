@@ -210,3 +210,117 @@ that lets a non-Windows host produce a `passed` report.
 CLI: `pc-agent release evidence` (status / run on Windows), `... verify PATH`,
 `... record [PATH]`, `--self-test`, `--no-suite`, `--out PATH`, `--json`.
 
+
+## Working on the Command Center UI (0.82.0)
+
+The UI is a normal Vite/React app in `frontend/`, but it is **not** a separate
+service: it is built into `src/pc_agent/webui/` and served by the Python API, so
+keep the one-origin rule intact.
+
+```powershell
+cd D:\omni-assistant\frontend
+npm ci                 # Node 20+
+npm run dev            # Vite on :5173, proxying /v1 and /assets to :8765
+```
+
+Start the real backend first, in another terminal, or the dev server has nothing
+to talk to:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pc-agent api serve
+```
+
+The token is normally injected by the server into the shell. In `npm run dev`
+Vite serves `frontend/index.html`, so the placeholder is not replaced - copy the
+token from `data/api-token` (the file the server writes) into
+`frontend/index.html` while you develop, and **never commit it**.
+
+Day-to-day commands:
+
+| Command | Does |
+|---|---|
+| `npm run build` | cleans stale hashed assets, runs `tsc --noEmit`, bundles into the Python package |
+| `npm run check` | WCAG contrast audit (`scripts/check_contrast.py`) + typecheck |
+| `npm run verify:ui` | drives real Chromium against a running API (`node scripts/ui-verify.js http://127.0.0.1:8765`) and writes screenshots + `report.json` |
+| `python -m pytest tests/test_transformation_phase19_command_center_ui.py -q` | the suite that keeps the UI honest in CI |
+
+Conventions that reviewers will check:
+
+1. **No hard-coded colours.** Add a token to `src/theme.css` for both themes and
+   reference it through the Tailwind semantic palette.
+2. **No fabricated content.** A new panel starts from a real `/v1` route. If the
+   capability does not exist, render `PanelState kind="unavailable"` with the
+   reason. `tests/.../_ui.py::test_no_simulated_metrics_in_ui_sources` enforces
+   the obvious cases.
+3. **No new dependency without a reason** worth writing down. Current runtime
+   dependencies are `react`, `react-dom`, `framer-motion` - that is deliberate.
+   (`three` was evaluated for the core and removed: 600 kB and a WebGL failure
+   mode for no visual gain.)
+4. **Types come from captures.** Add the shape to `src/lib/types.ts` after
+   calling the endpoint against a live server, not from the docstring.
+5. **Writes report the API's own answer.** Use `attempt()` from
+   `src/store/toast.ts` so failures surface the engine's message.
+6. **Performance:** subscribe with `useResource(key)` (never the whole store),
+   keep lists bounded, and pause animation when hidden.
+7. **Accessibility:** every interactive element is a real `<button>`/`<input>`
+   with a label; keep `:focus-visible` visible; respect `data-motion="reduce"`.
+
+Right-to-left: use **logical** utilities only (`ms/me`, `ps/pe`, `border-s/e`,
+`text-start/end`, `start/end`). A test fails the suite if a physical one
+(`ml-`, `pr-`, `border-l`, `text-left`, `left-0`) reappears, because those do not
+mirror. Inline animation offsets are `x`-axis only - never hard-code a side.
+
+Adding a destination: create `src/views/YourView.tsx`, add a `lazy()` entry and
+a `case` in `src/App.tsx`, and add the route to `src/nav.ts` - the sidebar, the
+palette and the router all read that one table.
+
+Desktop shell: `frontend/src-tauri/` (Tauri 2). `npm run tauri:build` needs the
+Rust toolchain, WebView2 and icons generated with `npx tauri icon`. It is **not
+verified in this release**; see `docs/command_center_ui.md`.
+
+## Building the desktop installer
+
+The Tauri shell is a thin window over the loopback API, so building it is mostly
+a toolchain question. Before touching Rust, run the preflight - it validates the
+parts that actually break, and it runs anywhere Python does:
+
+```powershell
+python scripts\check_desktop_shell.py        # -> "DESKTOP SHELL: READY"
+```
+
+What it proves, and why each check exists:
+
+| Check | Why it matters |
+|---|---|
+| `build.frontendDist` resolves to a directory with `index.html` | the path is **relative to `frontend/src-tauri/`**, so `../src/...` silently points into `frontend/` and `generate_context!` fails late |
+| `beforeBuildCommand` runs `npm --prefix .. run build` | the bundle must contain the SPA the API actually serves |
+| window URL is loopback | the window is the local app, not a browser pointed at a site |
+| min window >= 1024x700 | below that the Command Center layout is unusable |
+| every `bundle.icon` exists with real magic bytes | Tauri fails at the very end otherwise |
+| versions in `tauri.conf.json` + `Cargo.toml` equal `pc_agent.__version__` | the About box and the engine must not disagree |
+| capabilities == `["core:default"]` | no shell/fs/http power reaches the webview |
+| no `tauri-plugin-shell/fs/http` | same reason, enforced as a dependency check |
+
+Then:
+
+```powershell
+cd frontend
+npm ci
+npm run tauri:build
+```
+
+CI does the same on a real Windows runner
+(`.github/workflows/desktop-windows.yml`, `workflow_dispatch` or a `v*` tag) and
+uploads the NSIS/MSI artefacts. It deliberately performs **no** code signing:
+Authenticode needs the user's certificate, so signing stays a manual step.
+
+### Adding a desktop-only feature
+
+Do not add Rust plugins for things the API already does. The window loads
+`http://127.0.0.1:8765/`, so the UI has the full `/v1` surface with the same
+token and CSP as a browser tab. Reach for a plugin only for something a web page
+genuinely cannot do (tray, global hotkey, native notifications) - and if you do,
+add the capability to `capabilities/default.json` explicitly and extend
+`tests/test_desktop_shell_preflight.py`, which currently asserts that nothing
+beyond `core:default` is granted.

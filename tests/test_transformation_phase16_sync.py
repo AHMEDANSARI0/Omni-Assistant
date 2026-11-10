@@ -788,7 +788,7 @@ def test_release_audit_has_thirty_checks_including_sync(tmp_path: Path) -> None:
     Database(settings.database_path).initialize()
     result = audit_install(settings)
     names = [check.name for check in result.checks]
-    assert len(result.checks) == 33
+    assert len(result.checks) == 34
     assert "device_sync" in names
     sync_check = next(check for check in result.checks if check.name == "device_sync")
     assert sync_check.status == "pass"
@@ -796,7 +796,7 @@ def test_release_audit_has_thirty_checks_including_sync(tmp_path: Path) -> None:
 
 
 def test_build_identity_matches_the_phase(devices) -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert TRANSFORMATION_PHASE == 18
     assert "Production" in TRANSFORMATION_LABEL
     assert LATEST_SCHEMA_VERSION == 18

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The shell only needs the core capabilities: a window, focus and the single-instance plugin. No filesystem, shell or network capability is granted to the frontend - it talks to the loopback API with its own bearer token.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

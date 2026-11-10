@@ -703,7 +703,7 @@ def test_diagnostics_and_release_cover_flows(tmp_path: Path) -> None:
     assert flows_summary_line(settings, database).startswith("flows=")
 
     audit = audit_install(settings)
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     check = next(item for item in audit.checks if item.name == "flow_builder")
     assert check.status == "pass"
     assert "flow_definitions" in check.detail
@@ -726,7 +726,7 @@ def test_schema_v14_creates_flow_tables(tmp_path: Path) -> None:
 
 
 def test_identity_and_web_panel_are_current() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert TRANSFORMATION_PHASE == 18
     assert TRANSFORMATION_LABEL == "TRANSFORMATION PHASE 18 Production Hardening"
     assert LATEST_SCHEMA_VERSION == 18

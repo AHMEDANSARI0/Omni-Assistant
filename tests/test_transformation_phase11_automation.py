@@ -182,11 +182,11 @@ def test_phase11_identity_is_single_sourced() -> None:
     from pc_agent.baseline import baseline_identity
 
     identity = baseline_identity()
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert LATEST_SCHEMA_VERSION == 18
     assert TRANSFORMATION_PHASE == 18
     assert identity["label"] == TRANSFORMATION_LABEL
-    assert identity["previous_transformation_version"] == "0.81.1"
+    assert identity["previous_transformation_version"] == "0.82.11"
     assert len(build_default_registry().list_tools()) == 69
 
 
@@ -702,7 +702,7 @@ def test_diagnostics_and_release_cover_automation(tmp_path: Path) -> None:
     assert "vision=local" in line
 
     audit = audit_install(settings)
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     names = {check.name for check in audit.checks}
     assert "automation_audit" in names
     check = next(item for item in audit.checks if item.name == "automation_audit")

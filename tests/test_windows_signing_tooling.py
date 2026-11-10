@@ -272,7 +272,7 @@ def test_audit_reports_unsigned_as_a_fact_not_a_failure(tmp_path: Path, monkeypa
     assert check.status == "pass"
     assert "unsigned" in check.detail
     assert "Ed25519" in check.detail  # the enforced signature is named, not confused
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     assert "windows_authenticode" in {c.name for c in audit.checks}
 
 

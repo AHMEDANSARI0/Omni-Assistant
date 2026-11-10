@@ -89,7 +89,7 @@ def _signed(body: dict[str, Any], *, secret: str = "webhook-secret") -> tuple[by
 
 
 def test_phase13_identity_is_wired_through_the_product() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert TRANSFORMATION_PHASE == 18
     assert "Production" in TRANSFORMATION_LABEL
     assert LATEST_SCHEMA_VERSION == 18
@@ -599,7 +599,7 @@ def test_diagnostics_and_release_report_connectors(tmp_path: Path) -> None:
     audit = audit_install(settings)
     checks = {check.name: check for check in audit.checks}
     assert "connectors" in checks
-    assert len(audit.checks) == 33
+    assert len(audit.checks) == 34
     # With connectors switched on the audit warns (honestly) instead of passing.
     assert checks["connectors"].status == "warn"
     assert "PC_AGENT_ALLOW_CONNECTORS" in checks["connectors"].detail

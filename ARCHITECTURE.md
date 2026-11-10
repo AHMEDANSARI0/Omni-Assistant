@@ -375,3 +375,49 @@ Design rules for this layer:
    key and deletes it with the work directory.
 4. **The live install is never the test subject.** Apply/rollback run against a
    copy; tree hashes prove both directions.
+
+## Command Center UI layer (0.82.0)
+
+The presentation layer is now a separate build artefact inside the same package,
+served by the same process. There is no second server and no second origin.
+
+```
+src/pc_agent/webui/        built bundle (index.html + 17 hashed assets)
+src/pc_agent/webui/__init__ serving helpers: read_index (token meta),
+                            static_path (traversal-safe), inline_script_hashes,
+                            smoke (honest build status)
+src/pc_agent/api_server.py HTTP surface: GET /, /assets/*, /favicon.ico,
+                            /legacy, /v1/events/stream (NDJSON)
+frontend/src/              React + TypeScript sources (shipped in the bundle)
+frontend/src-tauri/        Tauri 2 shell (scaffold; not built on this machine)
+```
+
+**Rules this layer must keep**
+
+1. *One origin.* The shell, its assets and `/v1` are all served by the local API,
+   so there is no CORS configuration to get wrong and the bearer token never
+   appears in a URL. The token reaches the page as a `<meta>` tag injected per
+   response by `read_index()`.
+2. *Strict CSP.* `script-src 'self' 'sha256-...'` with the hash computed from the
+   shell's own inline bootstrap per response. No `'unsafe-inline'`, no
+   `'unsafe-eval'`, `frame-ancestors 'none'`, `connect-src 'self'`.
+3. *The engine is untouched.* Every screen is a client of documented `/v1`
+   routes. Where a capability does not exist, the screen says so; it never
+   invents data or a success. `frontend/src/lib/types.ts` mirrors payloads that
+   were captured from a live server, not from documentation.
+4. *Rollback stays possible.* `/legacy` still serves the pre-0.82 panel, and the
+   Tkinter GUI (`pc-agent gui`) is unchanged.
+5. *Bounded work.* The event stream is server-capped (5-900 s) with heartbeats;
+   the store polls per resource with one in-flight request and pauses when the
+   tab is hidden; the AI core canvas stops when hidden or off-screen.
+
+Data flow for a write (example, "execute now" from the command bar):
+
+```
+CommandBar → lib/actions.runInstruction → POST /v1/run (bearer from meta)
+           → activity store marks "thinking" (core state)
+           → service creates/executes the task in the engine
+           → response envelope {ok,data} → toast with the real outcome
+           → store.refresh("tasks"), refresh("events")
+           → /v1/events/stream pushes the task.created event to the feed
+```

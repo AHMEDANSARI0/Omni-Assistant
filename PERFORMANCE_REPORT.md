@@ -429,3 +429,46 @@ Notes and honest limits:
   module pulled into start-up), not micro-regressions;
 - the idle process holds no polling loop: proactive scheduling and background
   upgrades are OS-scheduled, so idle CPU stays at zero for this process.
+
+## Command Center UI measurements (0.82.0)
+
+Environment: Linux x86_64 sandbox, 2 vCPU, ~2 GB RAM, Chromium 130 (headless),
+real `pc-agent api serve` on loopback, captured by
+`frontend/scripts/ui-verify.js` (`/home/user/ui-verification/report.json`).
+
+| Metric | Measured | Budget | Note |
+|---|---:|---:|---|
+| First contentful paint | **275 ms** | < 1500 ms | loopback, cold page load |
+| DOMContentLoaded | 19 ms | — | shell only, views are lazy |
+| DOM nodes (dashboard) | **819** | < 2600 | 9 widgets + feed after the stream settles |
+| JS heap (dashboard) | **9.5 MB** | — | `performance.memory` |
+| First-screen transfer | **73 KB** | < 900 KB | 36 resources, local disk |
+| Initial bundle (raw) | 342 KB | — | 86 kB app + 134 kB React + 122 kB motion |
+| Initial bundle (gzip) | ~110 KB | — | 25.6 + 43.1 + 40.3 kB |
+| Lazy view chunks | 3.0-6.8 KB each | — | 16 views code-split |
+| All assets on disk | 471 KB | — | 23 files in `src/pc_agent/webui` |
+| `npm run build` (clean + tsc + vite) | ~2.1 s | — | Node 20.20.2 |
+
+Animation and resource discipline, verified in the same run:
+
+* the AI core canvas stops drawing on `visibilitychange` and when it scrolls out
+  of view (pixel-compare check: identical frames while hidden);
+* particle count is 168 at full motion, 40 under reduced motion, device pixel
+  ratio capped at 2;
+* both themes are measured on every route: light body text minimum **4.73:1**
+  and dark **5.99:1** over 286 sampled elements, zero failures;
+* the mirrored (RTL) layout is measured too: sidebar at the opposite edge,
+  content opposite it, no horizontal overflow at 1600/1280/1024 px;
+* polling runs per resource (2-30 s) and is skipped entirely for resources the
+  current screen does not use; one in-flight request per resource;
+* the event stream is bounded by the server (5-900 s), reconnects with backoff,
+  and is aborted on tab hide;
+* no chart, icon or font library is bundled - icons are 20 hand-written SVG
+  paths, charts are 30 lines of SVG, and system fonts are used.
+
+Across a full 17-route sweep the verifier recorded **0 console errors, 0 page
+errors, 0 failed requests** (28 client-side aborts, all from deliberately
+reloading or leaving the page mid-stream) and **0 cross-origin requests**.
+
+Not measured here: Windows WebView2/browser paint on the user's hardware, GPU
+composition cost, and long-session memory drift beyond the dashboard snapshot.

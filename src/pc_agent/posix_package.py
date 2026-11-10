@@ -11,6 +11,7 @@ or claim live macOS verification from a Linux build host.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -21,6 +22,10 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .env_template import (
+    ENV_TEMPLATE_NAME,
+    restore_env_template_if_missing,
+)
 from .errors import PcAgentError
 from .release import (
     ReleaseFileRecord,
@@ -30,6 +35,8 @@ from .release import (
     _validate_entry_name,
     release_candidate_files,
 )
+
+_LOG = logging.getLogger(__name__)
 
 POSIX_PACKAGE_APP_NAME = "Self-Healing PC Agent"
 POSIX_PACKAGE_APP_ID = "self-healing-pc-agent"
@@ -104,6 +111,17 @@ class PosixPackageInfo:
 def posix_package_payload_files(root_dir: Path) -> tuple[Path, ...]:
     """Return sorted runtime files allowed into a POSIX package."""
 
+    # The template is a *required payload file*, so a tree that lost it cannot
+    # build. Restore it first: this costs nothing, ships no secret, and turns a
+    # nineteen-failure cascade into a working build.
+    restored = restore_env_template_if_missing(root_dir)
+    if restored is not None:
+        _LOG.warning(
+            "Restored the missing %s template at %s (it is a required installer "
+            "payload file).",
+            ENV_TEMPLATE_NAME,
+            restored,
+        )
     candidates = tuple(
         relative
         for relative in release_candidate_files(root_dir)
@@ -115,7 +133,8 @@ def posix_package_payload_files(root_dir: Path) -> tuple[Path, ...]:
         raise PcAgentError(
             "POSIX installer source is missing required files: "
             + ", ".join(missing)
-            + "."
+            + ". Restore them by re-running the installer patcher; "
+            "`pc-agent release env-template --write` restores the .env template."
         )
     return candidates
 

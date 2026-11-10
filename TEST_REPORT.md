@@ -1,5 +1,102 @@
 # Test Report
 
+## 0.82.12 - the certificate guide, and a corrected claim
+
+| Test | What it holds |
+|---|---|
+| `test_the_reputation_wording_never_promises_an_ev_bypass` | `src/pc_agent/windows_signing.py` contains no "trusted immediately"; `docs/smartscreen_reputation.md` contains no "Typically trusted immediately" and does contain the correction marker |
+| `test_reputation_gives_the_same_expectation_for_ov_and_ev` | an OV certificate and an EV certificate now produce the same first-run expectation, because the difference no longer exists |
+| `test_reputation_names_the_ev_expectation` | hardware-backed is still reported, but the expectation text says EV no longer bypasses SmartScreen |
+| `test_the_certificate_purchase_guide_exists_and_is_honest` | the guide mentions the 2024 change, the US/Canada-only individual restriction, Pakistan, a "does not buy" section, the three real commands, and no angle-bracket placeholders in copyable commands |
+
+Linux suite after the change: **1327 passed, 2 skipped**. Sources for the
+correction: Microsoft Learn, *Code signing options for Windows app developers*
+(2026), and the CA/Browser Forum HSM requirement of June 2023.
+
+## 0.82.11 - the installer build path
+
+`tests/test_installer_build_path.py` - **18 tests**, all with a fake runner and a
+monkeypatched toolchain, because no Rust exists on the machine that wrote them:
+
+| Area | Tests | What is held |
+|---|---|---|
+| package manager | 1 | `npm ci` with a lockfile, `npm install` without, chosen by the file's presence |
+| UI bundle protection | 4 | a failed Tauri build restores `index.html` + `assets/`; a good build leaves no snapshot behind; no snapshot when nothing was built yet; `webui/__init__.py` untouched |
+| build ordering | 1 | `npm` failing skips the Tauri build instead of running it |
+| launcher | 4 | pins `OMNI_PYTHON`, prefers the built exe and still falls back to `pc-agent gui`, CRLF bytes, survives a path with spaces, writes no credentials |
+| runtime truth | 2 | the report says the shell starts `python -m pc_agent`; an interpreter that cannot import the package is a failure |
+| CLI | 2 | `--launcher` exists; `--check` never writes the launcher |
+| next steps | 3 | deduplicated `winget` commands, no angle-bracket placeholders, ordered, and `--check` prints them |
+| report | 1 | `data/installer-build.json` carries the new steps and the real version |
+
+Linux suite after the change: **1325 passed, 2 skipped**. `release installer
+--check` on Linux: `[FAIL] toolchain: missing cargo, rustc` - correct, and it
+prints the fix. `[PASS] runtime: the shell starts the core with python -m
+pc_agent; OMNI_PYTHON=<venv>`.
+
+**Not claimed:** no installer was built and none was signed in this release. The
+build itself needs Rust + WebView2 on Windows; the command that runs it is
+verified, the compile is not.
+
+## 0.82.10 - regression tests for client disconnects, and the first Windows acceptance record
+
+### The bug these tests exist for
+
+`pc-agent gui` on Windows logged `ERROR ... Local API GET /v1/events/stream
+failed` plus two tracebacks every time the browser dropped the event stream.
+Cause: only the POSIX disconnect errors (`BrokenPipeError`,
+`ConnectionResetError`) were caught; Windows raises `ConnectionAbortedError`
+(10053). The generic handler then tried to answer with a 500 on a dead socket.
+
+`tests/test_event_disconnect_is_quiet.py` - **9 tests**:
+
+| Test | What it holds |
+|---|---|
+| `test_the_stream_ends_quietly_whatever_the_platform_calls_it` | 4 params: Windows 10053, Windows 10054, POSIX EPIPE, bare `OSError(10053)`. No exception escapes `_stream_events`, no ERROR record. |
+| `test_dispatch_does_not_answer_a_client_that_is_gone` | A mid-request hang-up produces no 500 attempt and no ERROR. |
+| `test_a_real_application_error_still_reports_a_500` | A `RuntimeError` still yields `500 internal_error` **and** an ERROR log - the quiet path must not hide bugs. |
+| `test_connection_aborted_is_part_of_the_handled_set` | `_CLIENT_GONE` covers all three classes. |
+| `test_the_server_swallows_a_hangup_instead_of_printing_a_traceback` | `_QuietThreadingHTTPServer.handle_error` is silent for a disconnect. |
+| `test_the_server_still_surfaces_unexpected_failures` | Any other exception still reaches `ThreadingHTTPServer.handle_error`. |
+
+Proof the tests target the real fault: run against the 0.82.9 source, three of
+them fail with `ConnectionAbortedError: [Errno 10053] aborted`; against 0.82.10
+all nine pass. Additionally, an end-to-end probe (real server, real socket, `RST`
+via `SO_LINGER`, then `GET /v1/health`) produced **0** ERROR/traceback lines and
+kept serving - the same probe on the old code produced the reported tracebacks.
+
+### Linux suite
+
+- Full run: **1307 passed, 2 skipped** (Tk window unavailable, Windows-only
+  long-path check). `ruff` clean.
+
+### Windows acceptance (user machine, 0.82.9)
+
+`python scripts\verify_windows.py` on `Windows-10-10.0.19045-SP0`,
+Python 3.11.0, `D:\omni-assistant`:
+
+```
+[PASS] python         3.11.0 at D:\omni-assistant\.venv\Scripts\python.exe
+[PASS] import         pc_agent 0.82.9 imported from D:\omni-assistant\src\pc_agent
+[PASS] payload        all 19 required installer payload files are present
+[PASS] ruff / doctor / audit / desktop_shell
+[PASS] suite          1291 passed, 9 skipped in 1460.11s (0:24:20)
+[PASS] production     exit 0
+[N/R ] signing        no code-signing certificate installed
+WINDOWS VERIFICATION: PASS
+```
+
+1291 + 9 = **1300 collected** on Windows; 1298 + 2 = **1300 collected** on
+Linux. Same suite, different platform gating (7 Linux-only tests: systemd
+scheduler, idle-power sensors, `/proc` sampling, fork-type checks; 2 Windows-only:
+the Tk window and the long-path check). Zero failures on both. Evidence:
+`data/windows-verification.json` on the user's machine.
+
+**Signing stays `not-run` and that is the honest answer**, not a defect: an OV/EV
+certificate is bought from a CA, and SmartScreen reputation is assigned by
+Microsoft from download volume and publisher identity - this product can neither
+measure nor purchase it (`docs/smartscreen_reputation.md`).
+
 ## Phase 0 audit evidence (GitHub Phase 58)
 
 Audited commit: `89610f3d18f9348b6fe8ead679bab81ee34155df`.
@@ -1248,3 +1345,231 @@ Two real defects were fixed alongside: `--json` now emits one document, and the
 verb `status` never runs the gates. One property was added:
 `test_a_launcher_shim_host_still_has_a_working_candidate`.
 
+
+## 0.82.0 Command Center UI evidence
+
+Suite: **1147 passed, 1 skipped** (the skip is still the real-Tk-window test with
+no display), run on Linux under `TZ=UTC`, `Asia/Karachi` and `America/New_York`
+with `--basetemp` outside `/tmp`. `ruff check .` clean.
+`release audit`: READY (33 checks, 0 failures, the usual mock-provider warning).
+
+New automated tests - `tests/test_transformation_phase19_command_center_ui.py`
+(17):
+
+| Test | What it proves |
+|---|---|
+| `test_build_is_present_and_self_contained` | a build exists, is < 4 MB, every referenced asset resolves, the only absolute URL is the SVG namespace |
+| `test_token_meta_is_never_empty_or_duplicated` | exactly one token meta tag |
+| `test_static_path_refuses_traversal` | `../`, absolute paths, NUL bytes and symlink escapes are refused |
+| `test_inline_script_hashes_match_the_shell` | CSP hashes exist and none is `'unsafe-inline'` |
+| `test_spa_shell_is_served_with_strict_headers` | CSP directives, X-Frame-Options, token appears exactly once |
+| `test_assets_are_served_with_types_and_cache` | JS/CSS MIME, `immutable`, `nosniff` |
+| `test_asset_route_refuses_traversal_and_missing_files` | 404 for all three shapes |
+| `test_legacy_panel_still_available_for_rollback` | `/legacy` unchanged |
+| `test_missing_build_is_reported_honestly` | the not-built page, with the real fix and no fake dashboard |
+| `test_event_stream_emits_ready_frame_and_real_events` | NDJSON headers, `stream.ready`, then a `task.created` the service really wrote |
+| `test_event_stream_requires_the_token` | 401 without the bearer |
+| `test_event_stream_duration_is_bounded` | the server, not the client, ends the stream |
+| `test_event_stream_rejects_garbage_instead_of_guessing` | `since_id=abc` / `duration=xyz` are 400s |
+| `test_frontend_sources_are_shipped_for_rebuilds` | sources + lock file ship, build typechecks and cleans |
+| `test_both_themes_are_defined_and_contrast_checked` | dark + light tokens, `@tailwind`, reduced motion, and the contrast script passes |
+| `test_ui_verification_script_is_checked_in` | the browser verifier and its route list exist |
+| `test_no_simulated_metrics_in_ui_sources` | anti-fake-data guard over every view/widget source |
+
+Browser verification (not part of pytest, because it needs Chromium):
+`frontend/scripts/ui-verify.js` - **46/46 checks** against the real API, including
+17 routes rendering real content, measured contrast in both themes (light body
+min 4.73:1, dark 5.99:1), palette open/filter/navigate, live-stream update,
+persisted collapse, widget reorder, no overflow at 1280/1024, reduced motion,
+no console errors, no failed or cross-origin requests, bounded DOM, FCP 194 ms.
+
+Adjusted for the redesign, with the reason on the test itself:
+`test_web_ui_served_with_security_headers` (Phase 5) now accepts the SPA shell at
+`/` and relies on the 0.82 suite for the `/legacy` rollback assertion.
+
+Windows: unchanged claim - **not run on Windows** for this build. `not-run` is
+not `passed`; the acceptance harness (`pc-agent release evidence`) is the only
+thing that can change that status.
+
+### 0.82.1 - voice acceptance hardening (Windows finding)
+
+The 0.82.0 Windows run failed one test; the test was correct to fail.
+
+| Item | Result |
+|---|---|
+| Reported failure | `test_voice_acceptance_is_sealed_and_honest_on_a_headless_host` - assertion `report.not_run` was empty, i.e. all 7 gates passed on that host |
+| Root cause | `push_to_talk` passed on any backend name (`winmm`) without checking that an input device exists |
+| Source fix | gate now requires backend **and** `input_devices.count >= 1`; otherwise `not-run` with the scan reason; pass detail states presence-only |
+| Test fix | renamed to `..._honest_about_the_host`; asserts `not-run` exactly for hardware the host lacks, `passed` only with backend + device count recorded, evidence required on every gate |
+| New regression test | `test_voice_acceptance_does_not_pass_a_backend_without_a_device` (backend + 0 devices -> `not-run`, status `incomplete`) |
+| Linux evidence | `INCOMPLETE; gates=7; passed=4; failures=0; not-run=push_to_talk,stt_engine,tts_engine` |
+| Simulated Windows evidence | `PASSED; gates=7; passed=7; failures=0`; host `microphone_backend=winmm`, `input_devices=1` |
+| Suite | **1148 passed, 1 skipped** on Linux; on Windows the same suite reports 9 skips (symlink privilege, POSIX shell, live systemd/logind). `ruff` clean; `release audit` READY (33 checks) |
+
+The Windows figure above is a **simulation** of that host class produced on Linux by
+overriding only the hardware fields of the live status; the real Windows re-run is
+still the user's to perform and is recorded as `pending_user_windows_evidence`.
+
+### 0.82.2 - default entry point, RTL mirroring, desktop icons
+
+| Item | Evidence |
+|---|---|
+| `pc-agent ui` / `pc-agent gui` open the Command Center | `test_command_center_launcher_opens_the_api_not_tk` (parser + source), `test_command_center_launcher_serves_and_stops` (real bounded server run, exits cleanly) |
+| `pc-agent gui --tk` still reaches the Tk panel | same test asserts `tk=True` parses; the Tk suite (`test_phase5_gui.py`, 20 tests) is unchanged and green |
+| Logical direction utilities only | `test_ui_sources_use_logical_direction_utilities` scans every `.tsx` for `ml-/mr-/pl-/pr-/border-l/border-r/text-left/text-right/left-N/right-N` |
+| RTL in the real browser | `ui-verify.js` 54/54: `html dir` -> rtl, sidebar at the right edge (1354 px of 1600), content opposite it, no overflow, screenshot `07-dashboard-rtl.png` |
+| `auto` follows the engine | harness reads `/v1/i18n/status` -> `data.direction` and compares it to `document.documentElement.dir` |
+| Desktop shell is complete on the asset side | `test_desktop_shell_config_and_icons_are_real` (version match, 6 icon files with real magic bytes), `test_desktop_shell_grants_no_extra_capabilities` (`core:default`, no shell/fs/http plugin, single-instance present) |
+| Suite | **1154 passed, 1 skipped** on Linux; `ruff` clean; `release audit` READY (33 checks) |
+
+Tauri is still **not built or verified** (no Rust toolchain / WebView2 on this
+machine); the icons and configuration are ready for the machine that can.
+
+### 0.82.9 - a missing payload template, and the audit that should have caught it
+
+Reported from the Windows machine: 29 failures, 27 of them `missing required
+files: .env.example`, in ten different test modules, while `release audit` said
+READY.
+
+| Item | Evidence |
+|---|---|
+| Root cause | `.env.example` is a required payload file for the Windows, POSIX, Debian and RPM builders; it was absent from the install tree |
+| Template lives in code | `pc_agent/env_template.py`; test asserts the constant is byte-identical to the shipped file |
+| Template ships no secrets | test parses every `*_KEY=` / `*_TOKEN=` / `*_SECRET=` / `*_PASSWORD=` line and asserts the value is empty |
+| Builders self-heal | `posix_package_payload_files` and `windows_installer_payload_files` restore a missing `.env.example` and log the path; both asserted |
+| Restore is idempotent | an edited existing file is never overwritten; `--force` is explicit |
+| Real breakage stays loud | removing `scripts/install_posix.sh` still raises, and the message names the file **and** the recovery ("re-run the installer patcher", `env-template --write`) |
+| CLI | `release env-template --check` exits 1 when missing, `--write` restores, `--json` machine-readable |
+| `release audit` | new check **34** `installer_payload`: 19 required files, PASS when all present, FAIL naming the missing ones plus the fix |
+| Verification gate | `scripts/verify_windows.py` gate `payload`, ordered before `suite`, reports `restored .env.example from the built-in template` |
+| Regression suite | `tests/test_env_template_restore.py` - **15 tests** |
+| Suite | **1298 passed, 2 skipped** (Linux); `ruff` clean; release audit READY (34 checks) |
+| Allow-list | **490** files |
+
+The same Windows run also showed the 0.82.6 fixes missing (`WinError 10038`, the
+POSIX-literal argv assertion), which means that tree predates 0.82.6 - the
+diagnostic is `python -c "import pc_agent; print(pc_agent.__version__)"`.
+
+### 0.82.8 - EV / hardware-key signing, timestamp fallbacks, SmartScreen honesty
+
+| Item | Evidence |
+|---|---|
+| Key storage is reported | certificate listing parses `ProviderName` + `HardwareDevice` into `hardware-token` / `software-store` / `unknown`, and counts `hardware_backed` |
+| `--require-hardware` refuses a PFX | blocker names it "an exportable copy of that key"; `sign_bundle` returns early and never runs signtool |
+| `--require-hardware` accepts a token | READY with a note naming the provider |
+| `--require-hardware` refuses a software key | blocked with "check the token is plugged in and its middleware is running" |
+| Unreadable provider is a note, not a pass | `unknown` storage keeps the plan READY and records why it could not tell |
+| No key material anywhere | source contains no `Export-PfxCertificate`, no `certutil -exportPFX`, no `Export(`; test asserts it |
+| Timestamp fallback order | `digicert` -> `sectigo` -> `globalsign`; a fake failure on the first is retried on the second and the report names the one that worked |
+| All authorities failing | `failed`, detail says so, and every attempt is recorded |
+| Custom authority | tried first, then the fallbacks |
+| Reputation report | `not-measurable-here` + note; expected first-run text switches between unsigned / OV / EV from the certificate's own metadata |
+| Unreadable signing report | reported as `unreadable`, not swallowed |
+| CLI | `release signing --reputation [--json]` exits 1 while anything remains, and lists each blocker as `REMAINING:` |
+| Docs | `docs/smartscreen_reputation.md` linked from `INSTALLATION_GUIDE.md` §12.2d and from `docs/authenticode_signing.md` |
+| Suite | **1282 passed, 2 skipped** (Linux); `ruff` clean; release audit READY (33 checks) |
+| Allow-list | **488** files |
+
+Not verified: no certificate, no token and no `signtool.exe` exist on this
+machine, so `release sign-bundle --check` and `release signing --reputation` report
+`NOT READY` / `not-run` with the real reasons (measured), and the Win32 trust path
+remains unexercised here.
+
+### 0.82.7 - installer command + touch-friendly widget grid
+
+| Item | Evidence |
+|---|---|
+| `release installer --check` runs nothing | test doubles the runner and fails the test if it is called; build/signing steps report `not-run` |
+| Missing toolchain is named | `missing: cargo, rustc` + one hint per tool; build step `skip`; exit `1` |
+| Unbuilt UI is a blocker with the fix | `frontendDist` resolving to a directory with no `index.html` -> `run: cd frontend; npm run build` |
+| Build order | fake runner observed exactly `npm ci --no-audit --no-fund` then `npm run tauri:build` |
+| A broken `npm ci` stops early | `tauri:build` recorded as `skip`; the npm error tail is kept |
+| Timeout and missing-binary | `timed out after Ns` with partial output; `could not start` for a missing npm |
+| Signing blocks when it cannot work | no artifacts -> step `fail` with the real plan blockers, `signing == {}` |
+| Signing after a build | fake certificate + fake signtool -> 2 artifacts signed and verified, report `ok` |
+| Report file | `data/installer-build.json` with steps/timings/artifacts; `write_report=False` writes nothing |
+| API server tests are port-safe | the regression tests bind `api_port=0`, so a running `pc-agent api serve` cannot break them |
+| Arrange mode in the browser | `ui-verify.js` **57/57**: opacity `0 → 1` without hover, control height `15px → 32px` (floor asserted at 30), mode survives a reload |
+| Arrange mode is not a layout setting | `store/ui.ts` has no `arranging` field; `Reset layout` cannot toggle the mode |
+| Contrast | `check_contrast.py` PASS in both themes (0 failing pairs) |
+| Suite | **1252 passed, 2 skipped** (Linux); `ruff` clean; release audit READY (33 checks) |
+| Allow-list | **485** files; `check_desktop_shell.py` READY |
+
+Not verified: no installer was built here (no Rust/WebView2) and no certificate
+was used. `pc-agent release installer --check` says so on this machine and the
+docs repeat it.
+
+### 0.82.6 - Windows suite regressions: two product bugs, one wrong assertion, one mixed tree
+
+The 0.82.5 cycle ended with a real Windows run: **1161 passed, 9 skipped,
+6 failed** in 1499 s. Nothing in the failures was a Linux/Windows feature gap -
+they were a shutdown race, a silent failure mode, a POSIX literal, and a patched
+install that was not one release.
+
+| Failure (Windows) | Cause | Fix | Test |
+|---|---|---|---|
+| `test_app_window_argv_has_no_chrome_and_its_own_profile` | asserted `argv[0] == "/opt/chrome"`; `str(Path("/opt/chrome"))` is `\opt\chrome` on Windows | assertion is now platform-correct (`os.fspath`); code passes a **string** executable through verbatim instead of re-wrapping it in `Path` | `test_argv_keeps_the_executable_the_caller_gave`, `test_a_windows_path_string_is_passed_through_verbatim` |
+| `test_cli_production_check_json_is_machine_readable` | a failing chain printed the reason only inside the JSON and exited 1 | every failing step is named on stderr (`Release chain step failed -> …`), stdout stays parseable; `copy2`/read are retried on WinError 5/32/33 | `test_json_report_stays_parseable_and_the_reason_goes_to_stderr`, `test_retry_survives_a_transient_windows_sharing_violation` |
+| `test_readme_documents_the_hardening_entry_points`, `test_desktop_shell_config_and_icons_are_real`, `test_real_project_satisfies_baseline_document_and_dependency_contract`, `test_transformation_phase2_scope_and_documentation` | mixed tree: `pyproject.toml` = 0.82.4, `import pc_agent` = 0.82.3, `README.md` = 0.82.3 | version is now **0.82.6** everywhere; the patcher reads every file back and fails on a mismatch (`verified=480/480`); post-install steps print `pc_agent.__version__` **and** `__file__` so a stale `site-packages` copy is visible | `test_the_work_directory_prefix_is_short`, patcher `verified=` line in the install log |
+| `PytestUnhandledThreadExceptionWarning` `[WinError 10038]` | `stop()` closed the socket while `serve_forever()` ran on the caller's thread | `stop()` shuts the loop down first when any thread is serving; the loop absorbs a socket error | `test_stop_while_serve_forever_runs_does_not_raise`, `test_stop_is_immediate_when_the_blocking_loop_never_started`, `test_a_socket_error_does_not_kill_the_serving_thread` |
+
+Regression suite: `tests/test_windows_platform_regressions.py` - **14 passed,
+1 skipped** (the Windows-only MAX_PATH check). Working tree: **1216 passed,
+2 skipped**; `ruff` clean; release audit READY (33 checks); allow-list **480**.
+
+Not claimed: the Windows suite has not been re-run against 0.82.6 from this
+side. The four failing assertions are now platform-correct, so a Windows run is
+the confirmation - it is a check, not an assumption.
+
+### 0.82.5 - Authenticode installer runbook + configurable widget grid
+
+Two things were missing and both are now executable here: signing the installer
+you actually download, and letting the dashboard be rearranged (not just
+reordered).
+
+| Item | Evidence |
+|---|---|
+| Installer discovery | `discover_installer_artifacts()` returns only `.exe` inside `bundle/nsis/` and `.msi` inside `bundle/msi/`; a stray `notes.txt` and the app binary at `target/release/*.exe` are excluded (asserted) |
+| Certificate listing (Windows) | `list_signing_certificates()` parses PowerShell `Cert:\CurrentUser\My` JSON into subject / issuer / thumbprint / validity / private-key; `usable` counts certificates that can actually sign |
+| Certificate listing (Linux) | `pc-agent release signing --certificates` -> `not-run` + "the certificate store only exists on Windows", exit **1** - deliberately not an empty list |
+| Preflight | `pc-agent release sign-bundle --check` -> `NOT READY`, exit 1, 3 blockers (no installer / no `signtool.exe` / no certificate), 2 notes (not Windows / timestamp URL); signs nothing (test asserts no `signtool` call) |
+| Preflight negatives | short thumbprint -> "too short"; missing PFX -> "PFX file not found"; a full tree + signtool + thumbprint -> `READY` with 2 artefacts |
+| Bundle signing | `sign_bundle()` signs both artefact types with `/sha1`, `/fd sha256`, `/tr` timestamp, then verifies each through the trust API; 2 signtool invocations asserted |
+| Verification is not `signtool`'s exit code | a fake runner returning "Successfully signed" plus an untrusted verification result gives `ok=False`, `signed=0` |
+| Nothing is half-signed | when the plan is blocked, `sign_bundle()` returns before running signtool (`results == []`) |
+| Secret handling | PFX password only from `PC_AGENT_SIGN_PFX_PASSWORD` (missing -> exit **2**, message on stderr); `--allow-argv-password` is refused for bundle runs; no `BEGIN CERTIFICATE`/`EXPORT-PFX`/private-key code in the module (asserted) |
+| Runbook shipped | `docs/authenticode_signing.md` (4 steps, blocker table, PFX path, what it does *not* do) linked from `INSTALLATION_GUIDE.md` §12.3 |
+| Tests | `tests/test_installer_signing_runbook.py` - **18 tests**, all passing (fake runners, no Windows needed) |
+| Widget resize | ⤢ toggles span; harness measured `325px -> 660px` and the value is persisted in `omni.ui.v1` |
+| Widget hide/restore | ✕ removes it: `9 -> 8` widgets, still `8` after a full page reload; the **Widgets (8/9)** menu and **Reset layout** restore `9 of 9` |
+| UI harness | `ui-verify.js` now **54/54** (51 + 3 new widget checks), including "no console errors", "no failed requests", "no cross-origin requests", contrast PASS in both themes |
+| Contrast | `frontend/scripts/check_contrast.py` -> PASS, 0 failing pairs (dark and light) |
+| Suite (working tree) | **1202 passed, 1 skipped** (Linux; the skip is the real-Tk-window test with no display); `ruff` clean; `release audit` READY (33 checks) |
+| Allow-list | **479** files (new: `docs/authenticode_signing.md`, `tests/test_installer_signing_runbook.py`); `scripts/check_desktop_shell.py` -> `DESKTOP SHELL: READY` |
+
+Not claimed: no installer was built, signed or verified on Windows here. The
+signing code is tested against fake `signtool`/PowerShell output only; the real
+`WinVerifyTrust` path needs the user's machine and certificate.
+
+### 0.82.4 - desktop installer path: preflight + Windows CI
+
+The Tauri binary still cannot be built in this sandbox (no Rust, no WebView2).
+Everything around the build is now executable here, and the preflight found a
+real defect that would have failed the first genuine build.
+
+| Item | Evidence |
+|---|---|
+| Config defect found and fixed | `build.frontendDist` was `../src/pc_agent/webui`, which resolves to `frontend/src/pc_agent/webui` (does not exist). Now `../../src/pc_agent/webui`; `beforeBuildCommand` rebuilds the SPA |
+| Preflight | `python scripts/check_desktop_shell.py` -> `DESKTOP SHELL: READY`, 18 checks, 1 warning (`cargo` absent here) |
+| Negative case 1 | broken `frontendDist` in a copied tree -> exit 1, `NOT READY`, message names `frontendDist` |
+| Negative case 2 | window URL changed to `https://example.com/` -> exit 1, "loopback origin" |
+| Preflight robustness | missing `Cargo.toml`/`main.rs`/capabilities are reported as findings, not tracebacks |
+| Windows CI | `.github/workflows/desktop-windows.yml`: preflight -> `npm ci` -> `npm run build` -> Rust -> `tauri build` -> list artefacts -> upload NSIS/MSI |
+| CI does not sign | test asserts the workflow contains no `signtool`, no `PC_AGENT_SIGN_*`, no `secrets.` |
+| Tests | `tests/test_desktop_shell_preflight.py` - 9 tests, all passing |
+| Allow-list gap closed | `.github/` added to `release._INCLUDE_DIRS`; without it a patched install failed 9 tests (CI-workflow assertions + the `production_hardening` audit check) |
+| Patched-install run | patcher applied into an empty folder -> `created=477`, `pip install -e ".[dev]"`, suite there: **1184 passed, 1 skipped**, `ruff` clean, `pc-agent --version` = 0.82.4 |
+| Suite (working tree) | **1184 passed, 1 skipped** (Linux); `ruff` clean; `release audit` READY (33 checks) |
+
+Unchanged claim: the installer has **not** been built or run. The docs say so, and
+the preflight prints the exact commands for the machine that will.

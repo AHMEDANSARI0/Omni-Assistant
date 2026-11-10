@@ -151,7 +151,7 @@ def _service(
 
 
 def test_phase10_identity() -> None:
-    assert __version__ == "0.81.2"
+    assert __version__ == "0.82.12"
     assert LATEST_SCHEMA_VERSION == 18
 
 
