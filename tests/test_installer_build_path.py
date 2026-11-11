@@ -49,7 +49,7 @@ def _tree(tmp_path: Path, *, with_bundle: bool = True, with_lock: bool = True) -
     (root / "frontend" / "src-tauri").mkdir(parents=True)
     (root / "frontend" / "src-tauri" / "tauri.conf.json").write_text(
         json.dumps(
-            {"build": {"frontendDist": "../../src/pc_agent/webui"}, "version": "0.82.12"}
+            {"build": {"frontendDist": "../../src/pc_agent/webui"}, "version": "0.82.17"}
         ),
         encoding="utf-8",
     )
@@ -196,12 +196,14 @@ def test_npm_failing_skips_the_tauri_build_instead_of_running_it(
     seen: list[list[str]] = []
 
     report = run_installer_build(
-        root_dir=root, build=True, runner=_fake_runner({"ci": 1}, seen), write_report=False
+        root_dir=root, build=True, runner=_fake_runner({"ci": 1, "install": 1}, seen), write_report=False
     )
 
     assert report.step("npm_ci").status == "fail"
+    # 0.82.14: a failed `npm ci` retries with `npm install` before giving up
+    assert report.step("npm_install").status == "fail"
     assert report.step("tauri_build").status == "skip"
-    assert len(seen) == 1  # tauri was never invoked
+    assert all("tauri:build" not in argv for argv in seen)  # tauri was never invoked
 
 
 # ------------------------------------------------------------- the launcher
@@ -414,3 +416,246 @@ def test_check_mode_prints_the_ordered_fix_commands(
     assert "Next, one command at a time" in out
     assert "winget install --id Rustlang.Rustup" in out
     assert out.index("Rustlang.Rustup") < out.index("--build --launcher")
+
+
+# ------------------------------------- the directory bug (0.82.14)
+def test_the_build_runner_actually_receives_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0.82.11-0.82.13 dropped `cwd`, so npm ran in the project root.
+
+    That is the exact `ENOENT ... package.json` a user gets by running `npm ci`
+    from the project root instead of `frontend/`. The unit
+    tests could not catch it because their fake runners ignore `cwd`; this one
+    asserts the directory arrives, through the real `_default_runner`.
+    """
+
+    seen: list[dict] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append({"argv": list(argv), "cwd": kwargs.get("cwd")})
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(installer_build.subprocess, "run", fake_run)
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    installer_build._run_step(
+        "npm_ci", ["npm", "ci"], cwd=frontend, timeout=10, runner=installer_build._default_runner
+    )
+
+    assert seen and seen[0]["cwd"] == str(frontend.resolve())
+
+
+def test_a_two_argument_runner_still_works(tmp_path: Path) -> None:
+    """Older callers/tests pass (argv, timeout); they must keep working."""
+
+    calls: list[list[str]] = []
+
+    def two_arg_runner(argv, timeout):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    step = installer_build._run_step(
+        "npm", ["npm", "--version"], cwd=tmp_path, timeout=5, runner=two_arg_runner
+    )
+    assert step.status == "pass"
+    assert calls == [["npm", "--version"]]
+
+
+# ------------------------------------------------ `pc-agent ui build`
+def _ui_tree(tmp_path: Path) -> Path:
+    root = _tree(tmp_path)
+    (root / "frontend" / "package.json").write_text(
+        json.dumps({"name": "omni-command-center", "scripts": {"build": "vite build"}}),
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_ui_build_runs_inside_frontend_and_never_in_the_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_toolchain(monkeypatch)
+    root = _ui_tree(tmp_path)
+    seen: list[tuple[list[str], Path]] = []
+
+    def runner(argv, timeout, cwd):
+        seen.append((list(argv), Path(cwd)))
+        return _Completed()
+
+    report = installer_build.run_ui_build(root_dir=root, runner=runner, write_report=False)
+
+    assert report.steps[0].name == "frontend"
+    for argv, cwd in seen:
+        assert cwd == (root / "frontend").resolve(), (argv, cwd)
+    assert report.ok is True
+    assert report.step("vite_build").status == "pass"
+
+
+def test_ui_build_without_frontend_sources_says_so_instead_of_running_npm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_toolchain(monkeypatch)
+    root = _tree(tmp_path)  # no frontend/package.json
+    ran: list[list[str]] = []
+
+    report = installer_build.run_ui_build(
+        root_dir=root, runner=lambda argv, timeout, cwd: ran.append(argv) or _Completed(), write_report=False
+    )
+
+    assert report.steps[0].status == "fail"
+    assert "frontend" in report.steps[0].detail
+    assert ran == []
+    assert report.ok is False
+
+
+def test_ui_build_falls_back_to_npm_install_when_the_lock_is_out_of_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bumping the version does not touch package-lock.json: `npm ci` then fails."""
+
+    _fake_toolchain(monkeypatch)
+    root = _ui_tree(tmp_path)
+    commands: list[list[str]] = []
+
+    def runner(argv, timeout, cwd):
+        commands.append(list(argv))
+        if "ci" in argv:
+            return _Completed(returncode=1, stderr="npm error: package.json and package-lock.json are not in sync")
+        return _Completed()
+
+    report = installer_build.run_ui_build(root_dir=root, runner=runner, write_report=False)
+
+    assert [argv[1] for argv in commands] == ["ci", "install", "run"]
+    assert report.step("npm_install").status == "pass"
+    assert report.ok is True
+
+
+def test_ui_build_restores_the_bundle_when_the_compile_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_toolchain(monkeypatch)
+    root = _ui_tree(tmp_path)
+    webui = root / "src" / "pc_agent" / "webui"
+    before = (webui / "index.html").read_text(encoding="utf-8")
+
+    def runner(argv, timeout, cwd):
+        if "run" in argv:  # vite deletes the bundle, then fails
+            (webui / "index.html").unlink()
+            import shutil
+
+            shutil.rmtree(webui / "assets")
+            return _Completed(returncode=1, stderr="error TS2322: Type 'x' is not assignable")
+        return _Completed()
+
+    report = installer_build.run_ui_build(root_dir=root, runner=runner, write_report=False)
+
+    assert report.step("ui_bundle_restored").status == "pass"
+    assert (webui / "index.html").read_text(encoding="utf-8") == before
+    assert report.ok is False
+
+
+def test_ui_build_check_mode_runs_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_toolchain(monkeypatch)
+    root = _ui_tree(tmp_path)
+    ran: list[list[str]] = []
+
+    report = installer_build.run_ui_build(
+        root_dir=root,
+        check_only=True,
+        runner=lambda argv, timeout, cwd: ran.append(argv) or _Completed(),
+        write_report=False,
+    )
+
+    assert ran == []
+    assert report.step("build").status == "not-run"
+    assert report.ok is True
+
+
+def test_the_cli_parses_ui_build_and_its_flags() -> None:
+    args = build_parser().parse_args(["ui", "build", "--check"])
+    assert args.ui_command == "build" and args.check is True
+    plain = build_parser().parse_args(["ui"])
+    assert plain.ui_command is None  # bare `pc-agent ui` still opens the window
+
+
+def test_the_lockfile_version_matches_package_json() -> None:
+    """A version bump that skips the lock makes `npm ci` fail for every user."""
+
+    root = Path(__file__).resolve().parents[1] / "frontend"
+    package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    lock = json.loads((root / "package-lock.json").read_text(encoding="utf-8"))
+
+    assert lock["version"] == package["version"], "package-lock.json version is stale"
+    assert lock.get("packages", {}).get("", {}).get("version") == package["version"]
+
+
+# ------------------------------------------- stale bundle chunks (0.82.17)
+def _bundle_with_stale_chunk(tmp_path: Path) -> Path:
+    """A bundle whose assets/ holds a reachable chunk, a lazy one, and a stale one."""
+
+    root = _tree(tmp_path)
+    webui = root / "src" / "pc_agent" / "webui"
+    assets = webui / "assets"
+    (webui / "index.html").write_text(
+        '<html><script type="module" src="./assets/index-AAA.js"></script>'
+        '<link rel="stylesheet" href="./assets/index-AAA.css"></html>',
+        encoding="utf-8",
+    )
+    (assets / "index-AAA.js").write_text(
+        'import("./Agents-BBB.js");\nimport("./common-CCC.js");\n', encoding="utf-8"
+    )
+    (assets / "index-AAA.css").write_text("body{}", encoding="utf-8")
+    # the fixture's own placeholder chunk is unreachable once index.html is replaced
+    (assets / "index-abc123.js").unlink(missing_ok=True)
+    (assets / "Agents-BBB.js").write_text("// lazy view", encoding="utf-8")
+    (assets / "common-CCC.js").write_text("// shared chunk", encoding="utf-8")
+    # left behind by an earlier build: no longer referenced by anything
+    (assets / "Agents-OLD.js").write_text("// stale", encoding="utf-8")
+    (assets / "index-OLD.css").write_text("/* stale */", encoding="utf-8")
+    return root
+
+
+def test_stale_bundle_chunks_are_pruned(tmp_path: Path) -> None:
+    """0.82.15 shipped 40 files in assets/ where only 21 were current."""
+
+    root = _bundle_with_stale_chunk(tmp_path)
+    removed, kept = installer_build.prune_stale_assets(root)
+
+    assert sorted(removed) == ["Agents-OLD.js", "index-OLD.css"]
+    assert sorted(kept) == ["Agents-BBB.js", "common-CCC.js", "index-AAA.css", "index-AAA.js"]
+    assets = root / "src" / "pc_agent" / "webui" / "assets"
+    assert not (assets / "Agents-OLD.js").exists()
+    # the lazy chunk that index.html never names must survive
+    assert (assets / "Agents-BBB.js").is_file()
+
+
+def test_pruning_never_empties_a_bundle_it_cannot_read(tmp_path: Path) -> None:
+    root = _tree(tmp_path)
+    webui = root / "src" / "pc_agent" / "webui"
+    (webui / "index.html").write_text("<html>no references here</html>", encoding="utf-8")
+    (webui / "assets" / "Agents-BBB.js").write_text("// only file", encoding="utf-8")
+
+    removed, kept = installer_build.prune_stale_assets(root)
+
+    assert (removed, kept) == ([], [])
+    assert (webui / "assets" / "Agents-BBB.js").is_file()
+
+
+def test_a_good_build_reports_the_prune(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_toolchain(monkeypatch)
+    root = _bundle_with_stale_chunk(tmp_path)
+    (root / "frontend" / "package.json").write_text(
+        json.dumps({"name": "omni-command-center"}), encoding="utf-8"
+    )
+    webui = root / "src" / "pc_agent" / "webui"
+
+    report = installer_build.run_ui_build(
+        root_dir=root, runner=lambda argv, timeout, cwd: _Completed(), write_report=False
+    )
+
+    step = report.step("assets_pruned")
+    assert step is not None and step.status == "pass"
+    assert "removed 2 stale chunk(s)" in step.detail
+    assert not (webui / "assets" / "Agents-OLD.js").exists()
+    assert (webui / "assets" / "Agents-BBB.js").is_file()  # the lazy chunk survives

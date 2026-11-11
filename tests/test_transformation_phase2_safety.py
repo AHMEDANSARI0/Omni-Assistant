@@ -502,7 +502,7 @@ def test_diagnostics_and_release_audit_expose_safety(tmp_path: Path) -> None:
 
 
 def test_transformation_phase2_scope_and_documentation() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18  # phase 3 added app_events
     assert len(build_default_registry().list_tools()) == 69
 

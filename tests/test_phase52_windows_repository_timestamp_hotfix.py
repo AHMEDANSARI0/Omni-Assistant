@@ -85,7 +85,7 @@ def test_phase52_repository_builders_use_portable_timestamp_helper(
 
 
 def test_phase52_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(build_default_registry().list_tools()) == 69
 

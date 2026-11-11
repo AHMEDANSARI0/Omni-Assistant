@@ -374,7 +374,7 @@ def test_pdf_password_gui_controller_direct_methods(tmp_path: Path) -> None:
         controller.pdf_security("../outside.pdf")
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.82.12"
+    assert summary.version == __version__ == "0.82.17"
     assert summary.builtin_tools == 69
     assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
@@ -385,7 +385,7 @@ def test_phase26_scope_docs_schema_and_release_candidates() -> None:
     ids = {item.spec.id for item in build_default_registry().list_tools()}
     pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(ids) == 69
     assert "pypdf[crypto]" in pyproject

@@ -25,13 +25,13 @@ _ROOT = Path(__file__).resolve().parents[1]
 def test_transformation_phase1_identity_is_single_sourced() -> None:
     identity = baseline_identity()
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert TRANSFORMATION_PHASE == 18
     assert identity["label"] == TRANSFORMATION_LABEL
     assert identity["github_audit_commit"] == GITHUB_AUDIT_COMMIT
     assert identity["github_audit_version"] == "0.60.0"
     assert identity["pre_transformation_version"] == "0.62.0"
-    assert identity["previous_transformation_version"] == "0.82.11"
+    assert identity["previous_transformation_version"] == "0.82.16"
     assert identity["windows_acceptance_status"] == "pending_user_windows_evidence"
 
 

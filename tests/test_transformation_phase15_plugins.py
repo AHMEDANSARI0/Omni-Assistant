@@ -190,7 +190,7 @@ def _installed(tmp_path: Path, **overrides: str) -> tuple[PluginService, Setting
 def test_phase15_identity_is_wired_through_the_product(tmp_path: Path) -> None:
     from pc_agent.gui.app import NOTEBOOK_TAB_COUNT
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert TRANSFORMATION_PHASE == 18
     assert TRANSFORMATION_LABEL == "TRANSFORMATION PHASE 18 Production Hardening"
     assert LATEST_SCHEMA_VERSION == 18

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "self-healing-pc-agent"
-version = "0.82.12"
+version = "0.82.17"
 description = "Windows-first, local-first self-healing PC AI agent (Transformation Phase 2 Safety Kernel)"
 readme = "README.md"
 requires-python = ">=3.11"

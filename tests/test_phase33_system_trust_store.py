@@ -359,7 +359,7 @@ def test_system_trust_direct_cli_and_gui(
     assert "synthetic store unavailable" in (failed.error or "")
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.82.12"
+    assert summary.version == __version__ == "0.82.17"
     assert summary.builtin_tools == 69
     assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
@@ -372,7 +372,7 @@ def test_phase33_scope_defaults_docs_and_no_registered_tool() -> None:
         ["pdf", "validate-signatures", "signed.pdf"]
     )
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(ids) == 69
     assert args.system_trust_anchors is False

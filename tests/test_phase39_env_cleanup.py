@@ -309,7 +309,7 @@ def test_phase39_direct_cli_dry_run_denial_apply_and_json(
 
 
 def test_phase39_scope_inventory_and_counts() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert len(build_default_registry().list_tools()) == 69
     assert LATEST_SCHEMA_VERSION == 18
     assert PROVIDER_API_KEY_ENV_NAMES == {

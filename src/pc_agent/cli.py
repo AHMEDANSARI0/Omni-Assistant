@@ -542,6 +542,22 @@ def build_parser() -> argparse.ArgumentParser:
         "ui", help="Start the local API and open the Command Center as a desktop window"
     )
     _add_window_flags(ui_parser)
+    ui_subparsers = ui_parser.add_subparsers(dest="ui_command")
+    ui_build_parser = ui_subparsers.add_parser(
+        "build",
+        help=(
+            "Rebuild the Command Center bundle in frontend/ (npm ci + npm run build), "
+            "with the old bundle restored if the build fails"
+        ),
+    )
+    ui_build_parser.add_argument(
+        "--check", action="store_true", help="Report the toolchain only; run nothing"
+    )
+    ui_build_parser.add_argument(
+        "--no-install", action="store_true", help="Skip the dependency install and only build"
+    )
+    ui_build_parser.add_argument("--timeout", type=int, default=1800)
+    ui_build_parser.add_argument("--json", action="store_true")
 
     license_parser = subparsers.add_parser(
         "license", help="Show or manage the local offline license (Phase 6)"
@@ -3632,6 +3648,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_doctor(settings, as_json=bool(getattr(args, "json", False)))
         if args.command in {"gui", "ui"}:
             if args.command == "ui":
+                # `pc-agent ui build` rebuilds the bundle; bare `pc-agent ui`
+                # still opens the window.
+                if getattr(args, "ui_command", "") == "build":
+                    return _run_ui_build(settings, args)
                 return _open_command_center(
                     settings,
                     no_browser=getattr(args, "no_browser", False),
@@ -9875,6 +9895,8 @@ def _report_to_dict(report: ExecutionReport) -> dict[str, Any]:
             "result": _tool_result_to_dict(report.verification_result),
         },
         "missing_information": list(report.missing_information),
+        "reply": getattr(report, "reply", ""),
+        "reply_kind": getattr(report, "reply_kind", "reply"),
         "provider_attempts": [
             {
                 "provider": attempt.provider,
@@ -9938,6 +9960,13 @@ def _print_execution_report(report: ExecutionReport, *, as_json: bool) -> int:
     else:
         print(f"Task: {report.task.id}")
         print(f"Status: {report.task.status.value}")
+        if getattr(report, "reply", ""):
+            # 0.82.17: `pc-agent run "hello"` printed the status and nothing else,
+            # so an answer produced by the model (or by a rule) was invisible in
+            # the terminal even though the engine had it.
+            print("Reply:")
+            for line in report.reply.splitlines():
+                print(f"  {line}" if line else "")
         if report.step_reports:
             print(f"Plan: {report.plan_summary}")
             if report.plan:
@@ -10487,6 +10516,44 @@ def _run_release_env_template(settings: Settings, args: argparse.Namespace) -> i
     return 1
 
 
+def _run_ui_build(settings: Settings, args: argparse.Namespace) -> int:
+    """`pc-agent ui build`: rebuild the bundle in frontend/, never in the root."""
+
+    from .installer_build import UI_BUILD_REPORT_NAME, run_ui_build
+
+    report = run_ui_build(
+        root_dir=settings.root_dir,
+        install=not bool(getattr(args, "no_install", False)),
+        check_only=bool(getattr(args, "check", False)),
+        timeout=int(getattr(args, "timeout", 1800) or 1800),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), indent=1, sort_keys=True))
+    else:
+        print(f"UI build: {report.summary()}")
+        for step in report.steps:
+            marker = {
+                "pass": "PASS",
+                "recovered": "RECV",
+                "fail": "FAIL",
+                "skip": "SKIP",
+                "not-run": "N/R ",
+            }.get(step.status, step.status.upper())
+            print(f"  [{marker}] {step.name}: {step.detail}")
+            for line in step.tail:
+                print(f"          {line}")
+        if report.blockers:
+            print()
+            print("Blockers:")
+            for blocker in report.blockers:
+                print(f"  - {blocker}")
+        print()
+        print(f"Report written: {settings.data_dir / UI_BUILD_REPORT_NAME}")
+        if report.ok and not getattr(args, "check", False):
+            print("Open it with: pc-agent gui")
+    return 0 if report.ok else 1
+
+
 def _run_release_installer(settings: Settings, args: argparse.Namespace) -> int:
     """`pc-agent release installer`: check, build, then optionally sign."""
 
@@ -10516,9 +10583,13 @@ def _run_release_installer(settings: Settings, args: argparse.Namespace) -> int:
         print(f"Installer build: {report.summary()}")
         print(f"Shell: {report.shell_dir}")
         for step in report.steps:
-            marker = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP", "not-run": "N/R "}.get(
-                step.status, step.status.upper()
-            )
+            marker = {
+                "pass": "PASS",
+                "recovered": "RECV",
+                "fail": "FAIL",
+                "skip": "SKIP",
+                "not-run": "N/R ",
+            }.get(step.status, step.status.upper())
             print(f"  [{marker}] {step.name}: {step.detail}")
             for line in step.tail:
                 print(f"          {line}")

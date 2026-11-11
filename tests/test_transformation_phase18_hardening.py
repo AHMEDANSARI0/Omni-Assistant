@@ -70,7 +70,7 @@ def chain_report(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 def test_phase18_identity_is_wired_through_the_product() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert TRANSFORMATION_PHASE == 18
     assert "Production" in TRANSFORMATION_LABEL
     assert LATEST_SCHEMA_VERSION == 18  # hardening adds no migration
@@ -368,7 +368,7 @@ def test_hardening_docs_are_present_and_reference_real_commands() -> None:
 def test_readme_documents_the_hardening_entry_points() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     assert "production-check" in readme
-    assert "0.82.12" in readme
+    assert "0.82.17" in readme
 
 
 def test_no_workflow_or_script_shells_out_to_a_hardcoded_user_path() -> None:

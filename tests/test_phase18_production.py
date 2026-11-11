@@ -481,7 +481,7 @@ def test_current_project_candidates_include_phase18_but_no_private_areas() -> No
         path.as_posix() for path in release_candidate_files(project_root)
     }
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(build_default_registry().list_tools()) == 69
     assert "src/pc_agent/release.py" in candidates

@@ -11,6 +11,9 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 
+# Frontend dependencies
+/frontend/node_modules/
+
 # Local runtime data (created by the app)
 data/
 workspace/*
@@ -28,3 +31,10 @@ workspace/*
 .idea/
 Thumbs.db
 desktop.ini
+secrate
+/secrate
+/hide1
+hide1
+hide
+/hide
+.node_modules/

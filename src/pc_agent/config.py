@@ -327,9 +327,8 @@ class Settings:
         return dict(self.credential_sources).get(canonical, "missing")
 
     @property
-    def providers_with_credentials(self) -> tuple[str, ...]:
-        """Providers from provider_order for which a key is present (names only)."""
-        keys = {
+    def _provider_keys(self) -> dict[str, str | None]:
+        return {
             "gemini": self.gemini_api_key,
             "openrouter": self.openrouter_api_key,
             "openai": self.openai_api_key,
@@ -337,7 +336,33 @@ class Settings:
             "ollama": self.ollama_api_key,
             "anthropic": self.anthropic_api_key,
         }
-        return tuple(name for name in self.provider_order if keys.get(name))
+
+    @property
+    def effective_provider_order(self) -> tuple[str, ...]:
+        """The route to build: the configured order, else the keyed providers.
+
+        0.82.17: ``PC_AGENT_PROVIDER_ORDER`` used to be the only way to enable a
+        cloud provider, so putting ``GEMINI_API_KEY`` in ``.env`` - which is what
+        every document tells the user to do - left the router with nothing but
+        ``mock``. When no order is configured, the keyed providers are used, in a
+        stable preference order. ``ollama`` is deliberately excluded: a local
+        server that may not be running must be opted into explicitly.
+        """
+
+        if self.provider_order:
+            return self.provider_order
+        keys = self._provider_keys
+        return tuple(
+            name
+            for name in ("gemini", "openrouter", "openai", "anthropic", "openai-compatible")
+            if keys.get(name)
+        )
+
+    @property
+    def providers_with_credentials(self) -> tuple[str, ...]:
+        """Providers from the effective order for which a key is present."""
+        keys = self._provider_keys
+        return tuple(name for name in self.effective_provider_order if keys.get(name))
 
     def ensure_directories(self) -> None:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -384,7 +409,7 @@ class Settings:
             "api_token": "environment" if self.api_token else "file (auto)",
             "mission_max_parallel": str(self.mission_max_parallel),
             "scheduler_interval_seconds": str(self.scheduler_interval_seconds),
-            "provider_order": ", ".join(self.provider_order) or "mock (default)",
+            "provider_order": ", ".join(self.effective_provider_order) or "mock (default)",
             "providers_with_credentials": configured,
             "max_recovery_attempts": str(self.max_recovery_attempts),
             "recovery_stale_after_minutes": str(self.recovery_stale_after_minutes),

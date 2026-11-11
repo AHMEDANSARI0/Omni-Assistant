@@ -63,9 +63,13 @@ PC_AGENT_WEB_MAX_BYTES=2000000
 
 # AI provider route. Fallback happens ONLY between providers listed here that
 # are usable. Deterministic tasks (including supported PDF runs) do not call AI.
-# Add "ollama" for a local model, "openai" for OpenAI, "anthropic" for the
-# direct Claude Messages API, or "openai-compatible" for another endpoint.
-PC_AGENT_PROVIDER_ORDER=gemini,openrouter
+# Leave this line COMMENTED OUT (the recommended setup): the route is then built
+# from whichever provider keys you actually fill in below, so adding
+# GEMINI_API_KEY alone is enough. Uncomment it only to pin a specific order or to
+# enable a local model: "ollama" (local server), "openai", "anthropic",
+# "openai-compatible". Ollama is never enabled automatically, because a local
+# server might not be running.
+# PC_AGENT_PROVIDER_ORDER=gemini,openrouter
 PC_AGENT_PROVIDER_TIMEOUT_SECONDS=30
 
 # Provider keys: keep these only in your local .env.

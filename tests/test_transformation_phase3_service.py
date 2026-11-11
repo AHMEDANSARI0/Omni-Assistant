@@ -61,7 +61,7 @@ def test_local_service_task_lifecycle_and_events(settings):
     with LocalService(settings) as service:
         health = service.health()
         assert health["schema_version"] == 18
-        assert health["version"] == "0.82.12"
+        assert health["version"] == "0.82.17"
         created = service.create_task("an instruction no planner supports xyz")
         assert created["status"] == "queued"
         accepted = service.start_task(created["id"])

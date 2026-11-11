@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -45,17 +46,21 @@ from .windows_signing import (
 __all__ = [
     "INSTALLER_REPORT_NAME",
     "LAUNCHER_NAME",
+    "UI_BUILD_REPORT_NAME",
     "BuildStep",
     "InstallerBuildReport",
     "installer_report_path",
     "launcher_path",
     "next_steps",
+    "prune_stale_assets",
     "run_installer_build",
+    "run_ui_build",
     "toolchain_status",
     "write_launcher",
 ]
 
 INSTALLER_REPORT_NAME = "installer-build.json"
+UI_BUILD_REPORT_NAME = "ui-build.json"
 #: Written next to the project root by ``pc-agent release installer --launcher``.
 LAUNCHER_NAME = "Omni-Assistant.cmd"
 
@@ -85,7 +90,7 @@ class ToolInfo:
 @dataclass
 class BuildStep:
     name: str
-    status: str  # pass | fail | skip | not-run
+    status: str  # pass | recovered | fail | skip | not-run
     detail: str = ""
     seconds: float = 0.0
     tail: list[str] = field(default_factory=list)
@@ -119,6 +124,8 @@ class InstallerBuildReport:
         return None
 
     def failures(self) -> list[BuildStep]:
+        # "recovered" = the step failed and a documented fallback succeeded, so the
+        # build is not blocked. It stays visible in the report; it is not hidden.
         return [step for step in self.steps if step.status == "fail"]
 
     def to_dict(self) -> dict[str, Any]:
@@ -270,6 +277,70 @@ def _restore_ui_bundle(root: Path, backup: Path | None) -> bool:
     return True
 
 
+_ASSET_REF = re.compile(r"""[\w./-]+\.(?:js|css)""")
+
+
+def _reachable_assets(webui: Path) -> set[str]:
+    """Every chunk reachable from index.html, following dynamic imports.
+
+    Vite writes lazy chunks (`Agents-*.js`) that index.html never names directly -
+    it names `index-*.js`, which imports them. Pruning on index.html alone would
+    delete the views and break the app, so this walks the import graph.
+    """
+
+    assets = webui / "assets"
+    if not assets.is_dir():
+        return set()
+    pending = [webui / "index.html"]
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop()
+        try:
+            text = current.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for match in _ASSET_REF.finditer(text):
+            name = Path(match.group(0)).name
+            if name in seen:
+                continue
+            candidate = assets / name
+            if candidate.is_file():
+                seen.add(name)
+                pending.append(candidate)
+    return seen
+
+
+def prune_stale_assets(root_dir: Path | str) -> tuple[list[str], list[str]]:
+    """Delete bundle files no longer reachable from index.html.
+
+    0.82.15 shipped a `webui/assets` directory carrying 40 files where only 21
+    were current: every rebuild under a new content hash added a chunk and left
+    the old one behind (a direct `vite build` does not empty the directory and
+    `emptyOutDir` is false on purpose, so `__init__.py` survives). The installer
+    then packaged the whole directory - dead weight, and old code on disk.
+
+    Returns ``(removed, kept)`` and never touches ``assets`` unless index.html
+    resolves to at least one real file, so a broken build cannot empty the bundle.
+    """
+
+    webui = _webui_dir(Path(root_dir).expanduser().resolve())
+    assets = webui / "assets"
+    reachable = _reachable_assets(webui)
+    if not reachable:
+        return [], []
+    removed: list[str] = []
+    kept: list[str] = []
+    for path in sorted(assets.iterdir()):
+        if not path.is_file():
+            continue
+        if path.name in reachable:
+            kept.append(path.name)
+            continue
+        path.unlink()
+        removed.append(path.name)
+    return removed, kept
+
+
 def _ui_bundle_is_complete(root: Path) -> bool:
     webui = _webui_dir(root)
     return (webui / "index.html").is_file() and (webui / "assets").is_dir()
@@ -351,14 +422,23 @@ def _tail(text: str, lines: int = 20) -> list[str]:
     return kept[-lines:]
 
 
-def _default_runner(argv: list[str], timeout: int) -> Any:
+def _default_runner(argv: list[str], timeout: int, cwd: Path | str | None = None) -> Any:
+    """Run a build step in ``cwd``.
+
+    0.82.11-0.82.13 passed the directory to ``_run_step`` and then dropped it on
+    the floor: ``cwd=None`` here meant `npm ci` ran in the project root, which has
+    no package.json - the identical ``ENOENT ... package.json`` the user hit by
+    hand. The unit tests could not see it because their fake runners ignore
+    ``cwd``; there is now a test that asserts the directory actually arrives.
+    """
+
     return subprocess.run(
         argv,
         capture_output=True,
         text=True,
         timeout=timeout,
         check=False,
-        cwd=None,
+        cwd=str(cwd) if cwd is not None else None,
         env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1"),
     )
 
@@ -383,7 +463,12 @@ def _run_step(
 ) -> BuildStep:
     since = time.perf_counter()
     try:
-        completed = runner(argv, timeout)
+        try:
+            # Runners written before 0.82.14 take (argv, timeout) only; they still
+            # work, they just cannot honour the directory.
+            completed = runner(argv, timeout, cwd)  # type: ignore[call-arg]
+        except TypeError:
+            completed = runner(argv, timeout)
     except FileNotFoundError as exc:
         return BuildStep(
             name=name,
@@ -560,6 +645,23 @@ def run_installer_build(
         )
         step = _run_step(install_name, install_argv, cwd=frontend, timeout=timeout, runner=run)
         report.steps.append(step)
+        if step.status != "pass" and install_name == "npm_ci":
+            first = step
+            # `npm ci` refuses a lockfile that does not match package.json (for
+            # example right after a version bump that did not touch the lock).
+            # That is not a reason to block a build: fall back to `npm install`,
+            # which reconciles the lock and says so.
+            step = _run_step(
+                "npm_install",
+                [npm, "install", "--no-audit", "--no-fund"],
+                cwd=frontend,
+                timeout=timeout,
+                runner=run,
+            )
+            report.steps.append(step)
+            if step.status == "pass":
+                first.status = "recovered"
+                first.detail += " (recovered by npm install, which reconciled the lockfile)"
         if step.status == "pass":
             report.steps.append(
                 _run_step(
@@ -582,6 +684,15 @@ def run_installer_build(
         ) and _ui_bundle_is_complete(root)
         if built_ok:
             shutil.rmtree(root / "data" / "ui-bundle-backup", ignore_errors=True)
+            removed, _kept = prune_stale_assets(root)
+            report.steps.append(
+                BuildStep(
+                    name="assets_pruned",
+                    status="pass",
+                    detail=f"removed {len(removed)} stale chunk(s) from the shipped bundle",
+                    tail=removed[:10],
+                )
+            )
         if not built_ok and _restore_ui_bundle(root, snapshot):
             report.steps.append(
                 BuildStep(
@@ -740,6 +851,192 @@ def next_steps(report: InstallerBuildReport) -> list[str]:
         steps.append("pc-agent release installer --check")
         steps.append("pc-agent release installer --build --launcher")
     return steps
+
+
+def run_ui_build(
+    *,
+    root_dir: Path | str,
+    install: bool = True,
+    check_only: bool = False,
+    timeout: int = 1800,
+    runner: Runner | None = None,
+    write_report: bool = True,
+) -> InstallerBuildReport:
+    """Rebuild only the Command Center bundle - the step users kept getting wrong.
+
+    `npm ci` and `npm run build` must run **inside ``frontend/``**: from the
+    project root npm finds no ``package.json`` and fails with
+    ``ENOENT ... open 'D:\\omni-assistant\\package.json'``. That error is
+    harmless (npm stops before deleting anything) but it is pure friction, so this
+    runs the same steps in the right directory, with the same snapshot protection
+    an installer build has: if the build dies, the previous bundle comes back.
+
+    ``check_only`` reports what would run and touches nothing.
+    """
+
+    root = Path(root_dir).expanduser().resolve()
+    frontend = root / "frontend"
+    report = InstallerBuildReport(
+        ok=False,
+        version=_installed_version(),
+        generated_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+        platform=platform.platform(),
+        shell_dir=str(root / "frontend" / "src-tauri"),
+    )
+    run = runner or _default_runner
+
+    package = frontend / "package.json"
+    if not package.is_file():
+        report.steps.append(
+            BuildStep(
+                name="frontend",
+                status="fail",
+                detail=(
+                    f"no {package} - run this from the project root that contains "
+                    "frontend/, or pass --root"
+                ),
+            )
+        )
+        report.blockers.append(f"no frontend sources at {frontend}")
+        return report
+    report.steps.append(
+        BuildStep(name="frontend", status="pass", detail=f"package.json at {package}")
+    )
+
+    tools = {tool.name: tool for tool in toolchain_status()}
+    missing = [name for name in ("node", "npm") if not tools[name].found]
+    report.steps.append(
+        BuildStep(
+            name="toolchain",
+            status="pass" if not missing else "fail",
+            detail=(
+                f"node={tools['node'].version or 'found'}, npm={tools['npm'].version or 'found'}"
+                if not missing
+                else f"missing: {', '.join(missing)} - install Node.js 20+"
+            ),
+        )
+    )
+    for name in missing:
+        report.blockers.append(f"{name} is not installed")
+
+    if check_only:
+        report.steps.append(
+            BuildStep(
+                name="build",
+                status="not-run",
+                detail="--check only: nothing was run",
+            )
+        )
+        report.ok = not missing
+        return report
+
+    if missing:
+        report.steps.append(
+            BuildStep(name="build", status="skip", detail=f"not attempted: {', '.join(missing)} missing")
+        )
+        return report
+
+    snapshot = _snapshot_ui_bundle(root)
+    report.steps.append(
+        BuildStep(
+            name="ui_bundle",
+            status="pass" if snapshot is not None else "not-run",
+            detail=(
+                "the current bundle is snapshotted and restored if the build fails"
+                if snapshot is not None
+                else "no built bundle yet (this build creates it)"
+            ),
+        )
+    )
+
+    npm = _npm_command()
+    if install:
+        has_lock = (frontend / "package-lock.json").is_file()
+        argv = [npm, "ci", "--no-audit", "--no-fund"] if has_lock else [
+            npm,
+            "install",
+            "--no-audit",
+            "--no-fund",
+        ]
+        step = _run_step("npm_ci" if has_lock else "npm_install", argv, cwd=frontend, timeout=timeout, runner=run)
+        report.steps.append(step)
+        if step.status != "pass" and has_lock:
+            # Same fallback as the installer build: an out-of-sync lockfile must
+            # not stop the user from rebuilding their own UI.
+            first = step
+            step = _run_step(
+                "npm_install",
+                [npm, "install", "--no-audit", "--no-fund"],
+                cwd=frontend,
+                timeout=timeout,
+                runner=run,
+            )
+            report.steps.append(step)
+            if step.status == "pass":
+                first.status = "recovered"
+                first.detail += " (recovered by npm install, which reconciled the lockfile)"
+        if step.status != "pass":
+            report.steps.append(BuildStep(name="vite_build", status="skip", detail="dependency install failed"))
+            _restore_ui_bundle(root, snapshot)
+            report.steps.append(
+                BuildStep(name="ui_bundle_restored", status="pass", detail="previous bundle put back")
+            )
+            return report
+
+    build_step = _run_step(
+        "vite_build", [npm, "run", "build"], cwd=frontend, timeout=timeout, runner=run
+    )
+    report.steps.append(build_step)
+    rebuilt = _ui_bundle_is_complete(root)
+    if build_step.status == "pass" and rebuilt:
+        removed, kept = prune_stale_assets(root)
+        report.steps.append(
+            BuildStep(
+                name="assets_pruned",
+                status="pass",
+                detail=(
+                    f"removed {len(removed)} stale chunk(s), kept {len(kept)} reachable"
+                    if removed
+                    else f"no stale chunks ({len(kept)} reachable)"
+                ),
+                tail=removed[:10],
+            )
+        )
+    if build_step.status == "pass" and rebuilt:
+        shutil.rmtree(root / "data" / "ui-bundle-backup", ignore_errors=True)
+        report.steps.append(
+            BuildStep(
+                name="bundle",
+                status="pass",
+                detail=f"{_webui_dir(root)} rebuilt (index.html + assets present)",
+            )
+        )
+    else:
+        if _restore_ui_bundle(root, snapshot):
+            report.steps.append(
+                BuildStep(
+                    name="ui_bundle_restored",
+                    status="pass",
+                    detail="the build failed, so the previous bundle was put back - the app still opens",
+                )
+            )
+        report.steps.append(
+            BuildStep(
+                name="bundle",
+                status="fail",
+                detail="the build did not produce index.html + assets",
+            )
+        )
+
+    report.ok = not report.failures()
+    if write_report:
+        target = root / "data" / UI_BUILD_REPORT_NAME
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(report.to_dict(), indent=1, sort_keys=True), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - read-only install
+            raise PcAgentError(f"Could not write {target}: {exc}") from exc
+    return report
 
 
 def _importable(*, interpreter: str) -> bool:

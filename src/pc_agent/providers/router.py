@@ -339,7 +339,7 @@ def provider_statuses(
     if router is None:
         router = build_model_router(settings)
     route_names = set(router.provider_names)
-    ordered_names = list(settings.provider_order)
+    ordered_names = list(settings.effective_provider_order)
     if not ordered_names:
         ordered_names = ["mock"]
 

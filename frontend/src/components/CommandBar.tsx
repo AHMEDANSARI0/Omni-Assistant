@@ -13,7 +13,8 @@ import {
   voiceCaptureStop,
   voiceEnable,
 } from "@/lib/actions";
-import type { Health, SafetyPayload, TasksPayload, VoicePayload } from "@/lib/types";
+import { apiGet } from "@/lib/api";
+import type { EventsPayload, Health, SafetyPayload, TasksPayload, VoicePayload } from "@/lib/types";
 import { useCoreState } from "@/components/AICore";
 import { useUi } from "@/store/ui";
 
@@ -60,6 +61,11 @@ export function CommandBar() {
 
   const stopped = safety.data?.emergency_stop.engaged === true;
 
+  // The last exchange, kept in view until the next instruction. Before 0.82.15
+  // the bar said "Instruction queued" and then nothing, even when the engine had
+  // answered or refused - the user was left staring at an empty screen.
+  const [exchange, setExchange] = useState<{ instruction: string; reply: string; tone: "ok" | "warn" } | null>(null);
+
   const submit = async () => {
     const instruction = text.trim();
     if (!instruction || busy) return;
@@ -68,13 +74,51 @@ export function CommandBar() {
       return;
     }
     setBusy(true);
+    setExchange(null);
     const result = await attempt("Instruction queued", () => withActivity("thinking", () => runInstruction(instruction)));
     setBusy(false);
     if (result) {
       setText("");
       await refresh("tasks");
       await refresh("events");
+      await followAnswer(result.task?.id, instruction);
     }
+  };
+
+  /** Poll the task until it settles, then show its answer (or its reason). */
+  const followAnswer = async (taskId: string | undefined, instruction: string) => {
+    if (!taskId) return;
+    const settled = new Set(["succeeded", "completed", "failed", "needs_input", "cancelled"]);
+    for (let attemptIndex = 0; attemptIndex < 20; attemptIndex += 1) {
+      await new Promise((resolve) => setTimeout(resolve, attemptIndex === 0 ? 400 : 750));
+      try {
+        const payload = await apiGet<EventsPayload>(`/v1/events?task_id=${encodeURIComponent(taskId)}&limit=40`);
+        const reply = payload.events.filter((event) => event.event_type === "assistant.reply").at(-1);
+        if (reply) {
+          setExchange({ instruction, reply: reply.summary, tone: String((reply.payload as { kind?: string } | undefined)?.kind ?? "") === "explanation" ? "warn" : "ok" });
+          await refresh("events");
+          return;
+        }
+        const taskPayload = await apiGet<TasksPayload>("/v1/tasks?limit=10");
+        const task = taskPayload.tasks.find((candidate) => candidate.id === taskId);
+        if (task && settled.has(task.status)) {
+          const message =
+            task.error ||
+            (task.status === "succeeded" || task.status === "completed"
+              ? "Done. The task journal has the detail."
+              : `Task ended as ${task.status}.`);
+          setExchange({ instruction, reply: message, tone: task.error ? "warn" : "ok" });
+          return;
+        }
+      } catch {
+        return; // the resource hook already surfaces API errors
+      }
+    }
+    setExchange({
+      instruction,
+      reply: "Still running. Open Tasks or Conversations to watch it — this bar only waits about 15 seconds.",
+      tone: "warn",
+    });
   };
 
   const toggleMic = async () => {
@@ -126,6 +170,27 @@ export function CommandBar() {
 
   return (
     <footer className="relative z-20 shrink-0 border-t border-line/45 bg-elevated/70 px-3 py-2 backdrop-blur-xl">
+      {exchange ? (
+        <div
+          className={`mb-2 max-h-[26vh] overflow-y-auto rounded-xl border px-2.5 py-2 ${
+            exchange.tone === "warn" ? "border-warn/40 bg-warn/8" : "border-accent/35 bg-accent/8"
+          }`}
+          role="status"
+          aria-live="polite"
+        >
+          <p className="truncate text-[10.5px] text-faint">
+            <span className="font-mono uppercase tracking-wide">you</span> · {exchange.instruction}
+          </p>
+          <p className="mt-1 whitespace-pre-wrap text-[12px] leading-relaxed text-ink">{exchange.reply}</p>
+          <button
+            type="button"
+            onClick={() => setExchange(null)}
+            className="mt-1 text-[10px] text-faint underline-offset-2 hover:text-ink hover:underline"
+          >
+            dismiss
+          </button>
+        </div>
+      ) : null}
       <div className="flex items-center gap-2">
         <div className="relative flex min-w-0 flex-1 items-center gap-2 rounded-xl border border-line/60 bg-inset/55 px-2.5 py-1.5 transition focus-within:border-accent/60">
           <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${stopped ? "bg-danger" : "bg-accent"}`} aria-hidden />

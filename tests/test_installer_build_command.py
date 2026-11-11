@@ -54,7 +54,7 @@ def _shell(tmp_path: Path, *, ui_built: bool = True) -> Path:
     if ui_built:
         (ui / "index.html").write_bytes(b"<!doctype html><title>ui</title>")
     (shell / "tauri.conf.json").write_text(
-        json.dumps({"build": {"frontendDist": "../../src/pc_agent/webui"}, "version": "0.82.12"}),
+        json.dumps({"build": {"frontendDist": "../../src/pc_agent/webui"}, "version": "0.82.17"}),
         encoding="utf-8",
     )
     return shell
@@ -159,7 +159,9 @@ def test_a_failed_install_stops_before_the_expensive_build(
         return Completed(1, "", "npm ERR! No matching version found")
 
     report = run_installer_build(root_dir=tmp_path, shell_dir=shell, build=True, runner=_run)
-    assert seen == ["ci"], "tauri build must not run after a broken npm ci"
+    # 0.82.14: a broken `npm ci` retries once with `npm install` (it reconciles an
+    # out-of-sync lockfile); when that fails too, the expensive build never runs.
+    assert seen == ["ci", "install"], "tauri build must not run after a broken install"
     assert report.step("tauri_build").status == "skip"
     assert any("No matching version" in line for line in report.step("npm_ci").tail)
     assert report.ok is False

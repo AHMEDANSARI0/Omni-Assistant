@@ -110,14 +110,23 @@ function ActivityList({ events }: { events: { data: EventsPayload | null; error:
             </span>
             <div className="min-w-0 flex-1">
               <p className="line-clamp-2 text-[11.5px] leading-snug text-ink">{shorten(event.summary, 120)}</p>
-              <p className="mt-0.5 flex items-center gap-1.5 text-[10px] text-faint">
-                <span className="font-mono text-[9.5px] tracking-wide text-faint/85">{event.event_type}</span>
-                <span>·</span>
-                <span title={event.created_at}>{relative(event.created_at)}</span>
+              {/* The meta line is a flexible row of variable-length pieces: an
+                  event type can be 30+ characters, and before 0.82.13 it simply
+                  ran past the panel and was clipped by the overflow container
+                  (measured: 353 px inside 306 px). It wraps now, and the type
+                  ellipsises instead of pushing the timestamp out of view. */}
+              <p className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[10px] text-faint">
+                <span className="min-w-0 max-w-full truncate font-mono text-[9.5px] tracking-wide text-faint/85">
+                  {event.event_type}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="shrink-0" title={event.created_at}>
+                  {relative(event.created_at)}
+                </span>
                 {event.task_id ? (
                   <>
-                    <span>·</span>
-                    <span className="font-mono text-[9.5px]">{event.task_id.slice(0, 8)}</span>
+                    <span aria-hidden="true">·</span>
+                    <span className="shrink-0 font-mono text-[9.5px]">{event.task_id.slice(0, 8)}</span>
                   </>
                 ) : null}
               </p>

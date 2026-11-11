@@ -340,7 +340,7 @@ def test_phase51_direct_release_cli_build_verify_and_json(
 
 
 def test_phase51_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(build_default_registry().list_tools()) == 69
 

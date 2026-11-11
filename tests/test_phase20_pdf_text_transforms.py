@@ -547,7 +547,7 @@ def test_phase20_direct_cli_and_gui_controller(
     )
     assert gui_extract.success, gui_extract.error
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.82.12"
+    assert summary.version == __version__ == "0.82.17"
     assert summary.builtin_tools == 69
     assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
@@ -559,7 +559,7 @@ def test_phase20_scope_schema_and_release_candidates() -> None:
         item.spec.id for item in build_default_registry().list_tools()
     }
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(tool_ids) == 69
     assert {

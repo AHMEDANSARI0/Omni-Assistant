@@ -1,7 +1,7 @@
 {
   "name": "omni-command-center",
   "private": true,
-  "version": "0.82.12",
+  "version": "0.82.17",
   "type": "module",
   "scripts": {
     "dev": "vite",

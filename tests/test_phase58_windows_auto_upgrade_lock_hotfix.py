@@ -76,7 +76,7 @@ def test_phase58_windows_lock_reuses_existing_file_at_byte_zero(
 
 
 def test_phase58_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(build_default_registry().list_tools()) == 69
 

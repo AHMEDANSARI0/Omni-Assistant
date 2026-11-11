@@ -935,7 +935,12 @@ def audit_install(settings: Settings) -> ReleaseAudit:
             (
                 f"Usable route: {' -> '.join(route)}"
                 if external
-                else "Only the offline mock provider is usable; deterministic local tasks still work."
+                else (
+                    "Only the offline mock provider is usable, so conversation answers come "
+                    "from built-in rules: add GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY "
+                    "or OPENROUTER_API_KEY to .env (or PC_AGENT_PROVIDER_ORDER=ollama for a "
+                    "local Ollama) and restart. Deterministic local tasks still work without a key."
+                )
             ),
         )
     )

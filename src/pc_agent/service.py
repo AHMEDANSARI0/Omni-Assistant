@@ -711,6 +711,27 @@ class LocalService:
                 summary=f"Task finished with status {status_value}.",
                 payload={"status": status_value, "success": bool(report.success)},
             )
+            # 0.82.15: a conversational answer (or a refusal that explains itself)
+            # must reach the interface as an explicit event, otherwise the user
+            # sees "queued" and then silence.
+            answer = getattr(report, "reply", "") or (
+                final.error if final is not None and final.error else ""
+            )
+            if answer:
+                self._emit(
+                    "assistant.reply",
+                    source=source,
+                    task_id=task_id,
+                    summary=redact_text(answer)[:400],
+                    payload={
+                        "status": status_value,
+                        "kind": (
+                            getattr(report, "reply_kind", "reply")
+                            if getattr(report, "reply", "")
+                            else "explanation"
+                        ),
+                    },
+                )
         except Exception as exc:  # Thread must never die silently.  # noqa: BLE001
             _LOG.exception("Local service task %s crashed", task_id)
             self._reports[task_id] = {"error": redact_text(str(exc))[:400]}

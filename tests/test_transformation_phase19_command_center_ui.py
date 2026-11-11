@@ -470,3 +470,30 @@ def test_no_simulated_metrics_in_ui_sources():
         text = path.read_text(encoding="utf-8").lower()
         for marker in forbidden:
             assert marker.lower() not in text, f"{path} contains {marker!r}"
+
+
+# ------------------------------------------- layout clipping (0.82.13)
+def test_the_verifier_checks_for_clipped_content_not_just_document_overflow() -> None:
+    """A panel with `overflow: hidden` clips its own content silently.
+
+    Document-level overflow (the older check) stays at zero while a row runs
+    47 px past its panel - which is exactly what shipped in 0.82.0-0.82.12 in the
+    Intelligence feed: an event type of 30+ characters pushed the timestamp out
+    of view.
+    """
+
+    script = (_frontend_root() / "scripts" / "ui-verify.js").read_text(encoding="utf-8")
+
+    assert "no clipped content at" in script
+    assert "scrollWidth > element.clientWidth" in script
+    # intentional overflow must not be reported as a defect
+    assert 'style.textOverflow === "ellipsis"' in script
+    assert '["auto", "scroll"].includes(style.overflowX)' in script
+
+
+def test_the_intelligence_feed_meta_line_can_wrap() -> None:
+    feed = (_frontend_root() / "src" / "components" / "IntelligenceFeed.tsx").read_text(encoding="utf-8")
+
+    assert "flex-wrap" in feed
+    assert "min-w-0 max-w-full truncate" in feed  # the event type ellipsises
+    assert 'className="shrink-0" title={event.created_at}' in feed  # the time is never squeezed out

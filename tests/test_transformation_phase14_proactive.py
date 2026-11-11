@@ -66,7 +66,7 @@ def _at(hour: int, minute: int = 0, day_offset: int = 0) -> datetime:
 
 
 def test_phase14_identity_is_wired_through_the_product() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert TRANSFORMATION_PHASE == 18
     assert "Production" in TRANSFORMATION_LABEL
     assert LATEST_SCHEMA_VERSION == 18

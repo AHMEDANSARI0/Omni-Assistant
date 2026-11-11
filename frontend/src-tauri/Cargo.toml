@@ -9,7 +9,7 @@
 #   npm run tauri:build
 [package]
 name = "omni-command-center"
-version = "0.82.12"
+version = "0.82.17"
 description = "Omni-Assistant Command Center desktop shell"
 authors = ["Omni-Assistant"]
 edition = "2021"

@@ -98,7 +98,7 @@ def test_import_gate_fails_when_the_module_lives_elsewhere(monkeypatch, tmp_path
     module = _load_module()
 
     def _fake_run(argv, *, timeout):
-        return 0, f"0.82.12\n{tmp_path / 'site-packages' / 'pc_agent'}\n"
+        return 0, f"0.82.17\n{tmp_path / 'site-packages' / 'pc_agent'}\n"
 
     monkeypatch.setattr(module, "_run", _fake_run)
     result = module._import_gate()

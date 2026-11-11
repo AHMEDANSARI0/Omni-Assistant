@@ -417,7 +417,7 @@ def capability_catalog(settings: Settings, router: ModelRouter) -> list[dict[str
 
 def ordered_provider_names(settings: Settings) -> list[str]:
     """Configured order adjusted by the routing strategy (stable)."""
-    names = list(settings.provider_order)
+    names = list(settings.effective_provider_order)
     strategy = settings.provider_strategy
     if strategy == "default" or len(names) < 2:
         return names

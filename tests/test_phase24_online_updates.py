@@ -488,7 +488,7 @@ def test_online_cli_and_gui_controller_routes(
 
     summary = controller.doctor_summary()
     text = summary.to_text()
-    assert summary.version == __version__ == "0.82.12"
+    assert summary.version == __version__ == "0.82.17"
     assert "TRANSFORMATION PHASE 18 Production Hardening" in text
     assert "online=yes" in text
     assert "feed_host=updates.example.com" in text
@@ -566,7 +566,7 @@ def test_phase24_scope_docs_schema_and_release_candidates() -> None:
     candidates = {path.as_posix() for path in release_candidate_files(project_root)}
     tool_ids = {item.spec.id for item in build_default_registry().list_tools()}
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(tool_ids) == 69
     assert not any(tool_id.startswith("update.") for tool_id in tool_ids)

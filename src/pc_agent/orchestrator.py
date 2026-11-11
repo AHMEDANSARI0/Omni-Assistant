@@ -37,6 +37,12 @@ from .budgets import (
     TaskBudgetTracker,
 )
 from .config import Settings
+from .conversation import (
+    SYSTEM_PROMPT,
+    ConversationalReply,
+    reply_for,
+    reply_without_model,
+)
 from .desktop_automation import normalize_key_chord
 from .documents.office import (
     evaluate_workbook_formulas,
@@ -95,6 +101,25 @@ from .tools.registry import ToolContext, ToolRegistry, ToolResult
 from .verification import VerificationReport, build_criteria, evaluate_criteria
 
 logger = logging.getLogger(__name__)
+
+
+def _route_has_real_model(router: Any, settings: Any) -> bool:
+    """Is there an actual model in the route - not the offline mock?
+
+    The mock provider exists so tests and ``release audit`` have something to talk
+    to. Treating it as a model would mean shipping invented answers, so the
+    conversational path checks this before asking anyone.
+    """
+
+    try:
+        names = list(getattr(router, "provider_names", ()) or ())
+        if not names:
+            from .providers.router import build_model_router
+
+            names = list(build_model_router(settings).provider_names)
+    except Exception:  # noqa: BLE001 - route detection must never break a run
+        return False
+    return any(name not in {"mock", "offline-mock"} for name in names)
 
 CancellationCallback = Callable[[], bool]
 
@@ -313,6 +338,12 @@ class ExecutionReport:
     workflow_key: str | None = None
     workflow_success_count: int = 0
     workflow_reused: bool = False
+    #: Set when a conversational instruction was answered by a built-in rule
+    #: (greetings, thanks, help...). Empty for real work.
+    reply: str = ""
+    #: ``reply`` for a real answer, ``explanation`` when the text is a refusal
+    #: that explains itself (0.82.17). The interface shows both.
+    reply_kind: str = "reply"
     # Phase 11 multi-step evidence (empty/zero for single-step runs, where
     # ``plan``/``tool_result`` above describe the only step).
     step_reports: tuple[StepReport, ...] = ()
@@ -477,6 +508,57 @@ class TaskOrchestrator:
         database.initialize()
         return KnowledgeService(self._settings, database)
 
+    # -- conversation (0.82.17) -------------------------------------------------
+    def _answer_conversationally(
+        self, task: Task, text: str, *, final: TaskStatus = TaskStatus.SUCCEEDED
+    ) -> Task:
+        """Walk the legal state path for an answer produced by a model or a rule.
+
+        The caller may already have moved the task to PLANNING (the planner
+        runs first), so every step is skipped when it is already reached -
+        re-entering the same status is an invalid transition, not a no-op.
+        """
+
+        current = task
+        for step, note in (
+            (TaskStatus.PLANNING, "Answering in conversation mode"),
+            (TaskStatus.RUNNING, "Composing the reply"),
+            (TaskStatus.VERIFYING, "No tool ran, so nothing to verify"),
+        ):
+            if current.status is step:
+                continue
+            try:
+                current = self._tasks.update_status(task.id, step, message=note)
+            except PcAgentError:  # pragma: no cover - defensive: keep answering
+                return task
+        answered = self._tasks.update_status(task.id, final, message=text)
+        self._tasks.record_event(task.id, "assistant.reply", text)
+        return answered
+
+    def _conversational_reply(self, task: Task, instruction: str) -> str:
+        """Ask the configured provider for a plain-text answer. "" on failure."""
+
+        try:
+            from .providers.base import CompletionRequest
+
+            router = self._budgeted_router()
+            request = CompletionRequest.from_prompt(
+                instruction, system_instruction=SYSTEM_PROMPT, max_output_tokens=512
+            )
+            routed = router.complete(request)
+            # RoutedCompletion wraps the provider's response; a bare response is
+            # also accepted so a fake/stub router works in tests.
+            response = getattr(routed, "response", routed)
+            # CompletionResponse exposes ``content``; stubs/tests often use ``text``.
+            raw = getattr(response, "content", None)
+            if raw is None:
+                raw = getattr(response, "text", "")
+            text = str(raw or "").strip()
+            return text[:4000]
+        except Exception as exc:  # noqa: BLE001 - a provider fault must not kill the task
+            logging.getLogger(__name__).warning("Conversational provider call failed: %s", exc)
+            return ""
+
     def _attach_budget(
         self, report: ExecutionReport, tracker: TaskBudgetTracker
     ) -> ExecutionReport:
@@ -633,6 +715,32 @@ class TaskOrchestrator:
                 resume_checkpoints=True,
             )
 
+        # Conversational floor (0.82.15). "hello" is not a capability, but
+        # answering it with "not a supported deterministic capability" made the
+        # assistant look broken. A rule-based reply keeps the promise honest: it
+        # is labelled as built-in, and it states what open conversation needs.
+        if not resume_stored_plan:
+            canned = reply_for(task.instruction)
+            if canned is not None and _route_has_real_model(self._router, self._settings):
+                # A real model is configured: let it answer, and only fall back to
+                # the rule if the provider fails. This is the difference between
+                # "the app talks to you" and "the app prints canned strings".
+                model_text = self._conversational_reply(task, task.instruction)
+                if model_text:
+                    canned = None
+                    answered = self._answer_conversationally(task, model_text)
+                    return ExecutionReport(task=answered, reply=model_text)
+            if canned is not None:
+                # An answer is a run with no tools: it walks the same states as
+                # real work so the journal never shows a task that "succeeded"
+                # out of nowhere, and it always leaves an assistant.reply event.
+                answered = self._answer_conversationally(task, canned.text)
+                return ExecutionReport(
+                    task=answered,
+                    provider_attempts=(),
+                    reply=canned.text,
+                )
+
         task = self._tasks.update_status(
             task.id, TaskStatus.PLANNING, message="Planning started"
         )
@@ -640,15 +748,21 @@ class TaskOrchestrator:
         outcome = self._planner.plan(task.instruction, options)
         if outcome is None:
             if not use_ai:
-                outcome = PlanningOutcome(
-                    missing_information=(
-                        (
-                            "This instruction is not a supported deterministic capability yet. "
-                            "Re-run with --use-ai to request a constrained provider plan, or use "
-                            "a direct supported pdf/tools command."
-                        ),
+                # 0.82.17: with no model configured, "unsupported capability" was
+                # technically true and practically useless. Say what is missing
+                # and how to fix it - and say it *here*, after the planner and the
+                # workflow-reuse paths have had their turn, so a real capability is
+                # never hijacked by the conversational fallback.
+                if not _route_has_real_model(self._router, self._settings):
+                    explained = reply_without_model(task.instruction, route=())
+                else:
+                    explained = ConversationalReply(
+                        "This instruction is not a supported deterministic capability yet. "
+                        "Re-run with --use-ai to request a constrained provider plan, or use "
+                        "a direct supported pdf/tools command.",
+                        rule="unsupported",
                     )
-                )
+                outcome = PlanningOutcome(missing_information=(explained.text,))
             elif self._router is None:
                 outcome = PlanningOutcome(
                     missing_information=("AI planning was requested but no model router is configured.",),
@@ -715,6 +829,27 @@ class TaskOrchestrator:
                     ),
                     workflow_reused=True,
                 )
+            # Nothing planned, nothing stored to reuse: if a real model is
+            # configured, answer in conversation mode instead of refusing. This is
+            # what makes "explain git rebase" or "what is the capital of France"
+            # work in the Command Center. It runs here - after the planner *and*
+            # after stored-workflow reuse - so a capability (or a previously
+            # verified workflow) is never hijacked by the conversation path.
+            can_answer = (
+                not use_ai
+                and _route_has_real_model(self._router, self._settings)
+                and not self._is_cancellation_requested(task.id, cancellation_requested)
+            )
+            if can_answer:
+                model_text = self._conversational_reply(task, task.instruction)
+                if model_text:
+                    answered = self._answer_conversationally(task, model_text)
+                    return ExecutionReport(
+                        task=answered,
+                        provider_attempts=outcome.provider_attempts,
+                        source_task_id=source_task_id,
+                        reply=model_text,
+                    )
             message = " ".join(outcome.missing_information) or "More information is required."
             needs_input = self._tasks.update_status(
                 task.id,

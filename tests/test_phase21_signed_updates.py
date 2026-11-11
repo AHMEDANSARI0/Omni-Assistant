@@ -630,7 +630,7 @@ def test_gui_controller_signed_update_flow_and_doctor_text(
 
     summary = controller.doctor_summary()
     text = summary.to_text()
-    assert summary.version == __version__ == "0.82.12"
+    assert summary.version == __version__ == "0.82.17"
     assert "TRANSFORMATION PHASE 18 Production Hardening" in text
     assert "Signed updates: public_key=yes" in text
     assert "latest=" in summary.signed_updates_summary
@@ -644,7 +644,7 @@ def test_phase21_scope_schema_tools_and_release_candidates() -> None:
     }
     pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(tool_ids) == 69
     assert not any(tool_id.startswith("update.") for tool_id in tool_ids)

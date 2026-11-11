@@ -433,7 +433,7 @@ def test_pdf_trust_direct_cli_gui_and_workspace_bounds(
         controller.pdf_validate_signatures("signed.pdf", "../outside.pem")
 
     summary = controller.doctor_summary()
-    assert summary.version == __version__ == "0.82.12"
+    assert summary.version == __version__ == "0.82.17"
     assert summary.builtin_tools == 69
     assert "TRANSFORMATION PHASE 18 Production Hardening" in summary.to_text()
 
@@ -443,7 +443,7 @@ def test_phase29_scope_docs_schema_and_no_registered_trust_tool() -> None:
     candidates = {path.as_posix() for path in release_candidate_files(project_root)}
     ids = {item.spec.id for item in build_default_registry().list_tools()}
 
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(ids) == 69
     assert "pdf.validate_signatures" not in ids

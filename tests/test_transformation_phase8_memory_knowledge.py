@@ -81,7 +81,7 @@ def _write_text_pdf(path: Path, lines: list[str]) -> None:
 def test_phase8_identity():
     assert TRANSFORMATION_PHASE == 18
     assert TRANSFORMATION_LABEL == "TRANSFORMATION PHASE 18 Production Hardening"
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
 
 

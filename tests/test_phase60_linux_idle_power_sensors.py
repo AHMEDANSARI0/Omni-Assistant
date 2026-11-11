@@ -510,7 +510,7 @@ def test_phase60_live_loginctl_sensor_oracle_never_crashes() -> None:
 
 
 def test_phase60_scope_inventory_and_documentation() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert LATEST_SCHEMA_VERSION == 18
     assert len(build_default_registry().list_tools()) == 69
 

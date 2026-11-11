@@ -357,7 +357,7 @@ def test_phase40_release_admin_and_customer_consumer_round_trip(
 
 
 def test_phase40_scope_inventory_and_counts() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert len(build_default_registry().list_tools()) == 69
     assert LATEST_SCHEMA_VERSION == 18
 

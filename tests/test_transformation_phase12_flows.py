@@ -726,7 +726,7 @@ def test_schema_v14_creates_flow_tables(tmp_path: Path) -> None:
 
 
 def test_identity_and_web_panel_are_current() -> None:
-    assert __version__ == "0.82.12"
+    assert __version__ == "0.82.17"
     assert TRANSFORMATION_PHASE == 18
     assert TRANSFORMATION_LABEL == "TRANSFORMATION PHASE 18 Production Hardening"
     assert LATEST_SCHEMA_VERSION == 18

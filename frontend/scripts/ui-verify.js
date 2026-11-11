@@ -383,6 +383,26 @@ await page.evaluate(() => {
 });
 await settle(300);
 
+/* 9b. A typed instruction must produce a visible answer in the interface. */
+await page.goto(`${base}/#/`, { waitUntil: "domcontentloaded" });
+await settle(2000);
+await page.fill('input[aria-label="Instruction input"]', "hello");
+await page.keyboard.press("Enter");
+let answered = "";
+for (let attempt = 0; attempt < 24; attempt += 1) {
+  await page.waitForTimeout(500);
+  answered = await page.evaluate(() => {
+    const strip = document.querySelector('[role="status"]');
+    return strip ? (strip.innerText || "").trim() : "";
+  });
+  if (answered.length > 40) break;
+}
+check(
+  "a typed instruction gets an answer in the interface",
+  answered.length > 40 && /hello/i.test(answered),
+  answered ? answered.replace(/\s+/g, " ").slice(0, 110) : "no reply panel appeared",
+);
+
 /* 10. Responsive: 1280 and 1024 widths must not overflow horizontally. */
 for (const width of [1280, 1024]) {
   await page.setViewportSize({ width, height: 900 });
@@ -392,6 +412,36 @@ for (const width of [1280, 1024]) {
     client: document.documentElement.clientWidth,
   }));
   check(`no horizontal overflow at ${width}px`, overflow.doc <= overflow.client + 1, `${overflow.doc} vs ${overflow.client}`);
+
+  /* Document-level overflow is not enough: a panel with `overflow: hidden` can
+     clip its own content while the page reports no overflow at all. That is how
+     a feed row running 47 px past its panel survived the earlier checks. */
+  const clipped = await page.evaluate(() => {
+    const offenders = [];
+    for (const element of Array.from(document.querySelectorAll("main *, aside *"))) {
+      const style = getComputedStyle(element);
+      // Intentional overflow is not a defect: a scroll container scrolls, and an
+      // element with `truncate` (text-overflow: ellipsis) reports the full
+      // intrinsic width on purpose - the browser draws an ellipsis.
+      if (["auto", "scroll"].includes(style.overflowX)) continue;
+      if (style.textOverflow === "ellipsis") continue;
+      if (!(element.textContent || "").trim()) continue; // dots and icon rings
+      if (element.clientWidth < 24 || element.clientHeight < 8) continue;
+      if (element.scrollWidth > element.clientWidth + 2) {
+        offenders.push({
+          cls: String(element.className || element.tagName).slice(0, 60),
+          over: element.scrollWidth - element.clientWidth,
+          text: (element.textContent || "").trim().slice(0, 40),
+        });
+      }
+    }
+    return offenders;
+  });
+  check(
+    `no clipped content at ${width}px`,
+    clipped.length === 0,
+    clipped.length ? JSON.stringify(clipped.slice(0, 3)) : "every element fits its box",
+  );
   await page.screenshot({ path: `${outDir}/05-responsive-${width}.png` });
 }
 await page.setViewportSize({ width: 1600, height: 1000 });
